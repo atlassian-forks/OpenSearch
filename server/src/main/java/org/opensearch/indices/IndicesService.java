@@ -149,6 +149,7 @@ import org.opensearch.index.shard.IndexingStats;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.translog.InternalTranslogFactory;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
+import org.opensearch.index.translog.TranslogArchiveCollector;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogStats;
 import org.opensearch.indices.cluster.IndicesClusterStateService;
@@ -422,11 +423,13 @@ public class IndicesService extends AbstractLifecycleComponent
     private volatile int defaultMaxMergeAtOnce;
     private final StatusCounterStats statusCounterStats;
     private final ClusterMergeSchedulerConfig clusterMergeSchedulerConfig;
+    private final TranslogArchiveCollector translogArchiveCollector;
 
     @Override
     protected void doStart() {
         // Start thread that will manage cleaning the field data cache periodically
         threadPool.schedule(this.cacheCleaner, this.cleanInterval, ThreadPool.Names.SAME);
+        translogArchiveCollector.start();
     }
 
     @InternalApi
@@ -605,6 +608,7 @@ public class IndicesService extends AbstractLifecycleComponent
                 MergeSchedulerConfig.CLUSTER_MAX_FORCE_MERGE_MB_PER_SEC_SETTING,
                 this::onClusterLevelForceMergeMBPerSecUpdate
             );
+        this.translogArchiveCollector = new TranslogArchiveCollector(this, threadPool, remoteStoreSettings);
     }
 
     @InternalApi
@@ -761,6 +765,11 @@ public class IndicesService extends AbstractLifecycleComponent
 
     @Override
     protected void doStop() {
+        try {
+            translogArchiveCollector.stop();
+        } catch (Exception e) {
+            logger.warn("Error stopping translog archive collector", e);
+        }
         ThreadPool.terminate(danglingIndicesThreadPoolExecutor, 10, TimeUnit.SECONDS);
 
         ExecutorService indicesStopExecutor = Executors.newFixedThreadPool(5, daemonThreadFactory(settings, "indices_shutdown"));
