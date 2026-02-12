@@ -194,6 +194,17 @@ public class RemoteStoreSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * When true, if translog archive upload fails for a batch, fall back to per-shard upload for that batch.
+     * When false, fail and rely on retry (no fallback).
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD = Setting.boolSetting(
+        "cluster.remote_store.translog.archive.fallback_to_per_shard_upload",
+        true,
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
     private volatile TimeValue clusterRemoteTranslogBufferInterval;
     private volatile int minRemoteSegmentMetadataFiles;
     private volatile TimeValue clusterRemoteTranslogTransferTimeout;
@@ -208,6 +219,7 @@ public class RemoteStoreSettings {
     private static volatile TimeValue pinnedTimestampsLookbackInterval;
     private final String translogPathFixedPrefix;
     private final String segmentsPathFixedPrefix;
+    private volatile boolean translogArchiveFallbackToPerShard;
 
     public RemoteStoreSettings(Settings settings, ClusterSettings clusterSettings) {
         clusterRemoteTranslogBufferInterval = CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.get(settings);
@@ -255,6 +267,23 @@ public class RemoteStoreSettings {
 
         translogPathFixedPrefix = CLUSTER_REMOTE_STORE_TRANSLOG_PATH_PREFIX.get(settings);
         segmentsPathFixedPrefix = CLUSTER_REMOTE_STORE_SEGMENTS_PATH_PREFIX.get(settings);
+
+        translogArchiveFallbackToPerShard = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD,
+            this::setTranslogArchiveFallbackToPerShard
+        );
+    }
+
+    private void setTranslogArchiveFallbackToPerShard(boolean value) {
+        this.translogArchiveFallbackToPerShard = value;
+    }
+
+    /**
+     * When true, if translog archive upload fails, fall back to per-shard upload for that batch.
+     */
+    public boolean getTranslogArchiveFallbackToPerShard() {
+        return translogArchiveFallbackToPerShard;
     }
 
     public TimeValue getClusterRemoteTranslogBufferInterval() {

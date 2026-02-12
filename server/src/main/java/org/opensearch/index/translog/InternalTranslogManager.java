@@ -19,10 +19,15 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.engine.LifecycleAware;
 import org.opensearch.index.seqno.LocalCheckpointTracker;
 import org.opensearch.index.translog.listener.TranslogEventListener;
+import org.opensearch.index.translog.transfer.TransferSnapshot;
+import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.TranslogUploadFailedException;
+import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 
 import java.io.IOException;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
@@ -471,6 +476,35 @@ public class InternalTranslogManager implements TranslogManager {
         ).translogFileGeneration;
         return minReferencedTranslogGeneration < translogGenerationOfNewCommit
             || localCheckpointTrackerSupplier.get().getProcessedCheckpoint() == localCheckpointTrackerSupplier.get().getMaxSeqNo();
+    }
+
+    public boolean supportsArchiveSnapshot() {
+        return translog instanceof RemoteFsTranslog;
+    }
+
+    public void buildSnapshotForArchive(BiConsumer<TransferSnapshot, Runnable> consumer) throws IOException {
+        if (translog instanceof RemoteFsTranslog) {
+            ((RemoteFsTranslog) translog).buildSnapshotForArchive(consumer);
+        } else {
+            throw new UnsupportedOperationException("archive snapshot not supported");
+        }
+    }
+
+    public Optional<TranslogTransferManager> getTranslogTransferManager() {
+        return translog instanceof RemoteFsTranslog
+            ? Optional.of(((RemoteFsTranslog) translog).getTranslogTransferManager())
+            : Optional.empty();
+    }
+
+    public Optional<String> getNodeId() {
+        return Optional.of(translog.getConfig().getNodeId());
+    }
+
+    /**
+     * Returns retention bounds for archive deletion when this shard uses remote translog; empty otherwise.
+     */
+    public Optional<ArchiveDeletionHelper.RetentionBounds> getArchiveRetentionBounds() {
+        return translog instanceof RemoteFsTranslog ? ((RemoteFsTranslog) translog).getArchiveRetentionBounds() : Optional.empty();
     }
 
     @Override
