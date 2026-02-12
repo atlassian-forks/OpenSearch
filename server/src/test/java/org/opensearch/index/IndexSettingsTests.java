@@ -999,6 +999,31 @@ public class IndexSettingsTests extends OpenSearchTestCase {
         );
     }
 
+    public void testTranslogArchiveUploadEnabledDefault() {
+        Settings settings = Settings.builder().put(IndexMetadata.SETTING_INDEX_VERSION_CREATED.getKey(), Version.CURRENT).build();
+        assertFalse(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.get(settings));
+    }
+
+    public void testTranslogArchiveUploadEnabledUpdate() {
+        IndexMetadata metadata = newIndexMeta(
+            "index",
+            Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT).build()
+        );
+        IndexSettings indexSettings = new IndexSettings(metadata, Settings.EMPTY);
+        assertFalse(indexSettings.isTranslogArchiveUploadEnabled());
+
+        indexSettings.updateIndexMetadata(
+            newIndexMeta(
+                "index",
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+                    .build()
+            )
+        );
+        assertTrue(indexSettings.isTranslogArchiveUploadEnabled());
+    }
+
     @SuppressForbidden(reason = "sets the SEARCH_PIPELINE feature flag")
     public void testDefaultSearchPipeline() throws Exception {
         IndexMetadata metadata = newIndexMeta(
