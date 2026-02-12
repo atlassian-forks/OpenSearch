@@ -13,6 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.Version;
 import org.opensearch.common.SetOnce;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.index.remote.RemoteStoreUtils;
 
@@ -28,6 +29,7 @@ import java.util.Optional;
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public class TranslogTransferMetadata {
 
     public static final Logger logger = LogManager.getLogger(TranslogTransferMetadata.class);
