@@ -8,6 +8,7 @@
 
 package org.opensearch.index.translog.transfer.listener;
 
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
 
 import java.io.IOException;
@@ -17,6 +18,7 @@ import java.io.IOException;
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public interface TranslogTransferListener {
     /**
      * Invoked when the transfer of {@link TransferSnapshot} succeeds

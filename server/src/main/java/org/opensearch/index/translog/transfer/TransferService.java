@@ -28,6 +28,7 @@ import java.util.Set;
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public interface TransferService {
 
     /**
@@ -99,6 +100,27 @@ public interface TransferService {
         ActionListener<Void> listener
     ) throws IOException;
 
+    /**
+     * Streams the input stream to the remote path as a blob. Caller must provide exact content length.
+     * Use this to upload without writing to a temp file (e.g. ZIP built to a pipe).
+     * Multipart upload (e.g. S3) is handled inside the blob store implementation; this API is unchanged.
+     *
+     * @param inputStream   stream to read from (e.g. from PipedInputStream)
+     * @param contentLength exact byte length of the blob
+     * @param remotePath   remote path (e.g. BlobPath)
+     * @param blobName     blob file name
+     * @param writePriority write priority
+     * @param cryptoMetadata optional encryption metadata
+     */
+    void uploadBlobStream(
+        InputStream inputStream,
+        long contentLength,
+        Iterable<String> remotePath,
+        String blobName,
+        WritePriority writePriority,
+        CryptoMetadata cryptoMetadata
+    ) throws IOException;
+
     void deleteBlobs(Iterable<String> path, List<String> fileNames) throws IOException;
 
     /**
@@ -159,6 +181,18 @@ public interface TransferService {
      * @throws IOException the exception while reading the data
      */
     InputStream downloadBlob(Iterable<String> path, String fileName) throws IOException;
+
+    /**
+     * Range-read a blob from the remote path.
+     *
+     * @param path     the remote path from where download should be made
+     * @param fileName the name of the file
+     * @param position start offset in the file (bytes)
+     * @param length   number of bytes to read
+     * @return inputstream of the requested byte range
+     * @throws IOException the exception while reading the data
+     */
+    InputStream downloadBlob(Iterable<String> path, String fileName, long position, long length) throws IOException;
 
     /**
      *
