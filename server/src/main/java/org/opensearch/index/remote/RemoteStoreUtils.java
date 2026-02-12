@@ -19,6 +19,7 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.common.collect.Tuple;
+import org.opensearch.common.hash.FNV1a;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.node.remotestore.RemoteStoreNodeAttribute;
@@ -150,6 +151,22 @@ public class RemoteStoreUtils {
      * requiring special handling in some vendors. The characters present in this base64 version are [A-Za-z0-9_-].
      * This must not be changed as it is used for creating path for storing remote store data on the remote store.
      */
+    /**
+     * Hash a string for use as a path component (e.g. translog archive path).
+     * Uses the same FNV1a + encoding as {@link RemoteStoreEnums.PathHashAlgorithm}.
+     */
+    public static String hashStringForPath(String input, RemoteStoreEnums.PathHashAlgorithm algorithm) {
+        long hash = FNV1a.hash64(input);
+        switch (algorithm) {
+            case FNV_1A_BASE64:
+                return longToUrlBase64(hash);
+            case FNV_1A_COMPOSITE_1:
+                return longToCompositeBase64AndBinaryEncoding(hash, 20);
+            default:
+                throw new IllegalArgumentException("Unknown path hash algorithm: " + algorithm);
+        }
+    }
+
     static String longToUrlBase64(long value) {
         byte[] hashBytes = ByteBuffer.allocate(Long.BYTES).putLong(value).array();
         String base64Str = Base64.getUrlEncoder().encodeToString(hashBytes);
