@@ -15,6 +15,7 @@ import org.apache.lucene.store.OutputStreamIndexOutput;
 import org.opensearch.action.LatchedActionListener;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.SetOnce;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.InputStreamWithMetadata;
@@ -26,11 +27,16 @@ import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogReader;
 import org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot;
+import org.opensearch.index.translog.transfer.archive.ArchiveCommentFormat;
+import org.opensearch.index.translog.transfer.archive.ArchiveEntry;
+import org.opensearch.index.translog.transfer.archive.ArchiveIndexEntry;
+import org.opensearch.index.translog.transfer.archive.ZipCentralDirectoryParser;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.threadpool.ThreadPool;
@@ -41,6 +47,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -59,6 +66,7 @@ import static org.opensearch.index.translog.transfer.TranslogTransferMetadata.ME
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public class TranslogTransferManager {
 
     private final ShardId shardId;
@@ -69,6 +77,10 @@ public class TranslogTransferManager {
     private final RemoteTranslogTransferTracker remoteTranslogTransferTracker;
     private final RemoteStoreSettings remoteStoreSettings;
     private static final int METADATA_FILES_TO_FETCH = 10;
+    /** Max archive blobs to list per node when scanning for download; same as retention run. */
+    private static final int MAX_ARCHIVE_BLOBS_PER_NODE = 500;
+    /** Gen bucket size; must match TranslogArchiveCollector (translog/data/{hashPrefix}/{genBucket}). */
+    private static final int GEN_BUCKET_SIZE = 100;
     // Flag to include checkpoint file data as translog file metadata during upload/download
     private final boolean isTranslogMetadataEnabled;
     final static String CHECKPOINT_FILE_DATA_KEY = "ckp-data";
@@ -109,6 +121,14 @@ public class TranslogTransferManager {
 
     public ShardId getShardId() {
         return this.shardId;
+    }
+
+    public TransferService getTransferService() {
+        return transferService;
+    }
+
+    public BlobPath getRemoteDataTransferPath() {
+        return remoteDataTransferPath;
     }
 
     /**
@@ -284,6 +304,9 @@ public class TranslogTransferManager {
             generation,
             location
         );
+        if (downloadFromArchive(primaryTerm, generation, location)) {
+            return true;
+        }
         String ckpFileName = Translog.getCommitCheckpointFileName(Long.parseLong(generation));
         String translogFilename = Translog.getFilename(Long.parseLong(generation));
         if (isTranslogMetadataEnabled == false) {
@@ -301,6 +324,352 @@ public class TranslogTransferManager {
             }
         }
         return true;
+    }
+
+    private RemoteStoreEnums.PathHashAlgorithm getPathHashAlgorithm() {
+        return remoteStoreSettings != null
+            ? remoteStoreSettings.getPathHashAlgorithm()
+            : RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
+    }
+
+    /**
+     * Try to discover and download translog from archive when no metadata exists in remote.
+     * Lists archive (translog/data/{hashTypeIndex}/{hashNodeId}), finds candidate ZIP(s),
+     * uses comment or CD to get latest (primaryTerm, generation) for this shard, then downloads.
+     *
+     * @param location local path to write .tlog and .ckp
+     * @return true if download succeeded, false otherwise
+     */
+    public boolean tryDownloadFromArchiveOnly(Path location) throws IOException {
+        String indexUUID = shardId.getIndex().getUUID();
+        BlobPath dataBase = remoteDataTransferPath.add("translog").add("data");
+        List<ZipTail> candidates = listZipTailsAll(dataBase);
+
+        long bestPrimaryTerm = -1L;
+        long bestGeneration = -1L;
+        ZipTail bestZip = null;
+        ArchiveIndexEntry bestIndexEntry = null;
+        Map<String, ArchiveEntry> bestCdMap = null;
+
+        for (ZipTail c : candidates) {
+            byte[] tail = c.tail;
+            long tailStart = c.tailStartOffset;
+            ArchiveIndexEntry indexEntry = null;
+            Map<String, ArchiveEntry> cdMap = null;
+
+            try {
+                String comment = ZipCentralDirectoryParser.getComment(tail);
+                if (comment != null && !comment.isEmpty()) {
+                    Map<String, ArchiveIndexEntry> indexMap = ArchiveCommentFormat.parseToMap(comment);
+                    for (ArchiveIndexEntry e : indexMap.values()) {
+                        if (e.getShardId() == shardId.id()) {
+                            long pt = e.getPrimaryTerm();
+                            long gen = e.getGeneration();
+                            if (pt > bestPrimaryTerm || (pt == bestPrimaryTerm && gen > bestGeneration)) {
+                                bestPrimaryTerm = pt;
+                                bestGeneration = gen;
+                                bestZip = c;
+                                bestIndexEntry = e;
+                                bestCdMap = null;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                cdMap = ZipCentralDirectoryParser.parseToMap(tail, tailStart);
+            } catch (IOException e) {
+                try {
+                    cdMap = ZipCentralDirectoryParser.parseToMap(tail, tailStart);
+                } catch (IOException e2) {
+                    logger.trace("Parse archive {} failed: {}", c.blobName, e2.getMessage());
+                    continue;
+                }
+            }
+            if (cdMap != null) {
+                String pathPrefix = indexUUID + "/" + shardId.id() + "/";
+                for (String path : cdMap.keySet()) {
+                    if (path.startsWith(pathPrefix) && path.endsWith(".tlog")) {
+                        int secondSlash = path.indexOf('/', pathPrefix.length());
+                        if (secondSlash > 0) {
+                            String termStr = path.substring(pathPrefix.length(), secondSlash);
+                            String filePart = path.substring(secondSlash + 1);
+                            if (filePart.startsWith("translog-") && filePart.endsWith(".tlog")) {
+                                try {
+                                    long pt = Long.parseLong(termStr);
+                                    long gen = Long.parseLong(filePart.substring(9, filePart.length() - 5));
+                                    String ckpPath = pathPrefix + pt + "/translog-" + gen + ".ckp";
+                                    if (cdMap.containsKey(ckpPath)
+                                        && (pt > bestPrimaryTerm || (pt == bestPrimaryTerm && gen > bestGeneration))) {
+                                        bestPrimaryTerm = pt;
+                                        bestGeneration = gen;
+                                        bestZip = c;
+                                        bestIndexEntry = null;
+                                        bestCdMap = cdMap;
+                                    }
+                                } catch (NumberFormatException ignored) {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (bestZip == null || bestPrimaryTerm < 0) {
+            return false;
+        }
+
+        long gen = bestGeneration;
+        downloadTlogCkpFromZipTail(bestZip, bestIndexEntry, bestCdMap, bestPrimaryTerm, gen, indexUUID, location);
+        logger.debug("Downloaded translog from archive (no metadata) primaryTerm={} generation={}", bestPrimaryTerm, gen);
+        return true;
+    }
+
+    /**
+     * Downloads .tlog and .ckp for the given generation from the ZIP to the local path. Uses indexEntry
+     * offsets when non-null, otherwise looks up entries in cdMap by path.
+     */
+    private void downloadTlogCkpFromZipTail(
+        ZipTail zip,
+        ArchiveIndexEntry indexEntry,
+        Map<String, ArchiveEntry> cdMap,
+        long primaryTerm,
+        long gen,
+        String indexUUID,
+        Path location
+    ) throws IOException {
+        String translogFilename = Translog.getFilename(gen);
+        String ckpFileName = Translog.getCommitCheckpointFileName(gen);
+        long downloadStartTime = System.nanoTime();
+        long bytesRead = 0;
+        try {
+            if (indexEntry != null) {
+                downloadRangeToFS(
+                    zip.blobPath,
+                    zip.blobName,
+                    indexEntry.getTlogOffset(),
+                    indexEntry.getTlogLength(),
+                    location.resolve(translogFilename)
+                );
+                bytesRead += indexEntry.getTlogLength();
+                downloadRangeToFS(
+                    zip.blobPath,
+                    zip.blobName,
+                    indexEntry.getCkpOffset(),
+                    indexEntry.getCkpLength(),
+                    location.resolve(ckpFileName)
+                );
+                bytesRead += indexEntry.getCkpLength();
+            } else {
+                String pathPrefix = indexUUID + "/" + shardId.id() + "/" + primaryTerm + "/";
+                ArchiveEntry tlogEntry = cdMap.get(pathPrefix + translogFilename);
+                ArchiveEntry ckpEntry = cdMap.get(pathPrefix + ckpFileName);
+                downloadRangeToFS(tlogEntry, zip.blobPath, zip.blobName, location.resolve(translogFilename));
+                bytesRead += tlogEntry.getDataLength();
+                downloadRangeToFS(ckpEntry, zip.blobPath, zip.blobName, location.resolve(ckpFileName));
+                bytesRead += ckpEntry.getDataLength();
+            }
+        } finally {
+            remoteTranslogTransferTracker.addDownloadTimeInMillis((System.nanoTime() - downloadStartTime) / 1_000_000L);
+            remoteTranslogTransferTracker.addDownloadBytesSucceeded(bytesRead);
+        }
+        fileTransferTracker.add(translogFilename, true);
+        fileTransferTracker.add(ckpFileName, true);
+    }
+
+    private static final class ZipTail {
+        final BlobPath blobPath;
+        final String blobName;
+        final byte[] tail;
+        final long tailStartOffset;
+
+        ZipTail(BlobPath blobPath, String blobName, byte[] tail, long tailStartOffset) {
+            this.blobPath = blobPath;
+            this.blobName = blobName;
+            this.tail = tail;
+            this.tailStartOffset = tailStartOffset;
+        }
+    }
+
+    /**
+     * Lists all *.zip under translog/data: hashPrefix → genBucket → *.zip. For tryDownloadFromArchiveOnly.
+     */
+    private List<ZipTail> listZipTailsAll(BlobPath dataBase) {
+        Set<String> hashPrefixes;
+        try {
+            hashPrefixes = transferService.listFolders(dataBase);
+        } catch (IOException e) {
+            logger.trace("List translog/data failed: {}", e.getMessage());
+            return new ArrayList<>();
+        }
+        if (hashPrefixes == null || hashPrefixes.isEmpty()) {
+            return new ArrayList<>();
+        }
+        List<ZipTail> out = new ArrayList<>();
+        for (String hashPrefix : hashPrefixes) {
+            BlobPath hashPath = dataBase.add(hashPrefix);
+            Set<String> genBuckets;
+            try {
+                genBuckets = transferService.listFolders(hashPath);
+            } catch (IOException e) {
+                logger.trace("List genBuckets under {} failed: {}", hashPrefix, e.getMessage());
+                continue;
+            }
+            if (genBuckets == null || genBuckets.isEmpty()) {
+                continue;
+            }
+            for (String genBucket : genBuckets) {
+                collectZipTails(dataBase.add(hashPrefix).add(genBucket), out);
+            }
+        }
+        out.sort(
+            Comparator.comparing(
+                (ZipTail z) -> TranslogArchivePathHelper.parseBlobNameTimestamp(z.blobName).orElse(null),
+                Comparator.nullsLast(Comparator.reverseOrder())
+            )
+        );
+        return out;
+    }
+
+    /**
+     * Lists *.zip under translog/data/{hashPrefix}/{genBucket} for all hashPrefixes. For downloadFromArchive.
+     */
+    private List<ZipTail> listZipTailsInGenBucket(BlobPath dataBase, long genBucket) {
+        Set<String> hashPrefixes;
+        try {
+            hashPrefixes = transferService.listFolders(dataBase);
+        } catch (IOException e) {
+            logger.trace("List translog/data failed: {}", e.getMessage());
+            return new ArrayList<>();
+        }
+        if (hashPrefixes == null || hashPrefixes.isEmpty()) {
+            return new ArrayList<>();
+        }
+        List<ZipTail> out = new ArrayList<>();
+        String genBucketStr = String.valueOf(genBucket);
+        for (String hashPrefix : hashPrefixes) {
+            collectZipTails(dataBase.add(hashPrefix).add(genBucketStr), out);
+        }
+        return out;
+    }
+
+    private void collectZipTails(BlobPath path, List<ZipTail> out) {
+        List<BlobMetadata> blobs;
+        try {
+            blobs = transferService.listAllInSortedOrder(path, "", MAX_ARCHIVE_BLOBS_PER_NODE);
+        } catch (IOException e) {
+            logger.trace("List blobs under {} failed: {}", path.buildAsString(), e.getMessage());
+            return;
+        }
+        if (blobs == null) {
+            return;
+        }
+        for (BlobMetadata blob : blobs) {
+            String name = blob.name();
+            if (name == null || !name.endsWith(".zip")) {
+                continue;
+            }
+            long size = blob.length();
+            if (size < 22) {
+                continue;
+            }
+            int tailLen = (int) Math.min(size, ZipCentralDirectoryParser.MAX_ZIP_TAIL_BYTES);
+            long tailStartOffset = size - tailLen;
+            byte[] tail;
+            try (InputStream in = transferService.downloadBlob(path, name, tailStartOffset, tailLen)) {
+                tail = in.readAllBytes();
+            } catch (IOException e) {
+                logger.trace("Range-read tail of {} failed: {}", name, e.getMessage());
+                continue;
+            }
+            out.add(new ZipTail(path, name, tail, tailStartOffset));
+        }
+    }
+
+    /**
+     * Try to download this (primaryTerm, generation) from a translog archive (ZIP).
+     * Uses path translog/data/{hashTypeIndex}/{hashNodeId} with comment-based lookup then CD fallback.
+     */
+    private boolean downloadFromArchive(String primaryTerm, String generation, Path location) throws IOException {
+        return downloadFromArchiveNewPath(primaryTerm, generation, location);
+    }
+
+    private boolean downloadFromArchiveNewPath(String primaryTerm, String generation, Path location) throws IOException {
+        long gen = Long.parseLong(generation);
+        long genBucket = gen / GEN_BUCKET_SIZE;
+        BlobPath dataBase = remoteDataTransferPath.add("translog").add("data");
+        List<ZipTail> candidates = listZipTailsInGenBucket(dataBase, genBucket);
+        return downloadFromArchiveWithCandidates(candidates, primaryTerm, generation, location);
+    }
+
+    /**
+     * Iterates candidate ZIPs (newest first), parses comment then CD, and downloads tlog+ckp for the given
+     * (primaryTerm, generation) if found. Returns true when the first matching ZIP is downloaded.
+     */
+    private boolean downloadFromArchiveWithCandidates(List<ZipTail> candidates, String primaryTerm, String generation, Path location)
+        throws IOException {
+        long gen = Long.parseLong(generation);
+        String translogFilename = Translog.getFilename(gen);
+        String ckpFileName = Translog.getCommitCheckpointFileName(gen);
+        String indexUUID = shardId.getIndex().getUUID();
+        String pathPrefix = indexUUID + "/" + shardId.id() + "/" + primaryTerm + "/";
+        String tlogPathInZip = pathPrefix + translogFilename;
+        String ckpPathInZip = pathPrefix + ckpFileName;
+        String indexKey = shardId.id() + "," + primaryTerm + "," + generation;
+
+        for (ZipTail c : candidates) {
+            byte[] tail = c.tail;
+            long tailStartOffset = c.tailStartOffset;
+            BlobPath nodePath = c.blobPath;
+            String name = c.blobName;
+
+            ArchiveIndexEntry indexEntry = null;
+            Map<String, ArchiveEntry> cdMap = null;
+            try {
+                String comment = ZipCentralDirectoryParser.getComment(tail);
+                if (comment != null && !comment.isEmpty()) {
+                    Map<String, ArchiveIndexEntry> indexMap = ArchiveCommentFormat.parseToMap(comment);
+                    indexEntry = indexMap.get(indexKey);
+                }
+                if (indexEntry == null) {
+                    cdMap = ZipCentralDirectoryParser.parseToMap(tail, tailStartOffset);
+                }
+            } catch (IOException e) {
+                try {
+                    cdMap = ZipCentralDirectoryParser.parseToMap(tail, tailStartOffset);
+                } catch (IOException e2) {
+                    continue;
+                }
+            }
+            if (indexEntry != null) {
+                downloadTlogCkpFromZipTail(c, indexEntry, null, Long.parseLong(primaryTerm), gen, indexUUID, location);
+                logger.trace("Downloaded generation {} from archive {}", generation, name);
+                return true;
+            }
+            if (cdMap != null) {
+                ArchiveEntry tlogEntry = cdMap.get(tlogPathInZip);
+                ArchiveEntry ckpEntry = cdMap.get(ckpPathInZip);
+                if (tlogEntry != null && ckpEntry != null) {
+                    downloadTlogCkpFromZipTail(c, null, cdMap, Long.parseLong(primaryTerm), gen, indexUUID, location);
+                    logger.trace("Downloaded generation {} from archive (CD) {}", generation, name);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void downloadRangeToFS(BlobPath blobPath, String blobName, long offset, long length, Path localFile) throws IOException {
+        deleteFileIfExists(localFile);
+        try (InputStream in = transferService.downloadBlob(blobPath, blobName, offset, length)) {
+            Files.copy(in, localFile);
+        }
+    }
+
+    private void downloadRangeToFS(ArchiveEntry entry, BlobPath archivePath, String archiveBlobName, Path localFile) throws IOException {
+        deleteFileIfExists(localFile);
+        try (InputStream in = transferService.downloadBlob(archivePath, archiveBlobName, entry.getDataOffset(), entry.getDataLength())) {
+            Files.copy(in, localFile);
+        }
     }
 
     /**
@@ -494,6 +863,15 @@ public class TranslogTransferManager {
     }
 
     /**
+     * Uploads only the translog transfer metadata for a snapshot. Used after a node-level archive upload
+     * so recovery can discover generations via existing metadata path and then download from archive.
+     */
+    public void uploadMetadataForArchiveSnapshot(TransferSnapshot transferSnapshot) throws IOException {
+        TransferFileSnapshot meta = prepareMetadata(transferSnapshot);
+        transferService.uploadBlob(meta, remoteMetadataTransferPath, WritePriority.HIGH, null);
+    }
+
+    /**
      * Get the metadata bytes for a {@link TranslogTransferMetadata} object
      *
      * @param metadata The object to be parsed
@@ -585,7 +963,14 @@ public class TranslogTransferManager {
     public Set<Long> listPrimaryTermsInRemote() throws IOException {
         Set<String> primaryTermsStr = transferService.listFolders(remoteDataTransferPath);
         if (primaryTermsStr != null) {
-            return primaryTermsStr.stream().map(Long::parseLong).collect(Collectors.toSet());
+            return primaryTermsStr.stream().filter(folderName -> {
+                try {
+                    Long.parseLong(folderName);
+                    return true;
+                } catch (NumberFormatException ignored) {
+                    return false;
+                }
+            }).map(Long::parseLong).collect(Collectors.toSet());
         }
         return new HashSet<>();
     }
