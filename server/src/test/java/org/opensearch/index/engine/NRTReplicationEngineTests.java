@@ -20,6 +20,7 @@ import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.index.codec.CodecService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.seqno.LocalCheckpointTracker;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -31,6 +32,7 @@ import org.opensearch.test.IndexSettingsModule;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
@@ -684,6 +686,116 @@ public class NRTReplicationEngineTests extends EngineTestCase {
             // corruption Exception. In these cases we don't expect any issue on store close.
             nrtEngineStore.close();
         }
+    }
+
+    public void testWarmerIsInvokedOnSegmentUpdate() throws Exception {
+        final AtomicLong globalCheckpoint = new AtomicLong(SequenceNumbers.NO_OPS_PERFORMED);
+        final List<OpenSearchDirectoryReader> warmedReaders = new ArrayList<>();
+        final Engine.Warmer warmer = reader -> {
+            assertNotNull(reader);
+            warmedReaders.add(reader);
+        };
+
+        try (
+            final Store nrtEngineStore = createStore(INDEX_SETTINGS, newDirectory());
+            final NRTReplicationEngine nrtEngine = buildNrtReplicaEngineWithWarmer(globalCheckpoint, nrtEngineStore, INDEX_SETTINGS, warmer)
+        ) {
+            // Initially no warming has happened
+            assertEquals(0, warmedReaders.size());
+
+            // Index docs on primary and refresh to create segments
+            final int docCount = 2;
+            List<Engine.Operation> operations = generateHistoryOnReplica(docCount, randomBoolean(), randomBoolean(), randomBoolean());
+            for (Engine.Operation op : operations) {
+                applyOperation(engine, op);
+                applyOperation(nrtEngine, op);
+                engine.refresh("test");
+            }
+
+            // Wipe the nrt directory and copy segments from primary
+            Lucene.cleanLuceneIndex(nrtEngineStore.directory());
+            for (String file : engine.getLatestSegmentInfos().files(true)) {
+                nrtEngineStore.directory().copyFrom(store.directory(), file, file, IOContext.DEFAULT);
+            }
+
+            // Update segments on NRT engine - this should trigger refresh and warming
+            nrtEngine.updateSegments(engine.getLatestSegmentInfos());
+
+            // Verify warmer was invoked at least once after segment update
+            assertTrue("Warmer should have been invoked after segment update", warmedReaders.size() >= 1);
+        }
+    }
+
+    public void testWarmerNotInvokedWhenNoSegmentChange() throws Exception {
+        final AtomicLong globalCheckpoint = new AtomicLong(SequenceNumbers.NO_OPS_PERFORMED);
+        final List<OpenSearchDirectoryReader> warmedReaders = new ArrayList<>();
+        final Engine.Warmer warmer = reader -> {
+            assertNotNull(reader);
+            warmedReaders.add(reader);
+        };
+
+        try (
+            final Store nrtEngineStore = createStore(INDEX_SETTINGS, newDirectory());
+            final NRTReplicationEngine nrtEngine = buildNrtReplicaEngineWithWarmer(globalCheckpoint, nrtEngineStore, INDEX_SETTINGS, warmer)
+        ) {
+            // Calling refresh on NRT engine should be a no-op (no segment change), so warmer should not be invoked
+            nrtEngine.refresh("test refresh");
+            assertEquals("Warmer should not be invoked when no segment change occurs", 0, warmedReaders.size());
+        }
+    }
+
+    private NRTReplicationEngine buildNrtReplicaEngineWithWarmer(
+        AtomicLong globalCheckpoint,
+        Store store,
+        IndexSettings settings,
+        Engine.Warmer warmer
+    ) throws IOException {
+        Lucene.cleanLuceneIndex(store.directory());
+        final Path translogDir = createTempDir();
+        final EngineConfig baseConfig = config(
+            settings,
+            store,
+            translogDir,
+            NoMergePolicy.INSTANCE,
+            null,
+            null,
+            globalCheckpoint::get
+        );
+        // Build a new config that includes the warmer
+        final EngineConfig replicaConfig = new EngineConfig.Builder().shardId(baseConfig.getShardId())
+            .threadPool(baseConfig.getThreadPool())
+            .indexSettings(baseConfig.getIndexSettings())
+            .warmer(warmer)
+            .store(baseConfig.getStore())
+            .mergePolicy(baseConfig.getMergePolicy())
+            .analyzer(baseConfig.getAnalyzer())
+            .similarity(baseConfig.getSimilarity())
+            .codecService(new CodecService(null, baseConfig.getIndexSettings(), logger, List.of()))
+            .eventListener(baseConfig.getEventListener())
+            .queryCache(baseConfig.getQueryCache())
+            .queryCachingPolicy(baseConfig.getQueryCachingPolicy())
+            .translogConfig(baseConfig.getTranslogConfig())
+            .flushMergesAfter(baseConfig.getFlushMergesAfter())
+            .externalRefreshListener(baseConfig.getExternalRefreshListener())
+            .internalRefreshListener(baseConfig.getInternalRefreshListener())
+            .indexSort(baseConfig.getIndexSort())
+            .circuitBreakerService(baseConfig.getCircuitBreakerService())
+            .globalCheckpointSupplier(baseConfig.getGlobalCheckpointSupplier())
+            .retentionLeasesSupplier(baseConfig.retentionLeasesSupplier())
+            .primaryTermSupplier(baseConfig.getPrimaryTermSupplier())
+            .tombstoneDocSupplier(baseConfig.getTombstoneDocSupplier())
+            .build();
+        if (Lucene.indexExists(store.directory()) == false) {
+            store.createEmpty(replicaConfig.getIndexSettings().getIndexVersionCreated().luceneVersion);
+            final String translogUuid = Translog.createEmptyTranslog(
+                replicaConfig.getTranslogConfig().getTranslogPath(),
+                SequenceNumbers.NO_OPS_PERFORMED,
+                shardId,
+                primaryTerm.get()
+            );
+            store.associateIndexWithNewTranslog(translogUuid);
+        }
+        return new NRTReplicationEngine(replicaConfig);
     }
 
     private void copySegments(Collection<String> latestPrimaryFiles, Engine nrtEngine) throws IOException {

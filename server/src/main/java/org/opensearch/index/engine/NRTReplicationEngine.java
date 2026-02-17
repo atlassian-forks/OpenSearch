@@ -8,6 +8,7 @@
 
 package org.opensearch.index.engine;
 
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexCommit;
 import org.apache.lucene.index.SegmentInfos;
@@ -43,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
@@ -99,6 +101,12 @@ public class NRTReplicationEngine extends Engine {
             // Only wire up the internal listeners.
             for (ReferenceManager.RefreshListener listener : engineConfig.getInternalRefreshListener()) {
                 this.readerManager.addListener(listener);
+            }
+            // Wire up the warmer to ensure segments are warmed (e.g., eager global ordinals)
+            // on NRT replicas after each segment replication checkpoint processing.
+            final Engine.Warmer warmer = engineConfig.getWarmer();
+            if (warmer != null) {
+                this.readerManager.addListener(new WarmerRefreshListener(warmer, logger, isClosed, this.readerManager));
             }
             final Map<String, String> userData = this.lastCommittedSegmentInfos.getUserData();
             final String translogUUID = Objects.requireNonNull(userData.get(Translog.TRANSLOG_UUID_KEY));
@@ -559,5 +567,53 @@ public class NRTReplicationEngine extends Engine {
             DirectoryReader.open(store.directory(), engineConfig.getLeafSorter()),
             Lucene.SOFT_DELETES_FIELD
         );
+    }
+
+    /**
+     * A {@link ReferenceManager.RefreshListener} that warms new segments after a refresh on NRT replica shards.
+     * This ensures that resources like eager global ordinals are pre-built after each segment replication
+     * checkpoint processing, avoiding cold start penalties on first search after refresh.
+     *
+     * @opensearch.internal
+     */
+    static final class WarmerRefreshListener implements ReferenceManager.RefreshListener {
+        private final Engine.Warmer warmer;
+        private final Logger logger;
+        private final AtomicBoolean isClosed;
+        private final NRTReplicationReaderManager readerManager;
+
+        WarmerRefreshListener(
+            Engine.Warmer warmer,
+            Logger logger,
+            AtomicBoolean isClosed,
+            NRTReplicationReaderManager readerManager
+        ) {
+            this.warmer = warmer;
+            this.logger = logger;
+            this.isClosed = isClosed;
+            this.readerManager = readerManager;
+        }
+
+        @Override
+        public void beforeRefresh() throws IOException {}
+
+        @Override
+        public void afterRefresh(boolean didRefresh) throws IOException {
+            if (didRefresh) {
+                OpenSearchDirectoryReader reader = null;
+                try {
+                    reader = readerManager.acquire();
+                    warmer.warm(reader);
+                } catch (Exception e) {
+                    if (isClosed.get() == false) {
+                        logger.warn("failed to trigger warmer on index shard", e);
+                    }
+                } finally {
+                    if (reader != null) {
+                        readerManager.release(reader);
+                    }
+                }
+            }
+        }
     }
 }
