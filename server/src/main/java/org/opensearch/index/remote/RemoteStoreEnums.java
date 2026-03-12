@@ -212,12 +212,12 @@ public class RemoteStoreEnums {
         FNV_1A_BASE64(0) {
             @Override
             String hash(BasePathInput pathInput) {
-                StringBuilder input = new StringBuilder();
-                for (String path : pathInput.fixedSubPath().toArray()) {
-                    input.append(path);
-                }
-                long hash = FNV1a.hash64(input.toString());
-                return longToUrlBase64(hash);
+                return hashString(concatenateHashPath(pathInput));
+            }
+
+            @Override
+            public String hashString(String input) {
+                return longToUrlBase64(FNV1a.hash64(input));
             }
         },
         /**
@@ -227,14 +227,22 @@ public class RemoteStoreEnums {
         FNV_1A_COMPOSITE_1(1) {
             @Override
             String hash(BasePathInput pathInput) {
-                StringBuilder input = new StringBuilder();
-                for (String path : pathInput.fixedSubPath().toArray()) {
-                    input.append(path);
-                }
-                long hash = FNV1a.hash64(input.toString());
-                return longToCompositeBase64AndBinaryEncoding(hash, 20);
+                return hashString(concatenateHashPath(pathInput));
+            }
+
+            @Override
+            public String hashString(String input) {
+                return longToCompositeBase64AndBinaryEncoding(FNV1a.hash64(input), 20);
             }
         };
+
+        private static String concatenateHashPath(BasePathInput pathInput) {
+            StringBuilder input = new StringBuilder();
+            for (String path : pathInput.fixedSubPath().toArray()) {
+                input.append(path);
+            }
+            return input.toString();
+        }
 
         private final int code;
 
@@ -271,6 +279,20 @@ public class RemoteStoreEnums {
         }
 
         abstract String hash(BasePathInput pathInput);
+
+        /**
+         * Hash an arbitrary string. Used for translog archive path prefix.
+         */
+        public abstract String hashString(String input);
+
+        /**
+         * Compute hash prefix for translog archive path: hash(fileType|indexId|nodeId).
+         * If algorithm is null, uses FNV_1A_BASE64.
+         */
+        public static String hashForTranslogArchive(PathHashAlgorithm algorithm, String fileType, String indexId, String nodeId) {
+            PathHashAlgorithm algo = algorithm != null ? algorithm : FNV_1A_BASE64;
+            return algo.hashString(fileType + "|" + indexId + "|" + nodeId);
+        }
 
         public static PathHashAlgorithm parseString(String pathHashAlgorithm) {
             try {
