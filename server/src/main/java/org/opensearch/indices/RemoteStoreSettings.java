@@ -227,6 +227,29 @@ public class RemoteStoreSettings {
         Property.Dynamic
     );
 
+    /**
+     * Controls retention period (in minutes) for translog archives.
+     * Used for node recovery and durability. Translog archives older than this period are deleted.
+     * Default: 60 minutes (1 hour). Range: 30-10080 minutes (30 min to 7 days).
+     * Note: Effective retention is longer than configured value due to batching semantics.
+     */
+    @ExperimentalApi
+    public static final Setting<Integer> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES = Setting.intSetting(
+        "cluster.remote_store.translog.archive.retention_minutes",
+        60,
+        30,
+        10080,
+        v -> {
+            if (v < 30 || v > 10080) {
+                throw new IllegalArgumentException(
+                    "Translog archive retention must be between 30 minutes and 7 days (10080 minutes)"
+                );
+            }
+        },
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
     private volatile TimeValue clusterRemoteTranslogBufferInterval;
     private volatile boolean clusterRemoteStoreSegmentArchiveEnabled;
     private volatile boolean clusterRemoteStoreSegmentArchiveFallbackToPerFile;
@@ -244,6 +267,7 @@ public class RemoteStoreSettings {
     private final String translogPathFixedPrefix;
     private final String segmentsPathFixedPrefix;
     private volatile boolean translogArchiveFallbackToPerShard;
+    private volatile int translogArchiveRetentionMinutes;
 
     public RemoteStoreSettings(Settings settings, ClusterSettings clusterSettings) {
         clusterRemoteTranslogBufferInterval = CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.get(settings);
@@ -309,6 +333,12 @@ public class RemoteStoreSettings {
             CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE,
             this::setClusterRemoteStoreSegmentArchiveFallbackToPerFile
         );
+
+        translogArchiveRetentionMinutes = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES,
+            this::setTranslogArchiveRetentionMinutes
+        );
     }
 
     private void setTranslogArchiveFallbackToPerShard(boolean value) {
@@ -336,6 +366,14 @@ public class RemoteStoreSettings {
 
     public boolean isClusterRemoteStoreSegmentArchiveFallbackToPerFile() {
         return clusterRemoteStoreSegmentArchiveFallbackToPerFile;
+    }
+
+    private void setTranslogArchiveRetentionMinutes(int value) {
+        this.translogArchiveRetentionMinutes = value;
+    }
+
+    public int getTranslogArchiveRetentionMinutes() {
+        return translogArchiveRetentionMinutes;
     }
 
     public TimeValue getClusterRemoteTranslogBufferInterval() {
