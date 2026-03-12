@@ -31,6 +31,7 @@ import org.opensearch.index.translog.ChannelFactory;
 import org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -147,6 +148,26 @@ public class BlobStoreTransferService implements TransferService {
         }
     }
 
+    @Override
+    public void uploadBlobStream(
+        InputStream inputStream,
+        long contentLength,
+        Iterable<String> remotePath,
+        String blobName,
+        WritePriority writePriority,
+        CryptoMetadata cryptoMetadata
+    ) throws IOException {
+        BlobPath blobPath = (BlobPath) remotePath;
+        // Wrap so backends that require mark/reset (e.g. S3 plugin for retries) get a mark-supporting stream
+        int bufferSize = (int) Math.min(contentLength, 64 * 1024);
+        if (bufferSize < 8192) {
+            bufferSize = 8192;
+        }
+        try (InputStream wrapped = new BufferedInputStream(inputStream, bufferSize)) {
+            blobStore.blobContainer(blobPath).writeBlobWithMetadata(blobName, wrapped, contentLength, true, null, cryptoMetadata);
+        }
+    }
+
     // Builds a metadata map containing the Base64-encoded checkpoint file data associated with a translog file.
     static Map<String, String> buildTransferFileMetadata(InputStream metadataInputStream) throws IOException {
         Map<String, String> metadata = new HashMap<>();
@@ -257,6 +278,11 @@ public class BlobStoreTransferService implements TransferService {
     @Override
     public InputStream downloadBlob(Iterable<String> path, String fileName) throws IOException {
         return blobStore.blobContainer((BlobPath) path).readBlob(fileName);
+    }
+
+    @Override
+    public InputStream downloadBlob(Iterable<String> path, String fileName, long position, long length) throws IOException {
+        return blobStore.blobContainer((BlobPath) path).readBlob(fileName, position, length);
     }
 
     @Override
