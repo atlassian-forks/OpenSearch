@@ -993,6 +993,56 @@ public class IndexSettingsTests extends OpenSearchTestCase {
         );
     }
 
+    public void testTranslogArchiveUploadEnabledDefault() {
+        Settings settings = Settings.builder().put(IndexMetadata.SETTING_INDEX_VERSION_CREATED.getKey(), Version.CURRENT).build();
+        assertFalse(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.get(settings));
+    }
+
+    public void testTranslogArchiveUploadEnabledUpdate() {
+        IndexMetadata metadata = newIndexMeta(
+            "index",
+            Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT).build()
+        );
+        IndexSettings indexSettings = new IndexSettings(metadata, Settings.EMPTY);
+        assertFalse(indexSettings.isTranslogArchiveUploadEnabled());
+
+        indexSettings.updateIndexMetadata(
+            newIndexMeta(
+                "index",
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+                    .build()
+            )
+        );
+        assertTrue(indexSettings.isTranslogArchiveUploadEnabled());
+    }
+
+    public void testSegmentArchiveUploadEnabledDefault() {
+        Settings settings = Settings.builder().put(IndexMetadata.SETTING_INDEX_VERSION_CREATED.getKey(), Version.CURRENT).build();
+        assertFalse(IndexSettings.INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING.get(settings));
+    }
+
+    public void testSegmentArchiveUploadEnabledUpdate() {
+        IndexMetadata metadata = newIndexMeta(
+            "index",
+            Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT).build()
+        );
+        IndexSettings indexSettings = new IndexSettings(metadata, Settings.EMPTY);
+        assertFalse(indexSettings.isSegmentArchiveUploadEnabled());
+
+        indexSettings.updateIndexMetadata(
+            newIndexMeta(
+                "index",
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexSettings.INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+                    .build()
+            )
+        );
+        assertTrue(indexSettings.isSegmentArchiveUploadEnabled());
+    }
+
     @SuppressForbidden(reason = "sets the SEARCHABLE_SNAPSHOT_EXTENDED_COMPATIBILITY feature flag")
     public void testExtendedCompatibilityVersionForRemoteSnapshot() throws Exception {
         FeatureFlagSetter.set(FeatureFlags.SEARCHABLE_SNAPSHOT_EXTENDED_COMPATIBILITY);
