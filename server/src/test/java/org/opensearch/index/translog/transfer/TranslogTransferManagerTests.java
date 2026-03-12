@@ -16,6 +16,7 @@ import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.InputStreamWithMetadata;
+import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.blobstore.support.PlainBlobMetadata;
 import org.opensearch.common.collect.Tuple;
@@ -23,13 +24,19 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.remote.RemoteStoreEnums;
+import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
 import org.opensearch.index.translog.Translog;
+import org.opensearch.index.translog.TranslogArchiveCollector;
+import org.opensearch.index.translog.TranslogReader;
 import org.opensearch.index.translog.transfer.FileSnapshot.CheckpointFileSnapshot;
 import org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot;
 import org.opensearch.index.translog.transfer.FileSnapshot.TranslogFileSnapshot;
+import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.DefaultRemoteStoreSettings;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
@@ -502,6 +509,157 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
         tracker.add(translogFile, true);
         tracker.add(checkpointFile, true);
         assertTlogCkpDownloadStats();
+    }
+
+    /**
+     * Download from archive: upload a ZIP with one generation, then downloadTranslog and verify files.
+     */
+    public void testDownloadTranslogFromArchive() throws IOException {
+        ShardId realShardId = new ShardId("index", "indexUUid", 0);
+        String pathPrefix = realShardId.getIndex().getUUID() + "/" + realShardId.id() + "/1/";
+        byte[] tlogContent = "tlog-in-archive".getBytes(StandardCharsets.UTF_8);
+        byte[] ckpContent = "ckp-in-archive".getBytes(StandardCharsets.UTF_8);
+        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+            ArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", tlogContent),
+            ArchiveBuilder.fromBytes(pathPrefix + "translog-2.ckp", ckpContent)
+        );
+        TranslogArchiveCollector collector = new TranslogArchiveCollector(mock(IndicesService.class));
+        byte[] zipBytes = collector.buildArchiveFromEntries(entries);
+
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        BlobPath dataPath = new BlobPath().add("base").add(TRANSLOG.getName());
+        String indexUUID = realShardId.getIndex().getUUID();
+        String hashPrefix = RemoteStoreEnums.PathHashAlgorithm.hashForTranslogArchive(
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
+            "translog_zip",
+            indexUUID,
+            "node-1"
+        );
+        long genBucket = 2 / 100;
+        BlobPath archiveGenPath = dataPath.add("translog").add("data").add(hashPrefix).add(String.valueOf(genBucket));
+        BlobStoreTransferService blobStoreTransferService = new BlobStoreTransferService(blobStore, threadPool);
+        blobStoreTransferService.uploadBlob(new TransferFileSnapshot("batch.zip", zipBytes, 0L), archiveGenPath, WritePriority.HIGH, null);
+
+        Path location = createTempDir();
+        FileTransferTracker fileTracker = new FileTransferTracker(realShardId, remoteTranslogTransferTracker);
+        TranslogTransferManager manager = new TranslogTransferManager(
+            realShardId,
+            blobStoreTransferService,
+            new BlobPath().add("base").add(TRANSLOG.getName()),
+            new BlobPath().add("base").add(METADATA.getName()),
+            fileTracker,
+            remoteTranslogTransferTracker,
+            DefaultRemoteStoreSettings.INSTANCE,
+            false
+        );
+        boolean ok = manager.downloadTranslog("1", "2", location);
+        assertTrue(ok);
+        assertArrayEquals(tlogContent, Files.readAllBytes(location.resolve("translog-2.tlog")));
+        assertArrayEquals(ckpContent, Files.readAllBytes(location.resolve("translog-2.ckp")));
+    }
+
+    /**
+     * When archive is missing (no blobs or list empty), downloadTranslog falls back to per-shard path and succeeds.
+     */
+    public void testDownloadTranslogFallbackToPerShardWhenArchiveMissing() throws IOException {
+        ShardId realShardId = new ShardId("index", "indexUUid", 0);
+        byte[] perShardTlog = "per-shard-tlog".getBytes(StandardCharsets.UTF_8);
+        byte[] perShardCkp = "per-shard-ckp".getBytes(StandardCharsets.UTF_8);
+
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        BlobPath dataPath = new BlobPath().add("base").add(TRANSLOG.getName());
+        BlobPath perShardPath = dataPath.add("1");
+        BlobStoreTransferService blobStoreTransferService = new BlobStoreTransferService(blobStore, threadPool);
+        blobStoreTransferService.uploadBlob(
+            new TransferFileSnapshot("translog-2.tlog", perShardTlog, 0L),
+            perShardPath,
+            WritePriority.HIGH,
+            null
+        );
+        blobStoreTransferService.uploadBlob(
+            new TransferFileSnapshot("translog-2.ckp", perShardCkp, 0L),
+            perShardPath,
+            WritePriority.HIGH,
+            null
+        );
+        // No archive folder created – listFolders(archiveBase) will return empty; downloadFromArchive returns false
+
+        Path location = createTempDir();
+        FileTransferTracker fileTracker = new FileTransferTracker(realShardId, remoteTranslogTransferTracker);
+        TranslogTransferManager manager = new TranslogTransferManager(
+            realShardId,
+            blobStoreTransferService,
+            new BlobPath().add("base").add(TRANSLOG.getName()),
+            new BlobPath().add("base").add(METADATA.getName()),
+            fileTracker,
+            remoteTranslogTransferTracker,
+            DefaultRemoteStoreSettings.INSTANCE,
+            false
+        );
+        boolean ok = manager.downloadTranslog("1", "2", location);
+        assertTrue(ok);
+        assertArrayEquals(perShardTlog, Files.readAllBytes(location.resolve("translog-2.tlog")));
+        assertArrayEquals(perShardCkp, Files.readAllBytes(location.resolve("translog-2.ckp")));
+    }
+
+    /**
+     * When archive path has blobs but parse fails (e.g. corrupt or non-ZIP), downloadTranslog falls back to
+     * per-shard path and succeeds.
+     */
+    public void testDownloadTranslogFallbackToPerShardWhenArchiveParseFails() throws IOException {
+        ShardId realShardId = new ShardId("index", "indexUUid", 0);
+        byte[] perShardTlog = "per-shard-tlog".getBytes(StandardCharsets.UTF_8);
+        byte[] perShardCkp = "per-shard-ckp".getBytes(StandardCharsets.UTF_8);
+
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        BlobPath dataPath = new BlobPath().add("base").add(TRANSLOG.getName());
+        BlobPath perShardPath = dataPath.add("1");
+        BlobStoreTransferService blobStoreTransferService = new BlobStoreTransferService(blobStore, threadPool);
+        blobStoreTransferService.uploadBlob(
+            new TransferFileSnapshot("translog-2.tlog", perShardTlog, 0L),
+            perShardPath,
+            WritePriority.HIGH,
+            null
+        );
+        blobStoreTransferService.uploadBlob(
+            new TransferFileSnapshot("translog-2.ckp", perShardCkp, 0L),
+            perShardPath,
+            WritePriority.HIGH,
+            null
+        );
+
+        String indexUUID = realShardId.getIndex().getUUID();
+        String hashPrefix = RemoteStoreEnums.PathHashAlgorithm.hashForTranslogArchive(
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
+            "translog_zip",
+            indexUUID,
+            "node-1"
+        );
+        BlobPath archiveGenPath = dataPath.add("translog").add("data").add(hashPrefix).add("0");
+        byte[] corruptBlob = new byte[64];
+        blobStoreTransferService.uploadBlob(
+            new TransferFileSnapshot("corrupt.zip", corruptBlob, 0L),
+            archiveGenPath,
+            WritePriority.HIGH,
+            null
+        );
+
+        Path location = createTempDir();
+        FileTransferTracker fileTracker = new FileTransferTracker(realShardId, remoteTranslogTransferTracker);
+        TranslogTransferManager manager = new TranslogTransferManager(
+            realShardId,
+            blobStoreTransferService,
+            new BlobPath().add("base").add(TRANSLOG.getName()),
+            new BlobPath().add("base").add(METADATA.getName()),
+            fileTracker,
+            remoteTranslogTransferTracker,
+            DefaultRemoteStoreSettings.INSTANCE,
+            false
+        );
+        boolean ok = manager.downloadTranslog("1", "2", location);
+        assertTrue(ok);
+        assertArrayEquals(perShardTlog, Files.readAllBytes(location.resolve("translog-2.tlog")));
+        assertArrayEquals(perShardCkp, Files.readAllBytes(location.resolve("translog-2.ckp")));
     }
 
     public void testDeleteTranslogSuccess() throws Exception {

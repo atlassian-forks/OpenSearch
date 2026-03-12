@@ -757,9 +757,6 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_PATH_HASH_ALGORITHM_SETTING,
                 RemoteStoreSettings.CLUSTER_REMOTE_MAX_TRANSLOG_READERS,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_METADATA,
-<<<<<<< HEAD
-                SearchService.CLUSTER_ALLOW_DERIVED_FIELD_SETTING
-=======
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_SCHEDULER_INTERVAL,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_LOOKBACK_INTERVAL,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_ENABLED,
@@ -768,71 +765,12 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_PATH_PREFIX,
-                // Server Side encryption enabled
                 RemoteStoreSettings.CLUSTER_SERVER_SIDE_ENCRYPTION_ENABLED,
-
-                // Snapshot related Settings
-                BlobStoreRepository.SNAPSHOT_SHARD_PATH_PREFIX_SETTING,
-                BlobStoreRepository.SNAPSHOT_REPOSITORY_DATA_CACHE_THRESHOLD,
-
                 SearchService.CLUSTER_ALLOW_DERIVED_FIELD_SETTING,
                 SearchService.QUERY_REWRITING_ENABLED_SETTING,
                 SearchService.QUERY_REWRITING_TERMS_THRESHOLD_SETTING,
-                FlushModeResolver.STREAMING_MAX_ESTIMATED_BUCKET_COUNT,
-                FlushModeResolver.STREAMING_MIN_CARDINALITY_RATIO,
-                FlushModeResolver.STREAMING_MIN_ESTIMATED_BUCKET_COUNT,
-
-                // Composite index settings
-                CompositeIndexSettings.STAR_TREE_INDEX_ENABLED_SETTING,
-                CompositeIndexSettings.COMPOSITE_INDEX_MAX_TRANSLOG_FLUSH_THRESHOLD_SIZE_SETTING,
-
-                SystemTemplatesService.SETTING_APPLICATION_BASED_CONFIGURATION_TEMPLATES_ENABLED,
-
-                // WorkloadManagement settings
-                WorkloadManagementSettings.NODE_LEVEL_CPU_REJECTION_THRESHOLD,
-                WorkloadManagementSettings.NODE_LEVEL_CPU_CANCELLATION_THRESHOLD,
-                WorkloadManagementSettings.NODE_LEVEL_MEMORY_REJECTION_THRESHOLD,
-                WorkloadManagementSettings.NODE_LEVEL_MEMORY_CANCELLATION_THRESHOLD,
-                WorkloadManagementSettings.WLM_MODE_SETTING,
-                WorkloadManagementSettings.QUERYGROUP_SERVICE_RUN_INTERVAL_SETTING,
-                WorkloadManagementSettings.QUERYGROUP_SERVICE_DURESS_STREAK_SETTING,
-
-                // Settings to be used for limiting rest requests
-                ResponseLimitSettings.CAT_INDICES_RESPONSE_LIMIT_SETTING,
-                ResponseLimitSettings.CAT_SHARDS_RESPONSE_LIMIT_SETTING,
-                ResponseLimitSettings.CAT_SEGMENTS_RESPONSE_LIMIT_SETTING,
-
-                // Thread pool Settings
-                ThreadPool.CLUSTER_THREAD_POOL_SIZE_SETTING,
-
-                // Tiered caching settings
-                CacheSettings.getConcreteStoreNameSettingForCacheType(CacheType.INDICES_REQUEST_CACHE),
-                OpenSearchOnHeapCacheSettings.MAXIMUM_SIZE_IN_BYTES.getConcreteSettingForNamespace(
-                    CacheType.INDICES_REQUEST_CACHE.getSettingPrefix()
-                ),
-                OpenSearchOnHeapCacheSettings.EXPIRE_AFTER_ACCESS_SETTING.getConcreteSettingForNamespace(
-                    CacheType.INDICES_REQUEST_CACHE.getSettingPrefix()
-                ),
-
-                // Setting related to refresh optimisations
-                IndicesService.CLUSTER_REFRESH_FIXED_INTERVAL_SCHEDULE_ENABLED_SETTING,
-                IndicesService.CLUSTER_REFRESH_SHARD_LEVEL_ENABLED_SETTING,
-
-                // Settings related to Auto Force Merge Manager
-                ForceMergeManagerSettings.AUTO_FORCE_MERGE_SETTING,
-                ForceMergeManagerSettings.AUTO_FORCE_MERGE_SCHEDULER_INTERVAL,
-                ForceMergeManagerSettings.TRANSLOG_AGE_AUTO_FORCE_MERGE,
-                ForceMergeManagerSettings.SEGMENT_COUNT_FOR_AUTO_FORCE_MERGE,
-                ForceMergeManagerSettings.MERGE_DELAY_BETWEEN_SHARDS_FOR_AUTO_FORCE_MERGE,
-                ForceMergeManagerSettings.CPU_THRESHOLD_PERCENTAGE_FOR_AUTO_FORCE_MERGE,
-                ForceMergeManagerSettings.DISK_THRESHOLD_PERCENTAGE_FOR_AUTO_FORCE_MERGE,
-                ForceMergeManagerSettings.JVM_THRESHOLD_PERCENTAGE_FOR_AUTO_FORCE_MERGE,
-                ForceMergeManagerSettings.CONCURRENCY_MULTIPLIER,
                 StreamTransportService.STREAM_TRANSPORT_REQ_TIMEOUT_SETTING,
-                StreamSearchTransportService.STREAM_SEARCH_ENABLED,
-                RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD,
-                RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED,
-                RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE
+                StreamSearchTransportService.STREAM_SEARCH_ENABLED
             )
         )
     );
