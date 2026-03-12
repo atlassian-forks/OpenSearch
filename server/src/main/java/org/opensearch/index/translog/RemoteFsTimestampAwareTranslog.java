@@ -265,11 +265,8 @@ public class RemoteFsTimestampAwareTranslog extends RemoteFsTranslog {
                     }
                 } catch (Exception e) {
                     logger.error("Exception in trimUnreferencedReaders", e);
-                    remoteGenerationDeletionPermits.release(REMOTE_DELETION_PERMITS);
-                    assert remoteGenerationDeletionPermits.availablePermits() == REMOTE_DELETION_PERMITS : "Available permits "
-                        + remoteGenerationDeletionPermits.availablePermits()
-                        + " is not equal to "
-                        + REMOTE_DELETION_PERMITS;
+                    int available = remoteGenerationDeletionPermits.availablePermits();
+                    remoteGenerationDeletionPermits.release(REMOTE_DELETION_PERMITS - available);
                 }
             }
 
