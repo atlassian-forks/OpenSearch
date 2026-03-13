@@ -179,6 +179,9 @@ import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogConfig;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogStats;
+import org.opensearch.index.translog.transfer.TransferSnapshot;
+import org.opensearch.index.translog.transfer.TranslogTransferManager;
+import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.index.warmer.ShardIndexWarmerService;
 import org.opensearch.index.warmer.WarmerStats;
 import org.opensearch.indices.IndexingMemoryController;
@@ -5400,6 +5403,44 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     // Exclusively for testing, please do not use it elsewhere.
     public AsyncIOProcessor<Translog.Location> getTranslogSyncProcessor() {
         return translogSyncProcessor;
+    }
+
+    public Optional<TranslogTransferManager> getTranslogTransferManager() {
+        Engine engine = getEngine();
+        if (engine instanceof InternalEngine) {
+            return ((InternalEngine) engine).translogManager().getTranslogTransferManager();
+        }
+        return Optional.empty();
+    }
+
+    public void buildSnapshotForArchive(BiConsumer<TransferSnapshot, Runnable> consumer) throws IOException {
+        Engine engine = getEngine();
+        if (engine instanceof InternalEngine) {
+            ((InternalEngine) engine).translogManager().buildSnapshotForArchive(consumer);
+        } else {
+            throw new UnsupportedOperationException("archive snapshot not supported");
+        }
+    }
+
+    public boolean supportsArchiveSnapshot() {
+        Engine engine = getEngine();
+        return engine instanceof InternalEngine && ((InternalEngine) engine).translogManager().supportsArchiveSnapshot();
+    }
+
+    public Optional<String> getTranslogNodeId() {
+        Engine engine = getEngine();
+        if (engine instanceof InternalEngine) {
+            return ((InternalEngine) engine).translogManager().getNodeId();
+        }
+        return Optional.empty();
+    }
+
+    public Optional<ArchiveDeletionHelper.RetentionBounds> getArchiveRetentionBounds() {
+        Engine engine = getEngine();
+        if (engine instanceof InternalEngine) {
+            return ((InternalEngine) engine).translogManager().getArchiveRetentionBounds();
+        }
+        return Optional.empty();
     }
 
     enum ShardMigrationState {
