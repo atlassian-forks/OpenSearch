@@ -226,6 +226,10 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 // Settings for remote translog
                 IndexSettings.INDEX_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING,
                 IndexSettings.INDEX_REMOTE_TRANSLOG_KEEP_EXTRA_GEN_SETTING,
+                IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING,
+
+                // Settings for remote segment
+                IndexSettings.INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING,
 
                 // Settings for remote store enablement
                 IndexMetadata.INDEX_REMOTE_STORE_ENABLED_SETTING,
