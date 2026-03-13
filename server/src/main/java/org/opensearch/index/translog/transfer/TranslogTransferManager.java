@@ -58,6 +58,7 @@ import static org.opensearch.index.translog.transfer.TranslogTransferMetadata.ME
  *
  * @opensearch.internal
  */
+@org.opensearch.common.annotation.ExperimentalApi
 public class TranslogTransferManager {
 
     private final ShardId shardId;

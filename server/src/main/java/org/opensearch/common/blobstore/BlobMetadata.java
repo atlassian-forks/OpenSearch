@@ -37,6 +37,7 @@ package org.opensearch.common.blobstore;
  *
  * @opensearch.internal
  */
+@org.opensearch.common.annotation.ExperimentalApi
 public interface BlobMetadata {
 
     /**

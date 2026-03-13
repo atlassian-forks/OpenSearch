@@ -400,4 +400,24 @@ public class RemoteStoreSettings {
     public String getSegmentsPathFixedPrefix() {
         return segmentsPathFixedPrefix;
     }
+
+    public boolean isTranslogArchiveFallbackToPerShard() {
+        return translogArchiveFallbackToPerShard;
+    }
+
+    public boolean getTranslogArchiveFallbackToPerShard() {
+        return translogArchiveFallbackToPerShard;
+    }
+
+    public boolean isClusterRemoteStoreSegmentArchiveEnabled() {
+        return clusterRemoteStoreSegmentArchiveEnabled;
+    }
+
+    public boolean isClusterRemoteStoreSegmentArchiveFallbackToPerFile() {
+        return clusterRemoteStoreSegmentArchiveFallbackToPerFile;
+    }
+
+    public int getTranslogArchiveRetentionMinutes() {
+        return translogArchiveRetentionMinutes;
+    }
 }

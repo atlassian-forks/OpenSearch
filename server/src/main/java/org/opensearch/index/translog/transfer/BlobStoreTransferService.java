@@ -31,8 +31,6 @@ import org.opensearch.index.translog.ChannelFactory;
 import org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot;
 import org.opensearch.threadpool.ThreadPool;
 
-import java.io.BufferedInputStream;
-import org.opensearch.cluster.metadata.CryptoMetadata;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -133,22 +131,21 @@ public class BlobStoreTransferService implements TransferService {
         }
         final String resourceDescription = "BlobStoreTransferService.uploadBlob(blob=\"" + fileName + "\")";
         byte[] bytes = inputStream.readAllBytes();
-        try (IndexInput input = new ByteArrayIndexInput(resourceDescription, bytes)) {
-            long expectedChecksum = computeChecksum(input, resourceDescription);
-            uploadBlobAsyncInternal(
-                fileName,
-                fileName,
-                bytes.length,
-                blobPath,
-                writePriority,
-                (size, position) -> new OffsetRangeIndexInputStream(input, size, position),
-                expectedChecksum,
-                listener,
-                null
-            );
-        }
+        long expectedChecksum = computeChecksum(bytes, resourceDescription);
+        uploadBlobAsyncInternal(
+            fileName,
+            fileName,
+            bytes.length,
+            blobPath,
+            writePriority,
+            (size, position) -> new OffsetRangeIndexInputStream(new ByteArrayIndexInput(resourceDescription, bytes), size, position),
+            expectedChecksum,
+            listener,
+            null
+        );
     }
 
+    // Builds a metadata map containing the Base64-encoded checkpoint file data associated with a translog file.
     @Override
     public void uploadBlobStream(
         InputStream inputStream,
@@ -156,20 +153,21 @@ public class BlobStoreTransferService implements TransferService {
         Iterable<String> remotePath,
         String blobName,
         WritePriority writePriority,
-        CryptoMetadata cryptoMetadata
+        org.opensearch.cluster.metadata.CryptoMetadata cryptoMetadata
     ) throws IOException {
         BlobPath blobPath = (BlobPath) remotePath;
-        // Wrap so backends that require mark/reset (e.g. S3 plugin for retries) get a mark-supporting stream
         int bufferSize = (int) Math.min(contentLength, 64 * 1024);
-        if (bufferSize < 8192) {
-            bufferSize = 8192;
-        }
-        try (InputStream wrapped = new BufferedInputStream(inputStream, bufferSize)) {
+        if (bufferSize < 8192) bufferSize = 8192;
+        try (java.io.InputStream wrapped = new java.io.BufferedInputStream(inputStream, bufferSize)) {
             blobStore.blobContainer(blobPath).writeBlob(blobName, wrapped, contentLength, true);
         }
     }
 
-    // Builds a metadata map containing the Base64-encoded checkpoint file data associated with a translog file.
+    @Override
+    public java.io.InputStream downloadBlob(Iterable<String> path, String fileName, long position, long length) throws IOException {
+        return blobStore.blobContainer((BlobPath) path).readBlob(fileName, position, length);
+    }
+
     static Map<String, String> buildTransferFileMetadata(InputStream metadataInputStream) throws IOException {
         Map<String, String> metadata = new HashMap<>();
         try (ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream()) {
@@ -242,7 +240,8 @@ public class BlobStoreTransferService implements TransferService {
 
     }
 
-    private void uploadBlobAsyncInternal(
+    // package private for testing
+    void uploadBlobAsyncInternal(
         String fileName,
         String remoteFileName,
         long contentLength,
@@ -286,11 +285,6 @@ public class BlobStoreTransferService implements TransferService {
     public InputStreamWithMetadata downloadBlobWithMetadata(Iterable<String> path, String fileName) throws IOException {
         assert blobStore.isBlobMetadataEnabled();
         return blobStore.blobContainer((BlobPath) path).readBlobWithMetadata(fileName);
-    }
-
-    @Override
-    public InputStream downloadBlob(Iterable<String> path, String fileName, long position, long length) throws IOException {
-        return blobStore.blobContainer((BlobPath) path).readBlob(fileName, position, length);
     }
 
     @Override
@@ -362,10 +356,10 @@ public class BlobStoreTransferService implements TransferService {
         threadPool.executor(threadpoolName).execute(() -> { listAllInSortedOrder(path, filenamePrefix, limit, listener); });
     }
 
-    private static long computeChecksum(IndexInput indexInput, String resourceDescription) throws ChecksumCombinationException {
+    private static long computeChecksum(byte[] bytes, String resourceDescription) throws ChecksumCombinationException {
         long expectedChecksum;
-        try {
-            expectedChecksum = checksumOfChecksum(indexInput.clone(), CHECKSUM_BYTES_LENGTH);
+        try (IndexInput indexInput = new ByteArrayIndexInput(resourceDescription, bytes)) {
+            expectedChecksum = checksumOfChecksum(indexInput, CHECKSUM_BYTES_LENGTH);
         } catch (Exception e) {
             throw new ChecksumCombinationException(
                 "Potentially corrupted file: Checksum combination failed while combining stored checksum "

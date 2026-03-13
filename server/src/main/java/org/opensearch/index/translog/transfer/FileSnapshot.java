@@ -15,6 +15,7 @@ import org.opensearch.common.util.io.IOUtils;
 
 import java.io.BufferedInputStream;
 import java.io.Closeable;
+import org.opensearch.common.annotation.ExperimentalApi;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.Channels;

@@ -78,6 +78,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.concurrent.AbstractRefCounted;
+import org.opensearch.index.translog.TranslogArchiveCollector;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.common.util.concurrent.OpenSearchThreadPoolExecutor;
@@ -324,6 +325,7 @@ public class IndicesService extends AbstractLifecycleComponent
     private final IndexScopedSettings indexScopedSettings;
     private final IndicesFieldDataCache indicesFieldDataCache;
     private final CacheCleaner cacheCleaner;
+    private final TranslogArchiveCollector translogArchiveCollector;
     private final ThreadPool threadPool;
     private final CircuitBreakerService circuitBreakerService;
     private final BigArrays bigArrays;
@@ -367,6 +369,7 @@ public class IndicesService extends AbstractLifecycleComponent
     protected void doStart() {
         // Start thread that will manage cleaning the field data cache periodically
         threadPool.schedule(this.cacheCleaner, this.cleanInterval, ThreadPool.Names.SAME);
+        translogArchiveCollector.start();
     }
 
     public IndicesService(
@@ -506,6 +509,7 @@ public class IndicesService extends AbstractLifecycleComponent
             .addSettingsUpdateConsumer(CLUSTER_DEFAULT_INDEX_REFRESH_INTERVAL_SETTING, this::onRefreshIntervalUpdate);
         this.recoverySettings = recoverySettings;
         this.remoteStoreSettings = remoteStoreSettings;
+        this.translogArchiveCollector = new TranslogArchiveCollector(this, threadPool, remoteStoreSettings);
         this.compositeIndexSettings = compositeIndexSettings;
         this.fileCache = fileCache;
         this.replicator = replicator;
@@ -691,6 +695,11 @@ public class IndicesService extends AbstractLifecycleComponent
 
     @Override
     protected void doStop() {
+        try {
+            translogArchiveCollector.stop();
+        } catch (Exception e) {
+            logger.warn("Error stopping translog archive collector", e);
+        }
         ThreadPool.terminate(danglingIndicesThreadPoolExecutor, 10, TimeUnit.SECONDS);
 
         ExecutorService indicesStopExecutor = Executors.newFixedThreadPool(5, daemonThreadFactory(settings, "indices_shutdown"));
