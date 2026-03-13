@@ -171,11 +171,15 @@ import org.opensearch.index.store.Store.MetadataSnapshot;
 import org.opensearch.index.store.StoreFileMetadata;
 import org.opensearch.index.store.StoreStats;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
+import org.opensearch.index.translog.InternalTranslogManager;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
 import org.opensearch.index.translog.RemoteFsTranslog;
 import org.opensearch.index.translog.RemoteTranslogStats;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogConfig;
+import org.opensearch.index.translog.transfer.TransferSnapshot;
+import org.opensearch.index.translog.transfer.TranslogTransferManager;
+import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogStats;
 import org.opensearch.index.warmer.ShardIndexWarmerService;
@@ -5308,6 +5312,61 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     // Exclusively for testing, please do not use it elsewhere.
     public AsyncIOProcessor<Translog.Location> getTranslogSyncProcessor() {
         return translogSyncProcessor;
+    }
+
+    /**
+     * The translog transfer manager for remote translog, if any. Used by the archive collector for upload path.
+     */
+    public Optional<TranslogTransferManager> getTranslogTransferManager() {
+        Engine engine = getEngine();
+        if (engine instanceof InternalEngine) {
+            return ((InternalEngine) engine).translogManager().getTranslogTransferManager();
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Builds a transfer snapshot for archive upload and passes it to the consumer with a release callback.
+     * Only supported when translog is remote with archive upload enabled. Caller must close the snapshot and call
+     * the release runnable when done.
+     */
+    public void buildSnapshotForArchive(BiConsumer<TransferSnapshot, Runnable> consumer) throws IOException {
+        Engine engine = getEngine();
+        if (engine instanceof InternalEngine) {
+            ((InternalEngine) engine).translogManager().buildSnapshotForArchive(consumer);
+        } else {
+            throw new UnsupportedOperationException("archive snapshot not supported");
+        }
+    }
+
+    /**
+     * Whether this shard's translog manager supports building a snapshot for archive upload.
+     */
+    public boolean supportsArchiveSnapshot() {
+        Engine engine = getEngine();
+        return engine instanceof InternalEngine && ((InternalEngine) engine).translogManager().supportsArchiveSnapshot();
+    }
+
+    /**
+     * Node ID for the translog (for archive path), if applicable.
+     */
+    public Optional<String> getTranslogNodeId() {
+        Engine engine = getEngine();
+        if (engine instanceof InternalEngine) {
+            return ((InternalEngine) engine).translogManager().getNodeId();
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Returns retention bounds for archive deletion when this shard uses remote translog; empty otherwise.
+     */
+    public Optional<ArchiveDeletionHelper.RetentionBounds> getArchiveRetentionBounds() {
+        Engine engine = getEngine();
+        if (engine instanceof InternalEngine) {
+            return ((InternalEngine) engine).translogManager().getArchiveRetentionBounds();
+        }
+        return Optional.empty();
     }
 
     enum ShardMigrationState {
