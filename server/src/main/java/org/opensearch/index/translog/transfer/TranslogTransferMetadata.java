@@ -9,6 +9,7 @@
 package org.opensearch.index.translog.transfer;
 
 import org.opensearch.common.SetOnce;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.index.remote.RemoteStoreUtils;
 
@@ -23,6 +24,7 @@ import java.util.Objects;
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public class TranslogTransferMetadata {
 
     private final long primaryTerm;
