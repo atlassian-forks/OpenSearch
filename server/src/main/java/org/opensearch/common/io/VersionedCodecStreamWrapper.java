@@ -56,7 +56,17 @@ public class VersionedCodecStreamWrapper<T> {
         try {
             CodecUtil.checksumEntireFile(indexInput);
             int readStreamVersion = checkHeader(indexInput);
-            return getHandlerForVersion(readStreamVersion).readContent(indexInput);
+            IndexIOStreamHandler<T> handler = getHandlerForVersion(readStreamVersion);
+            if (handler instanceof VersionAwareIndexIOStreamHandler) {
+                ((VersionAwareIndexIOStreamHandler<?>) handler).setReadVersion(readStreamVersion);
+            }
+            try {
+                return handler.readContent(indexInput);
+            } finally {
+                if (handler instanceof VersionAwareIndexIOStreamHandler) {
+                    ((VersionAwareIndexIOStreamHandler<?>) handler).clearReadVersion();
+                }
+            }
         } catch (CorruptIndexException cie) {
             logger.error(
                 () -> new ParameterizedMessage(
@@ -82,12 +92,12 @@ public class VersionedCodecStreamWrapper<T> {
 
     /**
      * Reads header from file input stream containing {@code this.codec} and {@code this.currentVersion}.
+     * Accepts any version from 1 up to currentVersion for backward compatibility.
      * @param indexInput file input stream
      * @return header version found in the input stream
      */
     private int checkHeader(IndexInput indexInput) throws IOException {
-        // TODO Once versioning strategy is decided we'll add support for min/max supported versions
-        return CodecUtil.checkHeader(indexInput, this.codec, this.currentVersion, this.currentVersion);
+        return CodecUtil.checkHeader(indexInput, this.codec, 1, this.currentVersion);
     }
 
     /**

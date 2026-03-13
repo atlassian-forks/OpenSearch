@@ -839,7 +839,7 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
 
         BytesStreamOutput output = new BytesStreamOutput();
         OutputStreamIndexOutput indexOutput = new OutputStreamIndexOutput("segment metadata", "metadata output stream", output, 4096);
-        CodecUtil.writeHeader(indexOutput, RemoteSegmentMetadata.METADATA_CODEC, 2);
+        CodecUtil.writeHeader(indexOutput, RemoteSegmentMetadata.METADATA_CODEC, RemoteSegmentMetadata.CURRENT_VERSION + 1);
         indexOutput.writeMapOfStrings(metadata);
         CodecUtil.writeFooter(indexOutput);
         indexOutput.close();
@@ -1114,7 +1114,7 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
           If author doesn't want to support old metadata files. Then this can be ignored.
           After taking appropriate action, fix this test by setting the correct version here
          */
-        assertEquals(RemoteSegmentMetadata.CURRENT_VERSION, 1);
+        assertEquals(RemoteSegmentMetadata.CURRENT_VERSION, 2);
     }
 
     private void indexDocs(int startDocId, int numberOfDocs) throws IOException {

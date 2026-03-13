@@ -10,7 +10,7 @@ package org.opensearch.index.store.remote.metadata;
 
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
-import org.opensearch.common.io.IndexIOStreamHandler;
+import org.opensearch.common.io.VersionAwareIndexIOStreamHandler;
 
 import java.io.IOException;
 
@@ -19,7 +19,20 @@ import java.io.IOException;
  *
  * @opensearch.internal
  */
-public class RemoteSegmentMetadataHandler implements IndexIOStreamHandler<RemoteSegmentMetadata> {
+public class RemoteSegmentMetadataHandler implements VersionAwareIndexIOStreamHandler<RemoteSegmentMetadata> {
+
+    private static final ThreadLocal<Integer> VERSION_CONTEXT = ThreadLocal.withInitial(() -> RemoteSegmentMetadata.CURRENT_VERSION);
+
+    @Override
+    public void setReadVersion(int version) {
+        VERSION_CONTEXT.set(version);
+    }
+
+    @Override
+    public void clearReadVersion() {
+        VERSION_CONTEXT.remove();
+    }
+
     /**
      * Reads metadata content from metadata file input stream and parsed into {@link RemoteSegmentMetadata}
      * @param indexInput metadata file input stream with {@link IndexInput#getFilePointer()} pointing to metadata content
