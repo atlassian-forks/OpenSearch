@@ -38,7 +38,7 @@ public class RemoteSegmentMetadata {
     /**
      * Latest supported version of metadata
      */
-    public static final int CURRENT_VERSION = VERSION_TWO;
+    public static final int CURRENT_VERSION = VERSION_ONE;
     /**
      * Metadata codec
      */
@@ -161,22 +161,24 @@ public class RemoteSegmentMetadata {
         writeCheckpointToIndexOutput(replicationCheckpoint, out);
         out.writeLong(segmentInfosBytes.length);
         out.writeBytes(segmentInfosBytes, segmentInfosBytes.length);
-        
-        // Write archive fields (v2 format)
-        out.writeByte((byte) (archiveEnabled ? 1 : 0));
-        if (archiveEnabled) {
-            out.writeString(archiveBlob != null ? archiveBlob : "");
-            out.writeString(archiveFormat != null ? archiveFormat : "");
-            
-            // Write archive entries map
-            if (archiveEntries != null) {
-                out.writeVInt(archiveEntries.size());
-                for (Map.Entry<String, SegmentArchiveEntry> entry : archiveEntries.entrySet()) {
-                    out.writeString(entry.getKey());
-                    entry.getValue().write(out);
+
+        // Archive fields are written only when format version >= VERSION_TWO
+        if (CURRENT_VERSION >= VERSION_TWO) {
+            out.writeByte((byte) (archiveEnabled ? 1 : 0));
+            if (archiveEnabled) {
+                out.writeString(archiveBlob != null ? archiveBlob : "");
+                out.writeString(archiveFormat != null ? archiveFormat : "");
+
+                // Write archive entries map
+                if (archiveEntries != null) {
+                    out.writeVInt(archiveEntries.size());
+                    for (Map.Entry<String, SegmentArchiveEntry> entry : archiveEntries.entrySet()) {
+                        out.writeString(entry.getKey());
+                        entry.getValue().write(out);
+                    }
+                } else {
+                    out.writeVInt(0);
                 }
-            } else {
-                out.writeVInt(0);
             }
         }
     }

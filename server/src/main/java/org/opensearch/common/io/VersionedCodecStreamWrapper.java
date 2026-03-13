@@ -92,8 +92,8 @@ public class VersionedCodecStreamWrapper<T> {
      * @return header version found in the input stream
      */
     private int checkHeader(IndexInput indexInput) throws IOException {
-        // TODO Once versioning strategy is decided we'll add support for min/max supported versions
-        return CodecUtil.checkHeader(indexInput, this.codec, this.currentVersion, this.currentVersion);
+        // Accept any version from 1 up to currentVersion to support backward compatibility
+        return CodecUtil.checkHeader(indexInput, this.codec, 1, Math.max(this.currentVersion, 1));
     }
 
     /**
