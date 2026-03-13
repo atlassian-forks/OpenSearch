@@ -757,6 +757,11 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_PATH_HASH_ALGORITHM_SETTING,
                 RemoteStoreSettings.CLUSTER_REMOTE_MAX_TRANSLOG_READERS,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_METADATA,
+                RemoteStoreSettings.CLUSTER_SERVER_SIDE_ENCRYPTION_ENABLED,
+                RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD,
+                RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED,
+                RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE,
+                RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES,
                 SearchService.CLUSTER_ALLOW_DERIVED_FIELD_SETTING
             )
         )

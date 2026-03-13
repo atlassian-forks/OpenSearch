@@ -75,7 +75,7 @@ public class RemoteStoreSettings {
     @ExperimentalApi
     public static final Setting<RemoteStoreEnums.PathType> CLUSTER_REMOTE_STORE_PATH_TYPE_SETTING = new Setting<>(
         "cluster.remote_store.index.path.type",
-        RemoteStoreEnums.PathType.FIXED.toString(),
+        RemoteStoreEnums.PathType.HASHED_PREFIX.toString(),
         RemoteStoreEnums.PathType::parseString,
         Property.NodeScope,
         Property.Dynamic
@@ -134,14 +134,140 @@ public class RemoteStoreSettings {
         Property.Dynamic
     );
 
+    /**
+     * Controls pinned timestamp feature enablement
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_ENABLED = Setting.boolSetting(
+        "cluster.remote_store.pinned_timestamps.enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Controls pinned timestamp scheduler interval
+     */
+    public static final Setting<TimeValue> CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_SCHEDULER_INTERVAL = Setting.timeSetting(
+        "cluster.remote_store.pinned_timestamps.scheduler_interval",
+        TimeValue.timeValueMinutes(3),
+        TimeValue.timeValueMinutes(1),
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Controls allowed timestamp values to be pinned from past
+     */
+    public static final Setting<TimeValue> CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_LOOKBACK_INTERVAL = Setting.timeSetting(
+        "cluster.remote_store.pinned_timestamps.lookback_interval",
+        TimeValue.timeValueMinutes(1),
+        TimeValue.timeValueMinutes(1),
+        TimeValue.timeValueMinutes(5),
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Controls the fixed prefix for the translog path on remote store.
+     */
+    public static final Setting<String> CLUSTER_REMOTE_STORE_TRANSLOG_PATH_PREFIX = Setting.simpleString(
+        "cluster.remote_store.translog.path.prefix",
+        "",
+        Property.NodeScope,
+        Property.Final
+    );
+
+    /**
+     * Controls the fixed prefix for the segments path on remote store.
+     */
+    public static final Setting<String> CLUSTER_REMOTE_STORE_SEGMENTS_PATH_PREFIX = Setting.simpleString(
+        "cluster.remote_store.segments.path.prefix",
+        "",
+        Property.NodeScope,
+        Property.Final
+    );
+
+    /**
+     * Controls the ServerSideEncryption Settings.
+     */
+    public static final Setting<Boolean> CLUSTER_SERVER_SIDE_ENCRYPTION_ENABLED = Setting.boolSetting(
+        "cluster.remote_store.server_side_encryption",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * When true, if translog archive upload fails for a batch, fall back to per-shard upload for that batch.
+     * When false, fail and rely on retry (no fallback).
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD = Setting.boolSetting(
+        "cluster.remote_store.translog.archive.fallback_to_per_shard_upload",
+        true,
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
+    /**
+     * Controls whether segment archive upload is globally enabled at cluster level.
+     * Index-level setting still required to enable per index.
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED = Setting.boolSetting(
+        "cluster.remote_store.segment.archive.enabled",
+        true,
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
+    /**
+     * Controls fallback behavior when segment archive upload fails.
+     * When true, falls back to per-file upload on archive failure.
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE = Setting.boolSetting(
+        "cluster.remote_store.segment.archive.fallback_to_per_file_upload",
+        true,
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
+    /**
+     * Controls retention period (in minutes) for translog archives.
+     * Used for node recovery and durability. Translog archives older than this period are deleted.
+     * Default: 60 minutes (1 hour). Range: 30-10080 minutes (30 min to 7 days).
+     * Note: Effective retention is longer than configured value due to batching semantics.
+     */
+    @ExperimentalApi
+    public static final Setting<Integer> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES = Setting.intSetting(
+        "cluster.remote_store.translog.archive.retention_minutes",
+        60,
+        30,
+        10080,
+        v -> {
+            if (v < 30 || v > 10080) {
+                throw new IllegalArgumentException(
+                    "Translog archive retention must be between 30 minutes and 7 days (10080 minutes)"
+                );
+            }
+        },
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
     private volatile TimeValue clusterRemoteTranslogBufferInterval;
+    private volatile boolean clusterRemoteStoreSegmentArchiveEnabled;
+    private volatile boolean clusterRemoteStoreSegmentArchiveFallbackToPerFile;
     private volatile int minRemoteSegmentMetadataFiles;
     private volatile TimeValue clusterRemoteTranslogTransferTimeout;
     private volatile TimeValue clusterRemoteSegmentTransferTimeout;
     private volatile RemoteStoreEnums.PathType pathType;
     private volatile RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm;
     private volatile int maxRemoteTranslogReaders;
+    private volatile boolean isClusterServerSideEncryptionRepoEnabled;
     private volatile boolean isTranslogMetadataEnabled;
+    private static volatile boolean isPinnedTimestampsEnabled;
+    private static volatile TimeValue pinnedTimestampsSchedulerInterval;
+    private static volatile TimeValue pinnedTimestampsLookbackInterval;
+    private final String translogPathFixedPrefix;
+    private final String segmentsPathFixedPrefix;
+    private volatile boolean translogArchiveFallbackToPerShard;
+    private volatile int translogArchiveRetentionMinutes;
 
     public RemoteStoreSettings(Settings settings, ClusterSettings clusterSettings) {
         clusterRemoteTranslogBufferInterval = CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.get(settings);
@@ -179,6 +305,75 @@ public class RemoteStoreSettings {
             CLUSTER_REMOTE_SEGMENT_TRANSFER_TIMEOUT_SETTING,
             this::setClusterRemoteSegmentTransferTimeout
         );
+
+        isClusterServerSideEncryptionRepoEnabled = CLUSTER_SERVER_SIDE_ENCRYPTION_ENABLED.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(CLUSTER_SERVER_SIDE_ENCRYPTION_ENABLED, this::setClusterServerSideEncryptionEnabled);
+
+        pinnedTimestampsSchedulerInterval = CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_SCHEDULER_INTERVAL.get(settings);
+        pinnedTimestampsLookbackInterval = CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_LOOKBACK_INTERVAL.get(settings);
+        isPinnedTimestampsEnabled = CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_ENABLED.get(settings);
+
+        translogPathFixedPrefix = CLUSTER_REMOTE_STORE_TRANSLOG_PATH_PREFIX.get(settings);
+        segmentsPathFixedPrefix = CLUSTER_REMOTE_STORE_SEGMENTS_PATH_PREFIX.get(settings);
+
+        translogArchiveFallbackToPerShard = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD,
+            this::setTranslogArchiveFallbackToPerShard
+        );
+
+        clusterRemoteStoreSegmentArchiveEnabled = CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED,
+            this::setClusterRemoteStoreSegmentArchiveEnabled
+        );
+
+        clusterRemoteStoreSegmentArchiveFallbackToPerFile = CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE,
+            this::setClusterRemoteStoreSegmentArchiveFallbackToPerFile
+        );
+
+        translogArchiveRetentionMinutes = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES,
+            this::setTranslogArchiveRetentionMinutes
+        );
+    }
+
+    private void setTranslogArchiveFallbackToPerShard(boolean value) {
+        this.translogArchiveFallbackToPerShard = value;
+    }
+
+    /**
+     * When true, if translog archive upload fails, fall back to per-shard upload for that batch.
+     */
+    public boolean getTranslogArchiveFallbackToPerShard() {
+        return translogArchiveFallbackToPerShard;
+    }
+
+    private void setClusterRemoteStoreSegmentArchiveEnabled(boolean value) {
+        this.clusterRemoteStoreSegmentArchiveEnabled = value;
+    }
+
+    public boolean isClusterRemoteStoreSegmentArchiveEnabled() {
+        return clusterRemoteStoreSegmentArchiveEnabled;
+    }
+
+    private void setClusterRemoteStoreSegmentArchiveFallbackToPerFile(boolean value) {
+        this.clusterRemoteStoreSegmentArchiveFallbackToPerFile = value;
+    }
+
+    public boolean isClusterRemoteStoreSegmentArchiveFallbackToPerFile() {
+        return clusterRemoteStoreSegmentArchiveFallbackToPerFile;
+    }
+
+    private void setTranslogArchiveRetentionMinutes(int value) {
+        this.translogArchiveRetentionMinutes = value;
+    }
+
+    public int getTranslogArchiveRetentionMinutes() {
+        return translogArchiveRetentionMinutes;
     }
 
     public TimeValue getClusterRemoteTranslogBufferInterval() {
@@ -245,5 +440,38 @@ public class RemoteStoreSettings {
 
     private void setMaxRemoteTranslogReaders(int maxRemoteTranslogReaders) {
         this.maxRemoteTranslogReaders = maxRemoteTranslogReaders;
+    }
+
+    public boolean isClusterServerSideEncryptionEnabled() {
+        return isClusterServerSideEncryptionRepoEnabled;
+    }
+
+    private void setClusterServerSideEncryptionEnabled(boolean clusterServerSideEncryptionEnabled) {
+        isClusterServerSideEncryptionRepoEnabled = clusterServerSideEncryptionEnabled;
+    }
+
+    public static TimeValue getPinnedTimestampsSchedulerInterval() {
+        return pinnedTimestampsSchedulerInterval;
+    }
+
+    public static TimeValue getPinnedTimestampsLookbackInterval() {
+        return pinnedTimestampsLookbackInterval;
+    }
+
+    // Visible for testing
+    public static void setPinnedTimestampsLookbackInterval(TimeValue pinnedTimestampsLookbackInterval) {
+        RemoteStoreSettings.pinnedTimestampsLookbackInterval = pinnedTimestampsLookbackInterval;
+    }
+
+    public static boolean isPinnedTimestampsEnabled() {
+        return isPinnedTimestampsEnabled;
+    }
+
+    public String getTranslogPathFixedPrefix() {
+        return translogPathFixedPrefix;
+    }
+
+    public String getSegmentsPathFixedPrefix() {
+        return segmentsPathFixedPrefix;
     }
 }
