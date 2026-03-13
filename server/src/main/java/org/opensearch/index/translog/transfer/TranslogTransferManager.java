@@ -31,6 +31,7 @@ import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.common.annotation.ExperimentalApi;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -55,6 +56,7 @@ import static org.opensearch.index.translog.transfer.FileSnapshot.TranslogFileSn
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public class TranslogTransferManager {
 
     private final ShardId shardId;
@@ -65,6 +67,10 @@ public class TranslogTransferManager {
     private final RemoteTranslogTransferTracker remoteTranslogTransferTracker;
     private final RemoteStoreSettings remoteStoreSettings;
     private static final int METADATA_FILES_TO_FETCH = 10;
+    /** Max archive blobs to list per node when scanning for download; same as retention run. */
+    private static final int MAX_ARCHIVE_BLOBS_PER_NODE = 500;
+    /** Gen bucket size; must match TranslogArchiveCollector (translog/data/{hashPrefix}/{genBucket}). */
+    private static final int GEN_BUCKET_SIZE = 100;
     // Flag to include checkpoint file data as translog file metadata during upload/download
     private final boolean isTranslogMetadataEnabled;
     final static String CHECKPOINT_FILE_DATA_KEY = "ckp-data";
@@ -96,6 +102,14 @@ public class TranslogTransferManager {
         this.remoteTranslogTransferTracker = remoteTranslogTransferTracker;
         this.remoteStoreSettings = remoteStoreSettings;
         this.isTranslogMetadataEnabled = isTranslogMetadataEnabled;
+    }
+
+    public TransferService getTransferService() {
+        return transferService;
+    }
+
+    public BlobPath getRemoteDataTransferPath() {
+        return remoteDataTransferPath;
     }
 
     public RemoteTranslogTransferTracker getRemoteTranslogTransferTracker() {
@@ -394,6 +408,14 @@ public class TranslogTransferManager {
         }
 
         return metadataSetOnce.get();
+    }
+
+    /**
+     * Upload only the metadata file for a transfer snapshot (used by archive upload path after ZIP has been uploaded).
+     */
+    public void uploadMetadata(TransferSnapshot transferSnapshot) throws IOException {
+        TransferFileSnapshot tlogMetadata = prepareMetadata(transferSnapshot);
+        transferService.uploadBlob(tlogMetadata, remoteMetadataTransferPath, WritePriority.HIGH);
     }
 
     private TransferFileSnapshot prepareMetadata(TransferSnapshot transferSnapshot) throws IOException {

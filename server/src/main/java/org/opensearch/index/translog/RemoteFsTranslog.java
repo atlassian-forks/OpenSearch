@@ -9,6 +9,7 @@
 package org.opensearch.index.translog;
 
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.blobstore.BlobPath;
@@ -28,6 +29,7 @@ import org.opensearch.index.translog.transfer.TransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogCheckpointTransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.TranslogTransferMetadata;
+import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.repositories.Repository;
@@ -43,11 +45,13 @@ import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
@@ -431,6 +435,93 @@ public class RemoteFsTranslog extends Translog {
             syncPermit.release(SYNC_PERMIT);
         }
 
+    }
+
+    public void buildSnapshotForArchive(BiConsumer<TransferSnapshot, Runnable> consumer) throws IOException {
+        if (startedPrimarySupplier.getAsBoolean() == false || syncPermit.tryAcquire(SYNC_PERMIT) == false) {
+            return;
+        }
+        Releasable genLock = null;
+        Releasable readLockRef = null;
+        try {
+            long maxSeqNo = -1;
+            long snapshotGeneration;
+            try (Releasable ignored = writeLock.acquire()) {
+                try {
+                    if (closed.get() == false) {
+                        maxSeqNo = getMaxSeqNo();
+                    }
+                    final TranslogReader reader = current.closeIntoReader();
+                    readers.add(reader);
+                    copyCheckpointTo(location.resolve(getCommitCheckpointFileName(current.getGeneration())));
+                    snapshotGeneration = current.getGeneration();
+                    if (closed.get() == false) {
+                        logger.trace("Creating new writer for gen: [{}]", current.getGeneration() + 1);
+                        current = createWriter(current.getGeneration() + 1);
+                    }
+                    assert writeLock.isHeldByCurrentThread();
+                    readLockRef = readLock.acquire();
+                } catch (final Exception e) {
+                    tragedy.setTragicException(e);
+                    closeOnTragicEvent(e);
+                    throw e;
+                }
+            }
+            long primaryTerm = primaryTermSupplier.getAsLong();
+            genLock = deletionPolicy.acquireTranslogGen(getMinFileGeneration());
+            final Releasable genLockForRelease = genLock;
+            TranslogCheckpointTransferSnapshot snapshot = new TranslogCheckpointTransferSnapshot.Builder(
+                primaryTerm,
+                snapshotGeneration,
+                location,
+                readers,
+                Translog::getCommitCheckpointFileName,
+                config.getNodeId()
+            ).build();
+            if (readLockRef != null) {
+                readLockRef.close();
+                readLockRef = null;
+            }
+            Runnable release = () -> {
+                Releasables.close(genLockForRelease);
+                syncPermit.release(SYNC_PERMIT);
+            };
+            consumer.accept(snapshot, release);
+        } catch (Exception e) {
+            Releasables.close(genLock);
+            if (readLockRef != null) {
+                Releasables.close(readLockRef);
+            }
+            syncPermit.release(SYNC_PERMIT);
+            throw e;
+        }
+    }
+
+    public TranslogTransferManager getTranslogTransferManager() {
+        return translogTransferManager;
+    }
+
+    /**
+     * Returns retention bounds for archive deletion: do not delete archives containing entries with
+     * primary term >= minPrimaryTermToKeep or (primary term == minPrimaryTermToKeep and generation >= minGenerationToKeep).
+     * Used by the node-level archive collector to build retentionByShard for deleteArchivesOlderThanRetention.
+     */
+    public Optional<ArchiveDeletionHelper.RetentionBounds> getArchiveRetentionBounds() {
+        long minPrimaryTermToKeep;
+        try (ReleasableLock ignored = readLock.acquire()) {
+            if (readers.isEmpty()) {
+                minPrimaryTermToKeep = primaryTermSupplier.getAsLong();
+            } else {
+                minPrimaryTermToKeep = readers.stream().map(BaseTranslogReader::getPrimaryTerm).min(Long::compare).get();
+            }
+        } catch (AlreadyClosedException e) {
+            return Optional.empty();
+        }
+        long minGen = minRemoteGenReferenced - indexSettings().getRemoteTranslogExtraKeep();
+        if (minGen < 0) {
+            minGen = 0;
+        }
+        return Optional.of(new ArchiveDeletionHelper.RetentionBounds(minPrimaryTermToKeep, minGen));
     }
 
     // Visible for testing
