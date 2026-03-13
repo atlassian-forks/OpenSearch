@@ -767,6 +767,26 @@ public final class IndexSettings {
         Property.IndexScope
     );
 
+    /**
+     * When true, translog upload uses per-node archive (ZIP) upload to reduce PUT count; when false, uses existing per-shard upload.
+     */
+    public static final Setting<Boolean> INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING = Setting.boolSetting(
+        "index.remote_store.translog.archive_upload_enabled",
+        false,
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
+    /**
+     * When true, segment upload uses per-node archive (ZIP) upload to reduce PUT count; when false, uses existing per-file upload.
+     */
+    public static final Setting<Boolean> INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING = Setting.boolSetting(
+        "index.remote_store.segment.archive_upload_enabled",
+        false,
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
     public static final Setting<Long> INDEX_CONTEXT_CREATED_VERSION = Setting.longSetting(
         "index.context.created_version",
         0,
@@ -796,6 +816,8 @@ public final class IndexSettings {
     private volatile String remoteStoreTranslogRepository;
     private volatile String remoteStoreRepository;
     private int remoteTranslogKeepExtraGen;
+    private volatile boolean translogArchiveUploadEnabled;
+    private volatile boolean segmentArchiveUploadEnabled;
     private Version extendedCompatibilitySnapshotVersion;
     // volatile fields are updated via #updateIndexMetadata(IndexMetadata) under lock
     private volatile Settings settings;
@@ -1002,6 +1024,8 @@ public final class IndexSettings {
         remoteTranslogUploadBufferInterval = INDEX_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.get(settings);
         remoteStoreRepository = settings.get(IndexMetadata.SETTING_REMOTE_SEGMENT_STORE_REPOSITORY);
         this.remoteTranslogKeepExtraGen = INDEX_REMOTE_TRANSLOG_KEEP_EXTRA_GEN_SETTING.get(settings);
+        this.translogArchiveUploadEnabled = INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.get(settings);
+        this.segmentArchiveUploadEnabled = INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING.get(settings);
 
         if (isRemoteSnapshot() && FeatureFlags.isEnabled(SEARCHABLE_SNAPSHOT_EXTENDED_COMPATIBILITY)) {
             extendedCompatibilitySnapshotVersion = SEARCHABLE_SNAPSHOT_EXTENDED_COMPATIBILITY_MINIMUM_VERSION;
@@ -1184,6 +1208,14 @@ public final class IndexSettings {
             this::setRemoteTranslogUploadBufferInterval
         );
         scopedSettings.addSettingsUpdateConsumer(INDEX_REMOTE_TRANSLOG_KEEP_EXTRA_GEN_SETTING, this::setRemoteTranslogKeepExtraGen);
+        scopedSettings.addSettingsUpdateConsumer(
+            INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING,
+            this::setTranslogArchiveUploadEnabled
+        );
+        scopedSettings.addSettingsUpdateConsumer(
+            INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING,
+            this::setSegmentArchiveUploadEnabled
+        );
         scopedSettings.addSettingsUpdateConsumer(INDEX_DOC_ID_FUZZY_SET_ENABLED_SETTING, this::setEnableFuzzySetForDocId);
         scopedSettings.addSettingsUpdateConsumer(
             INDEX_DOC_ID_FUZZY_SET_FALSE_POSITIVE_PROBABILITY_SETTING,
@@ -1509,6 +1541,22 @@ public final class IndexSettings {
 
     public void setRemoteTranslogKeepExtraGen(int extraGen) {
         this.remoteTranslogKeepExtraGen = extraGen;
+    }
+
+    public boolean isTranslogArchiveUploadEnabled() {
+        return translogArchiveUploadEnabled;
+    }
+
+    private void setTranslogArchiveUploadEnabled(boolean enabled) {
+        this.translogArchiveUploadEnabled = enabled;
+    }
+
+    private void setSegmentArchiveUploadEnabled(boolean enabled) {
+        this.segmentArchiveUploadEnabled = enabled;
+    }
+
+    public boolean isSegmentArchiveUploadEnabled() {
+        return segmentArchiveUploadEnabled;
     }
 
     /**
