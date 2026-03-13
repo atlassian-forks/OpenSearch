@@ -73,6 +73,8 @@ public class RemoteSegmentMetadataHandlerTests extends IndexShardTestCase {
         RemoteSegmentMetadata.writeCheckpointToIndexOutput(replicationCheckpoint, indexOutput);
         indexOutput.writeLong(0);
         indexOutput.writeBytes(new byte[0], 0);
+        // v2: write archive byte (archiveEnabled = false)
+        indexOutput.writeByte((byte) 0);
         indexOutput.close();
         RemoteSegmentMetadata metadata = remoteSegmentMetadataHandler.readContent(
             new ByteArrayIndexInput("dummy bytes", BytesReference.toBytes(output.bytes()))
@@ -92,6 +94,8 @@ public class RemoteSegmentMetadataHandlerTests extends IndexShardTestCase {
         byte[] segmentInfosBytes = segmentInfosOutput.toArrayCopy();
         indexOutput.writeLong(segmentInfosBytes.length);
         indexOutput.writeBytes(segmentInfosBytes, 0, segmentInfosBytes.length);
+        // v2: write archive byte (archiveEnabled = false)
+        indexOutput.writeByte((byte) 0);
         indexOutput.close();
         RemoteSegmentMetadata metadata = remoteSegmentMetadataHandler.readContent(
             new ByteArrayIndexInput("dummy bytes", BytesReference.toBytes(output.bytes()))
