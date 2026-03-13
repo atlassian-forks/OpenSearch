@@ -36,9 +36,11 @@ public class RemoteSegmentMetadata {
     public static final int VERSION_TWO = 2;
 
     /**
-     * Latest supported version of metadata
+     * Latest supported version of metadata.
+     * VERSION_TWO adds optional archive fields (archiveEnabled, archiveBlob, archiveFormat, archiveEntries).
+     * Old files written with VERSION_ONE are still readable (archive fields default to disabled).
      */
-    public static final int CURRENT_VERSION = VERSION_ONE;
+    public static final int CURRENT_VERSION = VERSION_TWO;
     /**
      * Metadata codec
      */

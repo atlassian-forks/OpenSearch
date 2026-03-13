@@ -56,12 +56,16 @@ public class VersionedCodecStreamWrapper<T> {
         try {
             CodecUtil.checksumEntireFile(indexInput);
             int readStreamVersion = checkHeader(indexInput);
-            // Set version context for handlers that need version-aware reading
-            setVersionContext(readStreamVersion);
+            IndexIOStreamHandler<T> handler = getHandlerForVersion(readStreamVersion);
+            if (handler instanceof VersionAwareIndexIOStreamHandler) {
+                ((VersionAwareIndexIOStreamHandler<?>) handler).setReadVersion(readStreamVersion);
+            }
             try {
-                return getHandlerForVersion(readStreamVersion).readContent(indexInput);
+                return handler.readContent(indexInput);
             } finally {
-                clearVersionContext();
+                if (handler instanceof VersionAwareIndexIOStreamHandler) {
+                    ((VersionAwareIndexIOStreamHandler<?>) handler).clearReadVersion();
+                }
             }
         } catch (CorruptIndexException cie) {
             logger.error(
@@ -88,12 +92,12 @@ public class VersionedCodecStreamWrapper<T> {
 
     /**
      * Reads header from file input stream containing {@code this.codec} and {@code this.currentVersion}.
+     * Accepts any version from 1 up to currentVersion for backward compatibility.
      * @param indexInput file input stream
      * @return header version found in the input stream
      */
     private int checkHeader(IndexInput indexInput) throws IOException {
-        // Accept any version from 1 up to currentVersion to support backward compatibility
-        return CodecUtil.checkHeader(indexInput, this.codec, 1, Math.max(this.currentVersion, 1));
+        return CodecUtil.checkHeader(indexInput, this.codec, 1, this.currentVersion);
     }
 
     /**
@@ -129,41 +133,5 @@ public class VersionedCodecStreamWrapper<T> {
         // TODO implement factory and pick relevant handler based on version.
         // It should also take into account min and max supported versions
         return this.indexIOStreamHandler;
-    }
-
-    /**
-     * Sets the version context for handlers that need version-aware reading.
-     * This is a default implementation that handlers can override.
-     * @param version the version to set
-     */
-    protected void setVersionContext(int version) {
-        // Default implementation - subclasses or handlers can use ThreadLocal to store version context
-        // For RemoteSegmentMetadataHandler, it uses static ThreadLocal internally
-        try {
-            // Try to use RemoteSegmentMetadataHandler's static method if available
-            Class<?> handlerClass = indexIOStreamHandler.getClass();
-            if (handlerClass.getSimpleName().equals("RemoteSegmentMetadataHandler")) {
-                handlerClass.getMethod("setVersionContext", int.class).invoke(null, version);
-            }
-        } catch (Exception e) {
-            // If not available, silently ignore
-        }
-    }
-
-    /**
-     * Clears the version context for handlers that need version-aware reading.
-     * This is a default implementation that handlers can override.
-     */
-    protected void clearVersionContext() {
-        // Default implementation - subclasses or handlers can use ThreadLocal to store version context
-        try {
-            // Try to use RemoteSegmentMetadataHandler's static method if available
-            Class<?> handlerClass = indexIOStreamHandler.getClass();
-            if (handlerClass.getSimpleName().equals("RemoteSegmentMetadataHandler")) {
-                handlerClass.getMethod("clearVersionContext").invoke(null);
-            }
-        } catch (Exception e) {
-            // If not available, silently ignore
-        }
     }
 }

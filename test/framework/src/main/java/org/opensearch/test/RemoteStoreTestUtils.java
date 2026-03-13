@@ -60,6 +60,10 @@ public final class RemoteStoreTestUtils {
         RemoteSegmentMetadata.writeCheckpointToIndexOutput(replicationCheckpoint, indexOutput);
         indexOutput.writeLong(byteArray.length);
         indexOutput.writeBytes(byteArray, byteArray.length);
+        // Write archive fields for VERSION_TWO (archiveEnabled = false)
+        if (RemoteSegmentMetadata.CURRENT_VERSION >= RemoteSegmentMetadata.VERSION_TWO) {
+            indexOutput.writeByte((byte) 0); // archiveEnabled = false
+        }
         CodecUtil.writeFooter(indexOutput);
         indexOutput.close();
         return new ByteArrayInputStream(BytesReference.toBytes(output.bytes()));

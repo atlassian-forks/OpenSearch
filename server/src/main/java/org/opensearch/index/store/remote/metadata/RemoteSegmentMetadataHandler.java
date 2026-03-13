@@ -10,7 +10,7 @@ package org.opensearch.index.store.remote.metadata;
 
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
-import org.opensearch.common.io.IndexIOStreamHandler;
+import org.opensearch.common.io.VersionAwareIndexIOStreamHandler;
 
 import java.io.IOException;
 
@@ -19,30 +19,17 @@ import java.io.IOException;
  *
  * @opensearch.internal
  */
-public class RemoteSegmentMetadataHandler implements IndexIOStreamHandler<RemoteSegmentMetadata> {
+public class RemoteSegmentMetadataHandler implements VersionAwareIndexIOStreamHandler<RemoteSegmentMetadata> {
 
     private static final ThreadLocal<Integer> VERSION_CONTEXT = ThreadLocal.withInitial(() -> RemoteSegmentMetadata.CURRENT_VERSION);
 
-    /**
-     * Sets the version context for reading metadata
-     * @param version the version to use for reading
-     */
-    public static void setVersionContext(int version) {
+    @Override
+    public void setReadVersion(int version) {
         VERSION_CONTEXT.set(version);
     }
 
-    /**
-     * Gets the current version context
-     * @return the version context
-     */
-    public static int getVersionContext() {
-        return VERSION_CONTEXT.get();
-    }
-
-    /**
-     * Clears the version context
-     */
-    public static void clearVersionContext() {
+    @Override
+    public void clearReadVersion() {
         VERSION_CONTEXT.remove();
     }
 
@@ -53,7 +40,7 @@ public class RemoteSegmentMetadataHandler implements IndexIOStreamHandler<Remote
      */
     @Override
     public RemoteSegmentMetadata readContent(IndexInput indexInput) throws IOException {
-        return RemoteSegmentMetadata.read(indexInput, getVersionContext());
+        return RemoteSegmentMetadata.read(indexInput, VERSION_CONTEXT.get());
     }
 
     /**
