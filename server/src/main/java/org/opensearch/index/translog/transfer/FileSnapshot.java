@@ -104,6 +104,7 @@ public class FileSnapshot implements Closeable {
      *
      * @opensearch.internal
      */
+    @ExperimentalApi
     public static class TransferFileSnapshot extends FileSnapshot {
 
         private final long primaryTerm;
