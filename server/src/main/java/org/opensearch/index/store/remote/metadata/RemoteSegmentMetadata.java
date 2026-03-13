@@ -30,10 +30,15 @@ import java.util.stream.Collectors;
  */
 @PublicApi(since = "2.6.0")
 public class RemoteSegmentMetadata {
+
+    public static final int VERSION_ONE = 1;
+
+    public static final int VERSION_TWO = 2;
+
     /**
      * Latest supported version of metadata
      */
-    public static final int CURRENT_VERSION = 1;
+    public static final int CURRENT_VERSION = VERSION_TWO;
     /**
      * Metadata codec
      */
@@ -48,14 +53,38 @@ public class RemoteSegmentMetadata {
 
     private final ReplicationCheckpoint replicationCheckpoint;
 
+    /**
+     * Archive-related fields (v2 format)
+     */
+    private final boolean archiveEnabled;
+    private final String archiveBlob;
+    private final String archiveFormat;
+    private final Map<String, SegmentArchiveEntry> archiveEntries;
+
     public RemoteSegmentMetadata(
         Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> metadata,
         byte[] segmentInfosBytes,
         ReplicationCheckpoint replicationCheckpoint
     ) {
+        this(metadata, segmentInfosBytes, replicationCheckpoint, false, null, null, null);
+    }
+
+    public RemoteSegmentMetadata(
+        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> metadata,
+        byte[] segmentInfosBytes,
+        ReplicationCheckpoint replicationCheckpoint,
+        boolean archiveEnabled,
+        String archiveBlob,
+        String archiveFormat,
+        Map<String, SegmentArchiveEntry> archiveEntries
+    ) {
         this.metadata = metadata;
         this.segmentInfosBytes = segmentInfosBytes;
         this.replicationCheckpoint = replicationCheckpoint;
+        this.archiveEnabled = archiveEnabled;
+        this.archiveBlob = archiveBlob;
+        this.archiveFormat = archiveFormat;
+        this.archiveEntries = archiveEntries;
     }
 
     /**
@@ -82,6 +111,22 @@ public class RemoteSegmentMetadata {
         return replicationCheckpoint;
     }
 
+    public boolean isArchiveEnabled() {
+        return archiveEnabled;
+    }
+
+    public String getArchiveBlob() {
+        return archiveBlob;
+    }
+
+    public String getArchiveFormat() {
+        return archiveFormat;
+    }
+
+    public Map<String, SegmentArchiveEntry> getArchiveEntries() {
+        return archiveEntries;
+    }
+
     /**
      * Generate {@code Map<String, String>} from {@link RemoteSegmentMetadata}
      * @return {@code Map<String, String>}
@@ -106,22 +151,84 @@ public class RemoteSegmentMetadata {
             );
     }
 
+    /**
+     * Write always writes with the latest version of the RemoteSegmentMetadata
+     * @param out file output stream which will store stream content
+     * @throws IOException in case there is a problem writing the file
+     */
     public void write(IndexOutput out) throws IOException {
         out.writeMapOfStrings(toMapOfStrings());
         writeCheckpointToIndexOutput(replicationCheckpoint, out);
         out.writeLong(segmentInfosBytes.length);
         out.writeBytes(segmentInfosBytes, segmentInfosBytes.length);
+        
+        // Write archive fields (v2 format)
+        out.writeByte((byte) (archiveEnabled ? 1 : 0));
+        if (archiveEnabled) {
+            out.writeString(archiveBlob != null ? archiveBlob : "");
+            out.writeString(archiveFormat != null ? archiveFormat : "");
+            
+            // Write archive entries map
+            if (archiveEntries != null) {
+                out.writeVInt(archiveEntries.size());
+                for (Map.Entry<String, SegmentArchiveEntry> entry : archiveEntries.entrySet()) {
+                    out.writeString(entry.getKey());
+                    entry.getValue().write(out);
+                }
+            } else {
+                out.writeVInt(0);
+            }
+        }
     }
 
-    public static RemoteSegmentMetadata read(IndexInput indexInput) throws IOException {
+    /**
+     * Read can happen in the upgraded version of replica which needs to support all versions of RemoteSegmentMetadata
+     * @param indexInput file input stream
+     * @param version version of the RemoteSegmentMetadata
+     * @return {@code RemoteSegmentMetadata}
+     * @throws IOException in case there is a problem reading from the file input stream
+     */
+    public static RemoteSegmentMetadata read(IndexInput indexInput, int version) throws IOException {
         Map<String, String> metadata = indexInput.readMapOfStrings();
         final Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> uploadedSegmentMetadataMap = RemoteSegmentMetadata
             .fromMapOfStrings(metadata);
-        ReplicationCheckpoint replicationCheckpoint = readCheckpointFromIndexInput(indexInput, uploadedSegmentMetadataMap);
+        ReplicationCheckpoint replicationCheckpoint = readCheckpointFromIndexInput(indexInput, uploadedSegmentMetadataMap, version);
         int byteArraySize = (int) indexInput.readLong();
         byte[] segmentInfosBytes = new byte[byteArraySize];
         indexInput.readBytes(segmentInfosBytes, 0, byteArraySize);
-        return new RemoteSegmentMetadata(uploadedSegmentMetadataMap, segmentInfosBytes, replicationCheckpoint);
+        
+        // Read archive fields (v2 format)
+        boolean archiveEnabled = false;
+        String archiveBlob = null;
+        String archiveFormat = null;
+        Map<String, SegmentArchiveEntry> archiveEntries = null;
+        
+        if (version >= VERSION_TWO) {
+            archiveEnabled = indexInput.readByte() != 0;
+            if (archiveEnabled) {
+                archiveBlob = indexInput.readString();
+                archiveFormat = indexInput.readString();
+                
+                // Read archive entries map
+                int entryCount = indexInput.readVInt();
+                archiveEntries = new java.util.HashMap<>(entryCount);
+                for (int i = 0; i < entryCount; i++) {
+                    String key = indexInput.readString();
+                    SegmentArchiveEntry entry = SegmentArchiveEntry.read(indexInput);
+                    archiveEntries.put(key, entry);
+                }
+            }
+        }
+        
+        return new RemoteSegmentMetadata(
+            uploadedSegmentMetadataMap,
+            segmentInfosBytes,
+            replicationCheckpoint,
+            archiveEnabled,
+            archiveBlob,
+            archiveFormat,
+            archiveEntries
+        );
     }
 
     public static void writeCheckpointToIndexOutput(ReplicationCheckpoint replicationCheckpoint, IndexOutput out) throws IOException {
@@ -140,7 +247,8 @@ public class RemoteSegmentMetadata {
 
     private static ReplicationCheckpoint readCheckpointFromIndexInput(
         IndexInput in,
-        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> uploadedSegmentMetadataMap
+        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> uploadedSegmentMetadataMap,
+        int version
     ) throws IOException {
         return new ReplicationCheckpoint(
             new ShardId(new Index(in.readString(), in.readString()), in.readVInt()),

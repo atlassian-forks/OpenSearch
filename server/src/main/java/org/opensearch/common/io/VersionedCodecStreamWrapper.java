@@ -56,7 +56,13 @@ public class VersionedCodecStreamWrapper<T> {
         try {
             CodecUtil.checksumEntireFile(indexInput);
             int readStreamVersion = checkHeader(indexInput);
-            return getHandlerForVersion(readStreamVersion).readContent(indexInput);
+            // Set version context for handlers that need version-aware reading
+            setVersionContext(readStreamVersion);
+            try {
+                return getHandlerForVersion(readStreamVersion).readContent(indexInput);
+            } finally {
+                clearVersionContext();
+            }
         } catch (CorruptIndexException cie) {
             logger.error(
                 () -> new ParameterizedMessage(
@@ -123,5 +129,41 @@ public class VersionedCodecStreamWrapper<T> {
         // TODO implement factory and pick relevant handler based on version.
         // It should also take into account min and max supported versions
         return this.indexIOStreamHandler;
+    }
+
+    /**
+     * Sets the version context for handlers that need version-aware reading.
+     * This is a default implementation that handlers can override.
+     * @param version the version to set
+     */
+    protected void setVersionContext(int version) {
+        // Default implementation - subclasses or handlers can use ThreadLocal to store version context
+        // For RemoteSegmentMetadataHandler, it uses static ThreadLocal internally
+        try {
+            // Try to use RemoteSegmentMetadataHandler's static method if available
+            Class<?> handlerClass = indexIOStreamHandler.getClass();
+            if (handlerClass.getSimpleName().equals("RemoteSegmentMetadataHandler")) {
+                handlerClass.getMethod("setVersionContext", int.class).invoke(null, version);
+            }
+        } catch (Exception e) {
+            // If not available, silently ignore
+        }
+    }
+
+    /**
+     * Clears the version context for handlers that need version-aware reading.
+     * This is a default implementation that handlers can override.
+     */
+    protected void clearVersionContext() {
+        // Default implementation - subclasses or handlers can use ThreadLocal to store version context
+        try {
+            // Try to use RemoteSegmentMetadataHandler's static method if available
+            Class<?> handlerClass = indexIOStreamHandler.getClass();
+            if (handlerClass.getSimpleName().equals("RemoteSegmentMetadataHandler")) {
+                handlerClass.getMethod("clearVersionContext").invoke(null);
+            }
+        } catch (Exception e) {
+            // If not available, silently ignore
+        }
     }
 }

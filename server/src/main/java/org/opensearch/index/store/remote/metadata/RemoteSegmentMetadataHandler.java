@@ -20,6 +20,32 @@ import java.io.IOException;
  * @opensearch.internal
  */
 public class RemoteSegmentMetadataHandler implements IndexIOStreamHandler<RemoteSegmentMetadata> {
+
+    private static final ThreadLocal<Integer> VERSION_CONTEXT = ThreadLocal.withInitial(() -> RemoteSegmentMetadata.CURRENT_VERSION);
+
+    /**
+     * Sets the version context for reading metadata
+     * @param version the version to use for reading
+     */
+    public static void setVersionContext(int version) {
+        VERSION_CONTEXT.set(version);
+    }
+
+    /**
+     * Gets the current version context
+     * @return the version context
+     */
+    public static int getVersionContext() {
+        return VERSION_CONTEXT.get();
+    }
+
+    /**
+     * Clears the version context
+     */
+    public static void clearVersionContext() {
+        VERSION_CONTEXT.remove();
+    }
+
     /**
      * Reads metadata content from metadata file input stream and parsed into {@link RemoteSegmentMetadata}
      * @param indexInput metadata file input stream with {@link IndexInput#getFilePointer()} pointing to metadata content
@@ -27,7 +53,7 @@ public class RemoteSegmentMetadataHandler implements IndexIOStreamHandler<Remote
      */
     @Override
     public RemoteSegmentMetadata readContent(IndexInput indexInput) throws IOException {
-        return RemoteSegmentMetadata.read(indexInput);
+        return RemoteSegmentMetadata.read(indexInput, getVersionContext());
     }
 
     /**
