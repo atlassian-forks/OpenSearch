@@ -93,6 +93,68 @@ public class RemoteStoreSettings {
         Property.Dynamic
     );
 
+    public static final Setting<Boolean> CLUSTER_SERVER_SIDE_ENCRYPTION_ENABLED = Setting.boolSetting(
+        "cluster.remote_store.server_side_encryption",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * When true, if translog archive upload fails for a batch, fall back to per-shard upload for that batch.
+     * When false, fail and rely on retry (no fallback).
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD = Setting.boolSetting(
+        "cluster.remote_store.translog.archive.fallback_to_per_shard_upload",
+        true,
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
+    /**
+     * Controls whether segment archive upload is globally enabled at cluster level.
+     * Index-level setting still required to enable per index.
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED = Setting.boolSetting(
+        "cluster.remote_store.segment.archive.enabled",
+        true,
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
+    /**
+     * Controls fallback behavior when segment archive upload fails.
+     * When true, falls back to per-file upload on archive failure.
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE = Setting.boolSetting(
+        "cluster.remote_store.segment.archive.fallback_to_per_file_upload",
+        true,
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
+    /**
+     * Controls retention period (in minutes) for translog archives.
+     * Used for node recovery and durability. Translog archives older than this period are deleted.
+     * Default: 60 minutes (1 hour). Range: 30-10080 minutes (30 min to 7 days).
+     * Note: Effective retention is longer than configured value due to batching semantics.
+     */
+    public static final Setting<Integer> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES = Setting.intSetting(
+        "cluster.remote_store.translog.archive.retention_minutes",
+        60,
+        30,
+        10080,
+        v -> {
+            if (v < 30 || v > 10080) {
+                throw new IllegalArgumentException(
+                    "Translog archive retention must be between 30 minutes and 7 days (10080 minutes)"
+                );
+            }
+        },
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
     /**
      * This setting is used to set the remote store blob store path hash algorithm strategy. This setting is effective only for
      * remote store enabled cluster. This setting will come to effect if the {@link #CLUSTER_REMOTE_STORE_PATH_TYPE_SETTING}
@@ -192,6 +254,11 @@ public class RemoteStoreSettings {
     private volatile RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm;
     private volatile int maxRemoteTranslogReaders;
     private volatile boolean isTranslogMetadataEnabled;
+    private volatile boolean isClusterServerSideEncryptionRepoEnabled;
+    private volatile boolean translogArchiveFallbackToPerShard;
+    private volatile boolean clusterRemoteStoreSegmentArchiveEnabled;
+    private volatile boolean clusterRemoteStoreSegmentArchiveFallbackToPerFile;
+    private volatile int translogArchiveRetentionMinutes;
     private static volatile boolean isPinnedTimestampsEnabled;
     private static volatile TimeValue pinnedTimestampsSchedulerInterval;
     private static volatile TimeValue pinnedTimestampsLookbackInterval;
