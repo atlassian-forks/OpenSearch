@@ -101,6 +101,14 @@ public class TranslogTransferManager {
         this.isTranslogMetadataEnabled = isTranslogMetadataEnabled;
     }
 
+    public TransferService getTransferService() {
+        return transferService;
+    }
+
+    public BlobPath getRemoteDataTransferPath() {
+        return remoteDataTransferPath;
+    }
+
     public RemoteTranslogTransferTracker getRemoteTranslogTransferTracker() {
         return remoteTranslogTransferTracker;
     }
@@ -485,6 +493,11 @@ public class TranslogTransferManager {
         }
 
         return metadataBytes;
+    }
+
+    public void uploadMetadata(TransferSnapshot transferSnapshot) throws IOException {
+        TransferFileSnapshot tlogMetadata = prepareMetadata(transferSnapshot);
+        transferService.uploadBlob(tlogMetadata, remoteMetadataTransferPath, WritePriority.HIGH);
     }
 
     /**
