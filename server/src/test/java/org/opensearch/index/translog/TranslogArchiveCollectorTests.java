@@ -116,8 +116,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             transferService.uploadBlob(
                 new FileSnapshot.TransferFileSnapshot("batch1.zip", zipBytes, 0L),
                 archivePath,
-                WritePriority.HIGH,
-                null
+                WritePriority.HIGH
             );
 
             BlobContainer container = blobStore.blobContainer(archivePath);
@@ -170,7 +169,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 "node-1"
             );
             BlobPath genPath = dataBase.add(hashPrefix).add("0");
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("old.zip", zipBytes, 0L), genPath, WritePriority.HIGH, null);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("old.zip", zipBytes, 0L), genPath, WritePriority.HIGH);
             Map<String, BlobMetadata> before = blobStore.blobContainer(genPath).listBlobs();
             assertThat(zipBlobCount(before), equalTo(1L));
 
@@ -209,7 +208,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 "node-1"
             );
             BlobPath genPath = dataBase.add(hashPrefix).add("0");
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("keep.zip", zipBytes, 0L), genPath, WritePriority.HIGH, null);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("keep.zip", zipBytes, 0L), genPath, WritePriority.HIGH);
             Map<String, ArchiveDeletionHelper.RetentionBounds> retention = new java.util.HashMap<>();
             retention.put("idx-uuid/0", new ArchiveDeletionHelper.RetentionBounds(1L, 2L));
             int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetentionNewPath(transferService, dataBase, retention);
@@ -350,8 +349,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             org.mockito.ArgumentMatchers.anyLong(),
             pathCaptor.capture(),
             nameCaptor.capture(),
-            eq(WritePriority.HIGH),
-            eq(null)
+            eq(WritePriority.HIGH)
         );
         assertThat(nameCaptor.getValue(), endsWith(".zip"));
         assertThat(pathCaptor.getValue().buildAsString(), org.hamcrest.Matchers.containsString("translog"));
@@ -456,8 +454,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             org.mockito.ArgumentMatchers.anyLong(),
             any(),
             any(),
-            eq(WritePriority.HIGH),
-            eq(null)
+            eq(WritePriority.HIGH)
         );
         org.mockito.ArgumentCaptor<TransferSnapshot> snapshotCaptor = org.mockito.ArgumentCaptor.forClass(TransferSnapshot.class);
         verify(transferManager, org.mockito.Mockito.times(2)).uploadMetadataForArchiveSnapshot(snapshotCaptor.capture());
@@ -491,8 +488,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 org.mockito.ArgumentMatchers.anyLong(),
                 any(),
                 any(),
-                eq(WritePriority.HIGH),
-                eq(null)
+                eq(WritePriority.HIGH)
             );
 
         BlobPath basePath = new BlobPath().add("base");
@@ -546,7 +542,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         assertThat(collector.getEligibleShardIds(), hasSize(1));
         collector.runBatchForTesting();
 
-        verify(transferManager).transferSnapshot(eq(mockSnapshot), any(), eq(null));
+        verify(transferManager).transferSnapshot(eq(mockSnapshot), any());
     }
 
     /**
@@ -575,8 +571,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 org.mockito.ArgumentMatchers.anyLong(),
                 any(),
                 any(),
-                eq(WritePriority.HIGH),
-                eq(null)
+                eq(WritePriority.HIGH)
             );
 
         BlobPath basePath = new BlobPath().add("base");
@@ -630,7 +625,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         assertThat(collector.getEligibleShardIds(), hasSize(1));
         collector.runBatchForTesting();
 
-        verify(transferManager, never()).transferSnapshot(any(), any(), any());
+        verify(transferManager, never()).transferSnapshot(any(), any());
     }
 
     /**
@@ -658,8 +653,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 org.mockito.ArgumentMatchers.anyLong(),
                 any(),
                 any(),
-                eq(WritePriority.HIGH),
-                eq(null)
+                eq(WritePriority.HIGH)
             );
 
         BlobPath basePath = new BlobPath().add("base");
@@ -759,7 +753,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 "node-1"
             );
             BlobPath genPath = dataBase.add(hashPrefix).add("0");
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("old.zip", zipBytes, 0L), genPath, WritePriority.HIGH, null);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("old.zip", zipBytes, 0L), genPath, WritePriority.HIGH);
             assertThat(zipBlobCount(blobStore.blobContainer(genPath).listBlobs()), equalTo(1L));
 
             TranslogTransferManager transferManager = mock(TranslogTransferManager.class);

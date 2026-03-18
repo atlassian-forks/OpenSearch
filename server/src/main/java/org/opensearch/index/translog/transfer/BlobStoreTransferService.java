@@ -151,8 +151,7 @@ public class BlobStoreTransferService implements TransferService {
         long contentLength,
         Iterable<String> remotePath,
         String blobName,
-        WritePriority writePriority,
-        CryptoMetadata cryptoMetadata
+        WritePriority writePriority
     ) throws IOException {
         BlobPath blobPath = (BlobPath) remotePath;
         // Wrap so backends that require mark/reset (e.g. S3 plugin for retries) get a mark-supporting stream
@@ -161,7 +160,7 @@ public class BlobStoreTransferService implements TransferService {
             bufferSize = 8192;
         }
         try (InputStream wrapped = new BufferedInputStream(inputStream, bufferSize)) {
-            blobStore.blobContainer(blobPath).writeBlobWithMetadata(blobName, wrapped, contentLength, true, null, cryptoMetadata);
+            blobStore.blobContainer(blobPath).writeBlobWithMetadata(blobName, wrapped, contentLength, true, null);
         }
     }
 

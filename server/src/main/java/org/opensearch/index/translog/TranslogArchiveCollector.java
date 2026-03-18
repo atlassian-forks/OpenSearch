@@ -524,7 +524,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 AtomicReference<IOException> uploadError = new AtomicReference<>();
                 Thread uploadThread = new Thread(() -> {
                     try {
-                        transferService.uploadBlobStream(pis, contentLength, archivePath, blobName, WritePriority.HIGH, null);
+                        transferService.uploadBlobStream(pis, contentLength, archivePath, blobName, WritePriority.HIGH);
                     } catch (IOException e) {
                         uploadError.set(e);
                     }
@@ -613,7 +613,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             Optional<TranslogTransferManager> managerOpt = contributingShards.get(i).getTranslogTransferManager();
             if (managerOpt.isPresent()) {
                 try {
-                    managerOpt.get().transferSnapshot(snapshots.get(i), noOpListener, null);
+                    managerOpt.get().transferSnapshot(snapshots.get(i), noOpListener);
                 } catch (IOException io) {
                     logger.warn(
                         () -> new ParameterizedMessage(

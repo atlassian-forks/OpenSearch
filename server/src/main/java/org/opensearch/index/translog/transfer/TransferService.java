@@ -94,15 +94,13 @@ public interface TransferService {
      * @param remotePath   remote path (e.g. BlobPath)
      * @param blobName     blob file name
      * @param writePriority write priority
-     * @param cryptoMetadata optional encryption metadata
      */
     void uploadBlobStream(
         InputStream inputStream,
         long contentLength,
         Iterable<String> remotePath,
         String blobName,
-        WritePriority writePriority,
-        CryptoMetadata cryptoMetadata
+        WritePriority writePriority
     ) throws IOException;
 
     void deleteBlobs(Iterable<String> path, List<String> fileNames) throws IOException;

@@ -615,7 +615,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
         long genBucket = 2 / 100;
         BlobPath archiveGenPath = dataPath.add("translog").add("data").add(hashPrefix).add(String.valueOf(genBucket));
         BlobStoreTransferService blobStoreTransferService = new BlobStoreTransferService(blobStore, threadPool);
-        blobStoreTransferService.uploadBlob(new TransferFileSnapshot("batch.zip", zipBytes, 0L), archiveGenPath, WritePriority.HIGH, null);
+        blobStoreTransferService.uploadBlob(new TransferFileSnapshot("batch.zip", zipBytes, 0L), archiveGenPath, WritePriority.HIGH);
 
         Path location = createTempDir();
         FileTransferTracker fileTracker = new FileTransferTracker(realShardId, remoteTranslogTransferTracker);
@@ -650,14 +650,12 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
         blobStoreTransferService.uploadBlob(
             new TransferFileSnapshot("translog-2.tlog", perShardTlog, 0L),
             perShardPath,
-            WritePriority.HIGH,
-            null
+            WritePriority.HIGH
         );
         blobStoreTransferService.uploadBlob(
             new TransferFileSnapshot("translog-2.ckp", perShardCkp, 0L),
             perShardPath,
-            WritePriority.HIGH,
-            null
+            WritePriority.HIGH
         );
         // No archive folder created – listFolders(archiveBase) will return empty; downloadFromArchive returns false
 
@@ -695,14 +693,12 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
         blobStoreTransferService.uploadBlob(
             new TransferFileSnapshot("translog-2.tlog", perShardTlog, 0L),
             perShardPath,
-            WritePriority.HIGH,
-            null
+            WritePriority.HIGH
         );
         blobStoreTransferService.uploadBlob(
             new TransferFileSnapshot("translog-2.ckp", perShardCkp, 0L),
             perShardPath,
-            WritePriority.HIGH,
-            null
+            WritePriority.HIGH
         );
 
         String indexUUID = realShardId.getIndex().getUUID();
@@ -717,8 +713,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
         blobStoreTransferService.uploadBlob(
             new TransferFileSnapshot("corrupt.zip", corruptBlob, 0L),
             archiveGenPath,
-            WritePriority.HIGH,
-            null
+            WritePriority.HIGH
         );
 
         Path location = createTempDir();
