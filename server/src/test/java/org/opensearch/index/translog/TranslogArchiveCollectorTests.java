@@ -113,11 +113,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 "node-1"
             );
             BlobPath archivePath = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashPrefix).add("0");
-            transferService.uploadBlob(
-                new FileSnapshot.TransferFileSnapshot("batch1.zip", zipBytes, 0L),
-                archivePath,
-                WritePriority.HIGH
-            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("batch1.zip", zipBytes, 0L), archivePath, WritePriority.HIGH);
 
             BlobContainer container = blobStore.blobContainer(archivePath);
             Map<String, BlobMetadata> blobs = container.listBlobs();
@@ -483,13 +479,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
 
         TransferService transferService = mock(TransferService.class);
         doThrow(new IOException("simulated archive upload failure")).when(transferService)
-            .uploadBlobStream(
-                any(java.io.InputStream.class),
-                org.mockito.ArgumentMatchers.anyLong(),
-                any(),
-                any(),
-                eq(WritePriority.HIGH)
-            );
+            .uploadBlobStream(any(java.io.InputStream.class), org.mockito.ArgumentMatchers.anyLong(), any(), any(), eq(WritePriority.HIGH));
 
         BlobPath basePath = new BlobPath().add("base");
         TranslogTransferManager transferManager = mock(TranslogTransferManager.class);
@@ -566,13 +556,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
 
         TransferService transferService = mock(TransferService.class);
         doThrow(new IOException("simulated archive upload failure")).when(transferService)
-            .uploadBlobStream(
-                any(java.io.InputStream.class),
-                org.mockito.ArgumentMatchers.anyLong(),
-                any(),
-                any(),
-                eq(WritePriority.HIGH)
-            );
+            .uploadBlobStream(any(java.io.InputStream.class), org.mockito.ArgumentMatchers.anyLong(), any(), any(), eq(WritePriority.HIGH));
 
         BlobPath basePath = new BlobPath().add("base");
         TranslogTransferManager transferManager = mock(TranslogTransferManager.class);
@@ -648,13 +632,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
 
         TransferService transferService = mock(TransferService.class);
         doThrow(new IOException("simulated archive upload failure")).when(transferService)
-            .uploadBlobStream(
-                any(java.io.InputStream.class),
-                org.mockito.ArgumentMatchers.anyLong(),
-                any(),
-                any(),
-                eq(WritePriority.HIGH)
-            );
+            .uploadBlobStream(any(java.io.InputStream.class), org.mockito.ArgumentMatchers.anyLong(), any(), any(), eq(WritePriority.HIGH));
 
         BlobPath basePath = new BlobPath().add("base");
         TranslogTransferManager transferManager = mock(TranslogTransferManager.class);

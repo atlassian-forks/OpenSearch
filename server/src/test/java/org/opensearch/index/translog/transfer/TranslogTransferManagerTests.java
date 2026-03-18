@@ -652,11 +652,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             perShardPath,
             WritePriority.HIGH
         );
-        blobStoreTransferService.uploadBlob(
-            new TransferFileSnapshot("translog-2.ckp", perShardCkp, 0L),
-            perShardPath,
-            WritePriority.HIGH
-        );
+        blobStoreTransferService.uploadBlob(new TransferFileSnapshot("translog-2.ckp", perShardCkp, 0L), perShardPath, WritePriority.HIGH);
         // No archive folder created – listFolders(archiveBase) will return empty; downloadFromArchive returns false
 
         Path location = createTempDir();
@@ -695,11 +691,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             perShardPath,
             WritePriority.HIGH
         );
-        blobStoreTransferService.uploadBlob(
-            new TransferFileSnapshot("translog-2.ckp", perShardCkp, 0L),
-            perShardPath,
-            WritePriority.HIGH
-        );
+        blobStoreTransferService.uploadBlob(new TransferFileSnapshot("translog-2.ckp", perShardCkp, 0L), perShardPath, WritePriority.HIGH);
 
         String indexUUID = realShardId.getIndex().getUUID();
         String hashPrefix = RemoteStoreEnums.PathHashAlgorithm.hashForTranslogArchive(
@@ -710,11 +702,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
         );
         BlobPath archiveGenPath = dataPath.add("translog").add("data").add(hashPrefix).add("0");
         byte[] corruptBlob = new byte[64];
-        blobStoreTransferService.uploadBlob(
-            new TransferFileSnapshot("corrupt.zip", corruptBlob, 0L),
-            archiveGenPath,
-            WritePriority.HIGH
-        );
+        blobStoreTransferService.uploadBlob(new TransferFileSnapshot("corrupt.zip", corruptBlob, 0L), archiveGenPath, WritePriority.HIGH);
 
         Path location = createTempDir();
         FileTransferTracker fileTracker = new FileTransferTracker(realShardId, remoteTranslogTransferTracker);
