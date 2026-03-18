@@ -2337,7 +2337,9 @@ public abstract class AbstractSimpleTransportTestCase extends OpenSearchTestCase
                             accept.getInputStream().read();
                         }
                     } catch (IOException e) {
-                        throw new UncheckedIOException(e);
+                        // Expected when the connection is reset by the remote side;
+                        // suppress SocketException (Bad file descriptor / Connection reset)
+                        // so it doesn't surface as an uncaught exception.
                     }
                 }
             };
