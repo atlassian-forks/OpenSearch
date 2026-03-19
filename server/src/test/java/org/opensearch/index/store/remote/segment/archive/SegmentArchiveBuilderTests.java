@@ -21,7 +21,6 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.hasSize;
 
 /**
  * TDD Tests for {@link SegmentArchiveBuilder}
@@ -35,10 +34,10 @@ public class SegmentArchiveBuilderTests extends OpenSearchTestCase {
         // Given: segment files with content
         String segmentPath1 = "_0.si";
         byte[] content1 = "segment info content".getBytes(StandardCharsets.UTF_8);
-        
+
         String segmentPath2 = "_0.cfs";
         byte[] content2 = "compound file content".getBytes(StandardCharsets.UTF_8);
-        
+
         String segmentPath3 = "_0.cfe";
         byte[] content3 = "compound file entries".getBytes(StandardCharsets.UTF_8);
 
@@ -58,11 +57,11 @@ public class SegmentArchiveBuilderTests extends OpenSearchTestCase {
         int totalContentSize = content1.length + content2.length + content3.length;
         assertTrue("ZIP size should be close to content size", zipBytes.length >= totalContentSize);
         assertTrue("ZIP overhead should be reasonable", zipBytes.length < totalContentSize + 500);
-        
+
         // Verify ZIP structure: can read entries back
         ZipInputStream zis = new ZipInputStream(new java.io.ByteArrayInputStream(zipBytes));
         Map<String, byte[]> extractedEntries = extractZipEntries(zis);
-        
+
         assertThat(extractedEntries.size(), equalTo(3));
         assertArrayEquals(content1, extractedEntries.get(segmentPath1));
         assertArrayEquals(content2, extractedEntries.get(segmentPath2));
@@ -76,7 +75,7 @@ public class SegmentArchiveBuilderTests extends OpenSearchTestCase {
         // Given: segment files
         String path1 = "_1.si";
         byte[] content1 = "segment info one".getBytes(StandardCharsets.UTF_8);
-        
+
         String path2 = "_1.cfs";
         byte[] content2 = "compound file segment one".getBytes(StandardCharsets.UTF_8);
 
@@ -92,7 +91,7 @@ public class SegmentArchiveBuilderTests extends OpenSearchTestCase {
 
         // Then: should return archive entries with offsets
         assertThat(archiveEntries.size(), equalTo(2));
-        
+
         SegmentArchiveEntry entry1 = archiveEntries.get(path1);
         assertThat(entry1.getFilename(), equalTo(path1));
         assertThat(entry1.getLength(), equalTo((long) content1.length));
@@ -106,11 +105,9 @@ public class SegmentArchiveBuilderTests extends OpenSearchTestCase {
         assertTrue(entry2.getChecksum() != 0);
 
         // Verify range-read: extract data using offsets
-        byte[] extracted1 = Arrays.copyOfRange(zipBytes, (int) entry1.getOffset(), 
-                                               (int) (entry1.getOffset() + entry1.getLength()));
-        byte[] extracted2 = Arrays.copyOfRange(zipBytes, (int) entry2.getOffset(), 
-                                               (int) (entry2.getOffset() + entry2.getLength()));
-        
+        byte[] extracted1 = Arrays.copyOfRange(zipBytes, (int) entry1.getOffset(), (int) (entry1.getOffset() + entry1.getLength()));
+        byte[] extracted2 = Arrays.copyOfRange(zipBytes, (int) entry2.getOffset(), (int) (entry2.getOffset() + entry2.getLength()));
+
         assertArrayEquals(content1, extracted1);
         assertArrayEquals(content2, extracted2);
     }
@@ -124,9 +121,7 @@ public class SegmentArchiveBuilderTests extends OpenSearchTestCase {
         byte[] largeContent = new byte[10_000_000]; // 10 MB
         Arrays.fill(largeContent, (byte) 42);
 
-        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = Arrays.asList(
-            SegmentArchiveBuilder.fromBytes(path, largeContent)
-        );
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = Arrays.asList(SegmentArchiveBuilder.fromBytes(path, largeContent));
 
         // When: building archive
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -136,7 +131,7 @@ public class SegmentArchiveBuilderTests extends OpenSearchTestCase {
         // Then: large file should be stored without compression
         SegmentArchiveEntry entry = archiveEntries.get(path);
         assertThat(entry.getLength(), equalTo((long) largeContent.length));
-        
+
         // ZIP stored format: archive size ≈ data size + overhead (no compression savings)
         assertTrue(zipBytes.length < largeContent.length + 1000); // Small overhead
     }
@@ -171,7 +166,7 @@ public class SegmentArchiveBuilderTests extends OpenSearchTestCase {
         // Then: entry properties are correct
         assertThat(entry.getPath(), equalTo(path));
         assertThat(entry.getSize(), equalTo((long) content.length));
-        
+
         // Can read content
         byte[] readContent = new byte[content.length];
         try (var in = entry.getContent()) {

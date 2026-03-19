@@ -34,10 +34,10 @@ public class ZipSegmentParserTests extends OpenSearchTestCase {
         // Given: a built segment archive with known entries
         String path1 = "_0.si";
         byte[] content1 = "segment info".getBytes(StandardCharsets.UTF_8);
-        
+
         String path2 = "_0.cfs";
         byte[] content2 = "compound file segment".getBytes(StandardCharsets.UTF_8);
-        
+
         String path3 = "_0.cfe";
         byte[] content3 = "compound file entries".getBytes(StandardCharsets.UTF_8);
 
@@ -58,17 +58,17 @@ public class ZipSegmentParserTests extends OpenSearchTestCase {
 
         // Then: should extract all entries with correct offsets
         assertThat(parsedEntries.size(), equalTo(3));
-        
+
         SegmentArchiveEntry parsed1 = parsedEntries.get(path1);
         assertThat(parsed1, notNullValue());
         assertThat(parsed1.getFilename(), equalTo(path1));
         assertThat(parsed1.getLength(), equalTo((long) content1.length));
-        
+
         SegmentArchiveEntry parsed2 = parsedEntries.get(path2);
         assertThat(parsed2, notNullValue());
         assertThat(parsed2.getFilename(), equalTo(path2));
         assertThat(parsed2.getLength(), equalTo((long) content2.length));
-        
+
         SegmentArchiveEntry parsed3 = parsedEntries.get(path3);
         assertThat(parsed3, notNullValue());
         assertThat(parsed3.getFilename(), equalTo(path3));
@@ -99,17 +99,13 @@ public class ZipSegmentParserTests extends OpenSearchTestCase {
         // Then: should be able to extract exact range
         SegmentArchiveEntry entry = parsedEntries.get(path);
         assertThat(entry, notNullValue());
-        
+
         long offset = entry.getOffset();
         long length = entry.getLength();
-        
+
         // Extract using offset/length
-        byte[] extractedContent = Arrays.copyOfRange(
-            zipBytes,
-            (int) offset,
-            (int) (offset + length)
-        );
-        
+        byte[] extractedContent = Arrays.copyOfRange(zipBytes, (int) offset, (int) (offset + length));
+
         assertArrayEquals(originalContent, extractedContent);
     }
 
@@ -136,9 +132,7 @@ public class ZipSegmentParserTests extends OpenSearchTestCase {
         byte[] largeContent = new byte[5_000_000]; // 5 MB
         Arrays.fill(largeContent, (byte) 42);
 
-        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = Arrays.asList(
-            SegmentArchiveBuilder.fromBytes(path, largeContent)
-        );
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = Arrays.asList(SegmentArchiveBuilder.fromBytes(path, largeContent));
 
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         SegmentArchiveBuilder.buildAndExtractOffsets(out, entries);
@@ -153,13 +147,9 @@ public class ZipSegmentParserTests extends OpenSearchTestCase {
         SegmentArchiveEntry entry = parsedEntries.get(path);
         assertThat(entry, notNullValue());
         assertThat(entry.getLength(), equalTo((long) largeContent.length));
-        
+
         // Verify extraction works
-        byte[] extracted = Arrays.copyOfRange(
-            zipBytes,
-            (int) entry.getOffset(),
-            (int) (entry.getOffset() + entry.getLength())
-        );
+        byte[] extracted = Arrays.copyOfRange(zipBytes, (int) entry.getOffset(), (int) (entry.getOffset() + entry.getLength()));
         assertArrayEquals(largeContent, extracted);
     }
 
@@ -180,14 +170,14 @@ public class ZipSegmentParserTests extends OpenSearchTestCase {
         // When: parsing as list and map
         int tailLen = (int) Math.min(zipBytes.length, ZipSegmentParser.MAX_ZIP_TAIL_BYTES);
         byte[] tail = Arrays.copyOfRange(zipBytes, zipBytes.length - tailLen, zipBytes.length);
-        
+
         List<SegmentArchiveEntry> parsedList = ZipSegmentParser.parse(tail, zipBytes.length - tailLen);
         Map<String, SegmentArchiveEntry> parsedMap = ZipSegmentParser.parseToMap(tail, zipBytes.length - tailLen);
 
         // Then: both should have same entries
         assertThat(parsedList, hasSize(2));
         assertThat(parsedMap.size(), equalTo(2));
-        
+
         for (SegmentArchiveEntry entry : parsedList) {
             assertThat(parsedMap.get(entry.getFilename()), notNullValue());
             assertThat(parsedMap.get(entry.getFilename()).getOffset(), equalTo(entry.getOffset()));

@@ -10,7 +10,6 @@ package org.opensearch.index.translog;
 
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
@@ -36,6 +35,7 @@ import org.opensearch.index.translog.transfer.archive.ArchiveEntry;
 import org.opensearch.index.translog.transfer.archive.ZipCentralDirectoryParser;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.RemoteStoreSettings;
+import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
@@ -114,11 +114,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 "node-1"
             );
             BlobPath archivePath = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashPrefix).add("0");
-            transferService.uploadBlob(
-                new FileSnapshot.TransferFileSnapshot("batch1.zip", zipBytes, 0L),
-                archivePath,
-                WritePriority.HIGH
-            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("batch1.zip", zipBytes, 0L), archivePath, WritePriority.HIGH);
 
             BlobContainer container = blobStore.blobContainer(archivePath);
             Map<String, BlobMetadata> blobs = container.listBlobs();

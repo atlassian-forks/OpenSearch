@@ -18,10 +18,8 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
 
@@ -82,7 +80,7 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         // Note: Actual cleanup timing depends on retention policy
         List<String> archivesAfter = listSegmentArchives();
         logger.info("Archives before force merge: {}, after: {}", archives2.size(), archivesAfter.size());
-        
+
         // Verify that we have fewer archives after cleanup
         // (exact count depends on timing and retention settings)
         assertTrue("Some cleanup should have occurred", archivesAfter.size() <= archives2.size());
@@ -150,10 +148,10 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         // Create archive with multiple segments
         indexDocuments(DOCS_PER_BATCH);
         client().admin().indices().prepareRefresh(INDEX_NAME).get();
-        
+
         indexDocuments(DOCS_PER_BATCH);
         client().admin().indices().prepareRefresh(INDEX_NAME).get();
-        
+
         int archiveCountBefore = listSegmentArchives().size();
         assertTrue("Should have archives", archiveCountBefore > 0);
 
@@ -163,7 +161,7 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
 
         // Archives with active members should still exist
         int archiveCountAfter = listSegmentArchives().size();
-        
+
         // Verify index still works
         long docCount = client().prepareSearch(INDEX_NAME).setSize(0).get().getHits().getTotalHits().value;
         assertEquals("Should have all documents", DOCS_PER_BATCH * 2, docCount);
@@ -273,11 +271,7 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
     }
 
     private void updateIndexSetting(String index, String setting, String value) {
-        client().admin()
-            .indices()
-            .prepareUpdateSettings(index)
-            .setSettings(Settings.builder().put(setting, value))
-            .get();
+        client().admin().indices().prepareUpdateSettings(index).setSettings(Settings.builder().put(setting, value)).get();
     }
 
     private List<String> listSegmentArchives() throws Exception {
@@ -286,13 +280,13 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         // For now, return a mock implementation
         // TODO: Implement actual archive listing from remote store
         List<String> archives = new ArrayList<>();
-        
+
         // In real implementation, this would:
         // 1. Get remote store path for the index
         // 2. List files under segments/data/{hashPrefix}/
         // 3. Filter for *.zip files
         // 4. Return list of archive paths
-        
+
         return archives;
     }
 

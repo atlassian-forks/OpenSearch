@@ -158,7 +158,7 @@ public class RemoteSegmentMetadataV2Tests extends IndexShardTestCase {
         // This test verifies that v2 code can read metadata written in v2 format
         // Since write() always writes the latest version (v2), this test creates v2 format
         // and verifies it can be read back correctly
-        
+
         BytesStreamOutput output = new BytesStreamOutput();
         OutputStreamIndexOutput indexOutput = new OutputStreamIndexOutput("dummy bytes", "dummy stream", output, 4096);
 

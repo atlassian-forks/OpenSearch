@@ -31,7 +31,6 @@
 
 package org.opensearch.transport;
 
-import org.opensearch.common.SuppressForbidden;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -71,7 +70,6 @@ public class CopyBytesSocketChannelTests extends OpenSearchTestCase {
     private Channel serverChannel;
 
     @Override
-    @SuppressForbidden(reason = "calls getLocalHost")
     public void setUp() throws Exception {
         super.setUp();
         eventLoopGroup = new NioEventLoopGroup(1);
@@ -79,6 +77,7 @@ public class CopyBytesSocketChannelTests extends OpenSearchTestCase {
         serverBootstrap.channel(CopyBytesServerSocketChannel.class);
         serverBootstrap.group(eventLoopGroup);
         serverBootstrap.option(ChannelOption.ALLOCATOR, alloc);
+        serverBootstrap.option(ChannelOption.SO_REUSEADDR, true);
         serverBootstrap.childOption(ChannelOption.ALLOCATOR, alloc);
         serverBootstrap.childHandler(new ChannelInitializer<Channel>() {
             @Override
@@ -95,10 +94,10 @@ public class CopyBytesSocketChannelTests extends OpenSearchTestCase {
             }
         });
 
-        ChannelFuture bindFuture = serverBootstrap.bind(new InetSocketAddress(InetAddress.getLocalHost(), 0));
+        ChannelFuture bindFuture = serverBootstrap.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
         assertTrue(bindFuture.await(10, TimeUnit.SECONDS));
+        assertTrue("Server bind failed: " + bindFuture.cause(), bindFuture.isSuccess());
         serverAddress = (InetSocketAddress) bindFuture.channel().localAddress();
-        bindFuture.isSuccess();
         serverChannel = bindFuture.channel();
     }
 
@@ -142,13 +141,15 @@ public class CopyBytesSocketChannelTests extends OpenSearchTestCase {
             assertBusy(() -> assertNotNull(accepted.get()));
             int clientBytesToWrite = clientData.readableBytes();
             ChannelFuture clientWriteFuture = copyChannel.writeAndFlush(clientData.retainedSlice());
-            clientWriteFuture.await(10, TimeUnit.SECONDS);
-            assertBusy(() -> assertEquals(clientBytesToWrite, serverBytesReceived.get()));
+            assertTrue(clientWriteFuture.await(30, TimeUnit.SECONDS));
+            assertTrue("Client write failed: " + clientWriteFuture.cause(), clientWriteFuture.isSuccess());
+            assertBusy(() -> assertEquals(clientBytesToWrite, serverBytesReceived.get()), 30, TimeUnit.SECONDS);
 
             int serverBytesToWrite = serverData.readableBytes();
             ChannelFuture serverWriteFuture = accepted.get().writeAndFlush(serverData.retainedSlice());
-            assertTrue(serverWriteFuture.await(10, TimeUnit.SECONDS));
-            assertBusy(() -> assertEquals(serverBytesToWrite, clientBytesReceived.get()));
+            assertTrue(serverWriteFuture.await(30, TimeUnit.SECONDS));
+            assertTrue("Server write failed: " + serverWriteFuture.cause(), serverWriteFuture.isSuccess());
+            assertBusy(() -> assertEquals(serverBytesToWrite, clientBytesReceived.get()), 30, TimeUnit.SECONDS);
 
             ByteBuf compositeServerReceived = Unpooled.wrappedBuffer(serverReceived.toArray(new ByteBuf[0]));
             assertEquals(clientData, compositeServerReceived);

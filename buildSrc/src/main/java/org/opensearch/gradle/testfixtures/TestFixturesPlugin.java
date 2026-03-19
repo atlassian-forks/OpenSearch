@@ -160,18 +160,24 @@ public class TestFixturesPlugin implements Plugin<Project> {
             ComposeExtension composeExtension = project.getExtensions().getByType(ComposeExtension.class);
             composeExtension.getUseComposeFiles().set(Collections.singletonList(DOCKER_COMPOSE_YML));
             composeExtension.getRemoveContainers().set(true);
+            // Set an explicit project name replacing hyphens with underscores to avoid
+            // invalid Docker image tags (e.g. "hash_azure-fixture_-azure-fixture" has "_-" which is invalid)
+            composeExtension.setProjectName(project.getName().replace('-', '_'));
 
             // Increase the Docker Compose HTTP timeout to 120 sec (the default is 60)
             final Integer timeout = ext.has("dockerComposeHttpTimeout") ? (Integer) ext.get("dockerComposeHttpTimeout") : 120;
             composeExtension.getEnvironment().put("COMPOSE_HTTP_TIMEOUT", timeout);
 
-            Optional<String> dockerCompose = Arrays.asList(DOCKER_COMPOSE_BINARIES)
+            // Docker Compose V2 uses 'docker compose' (subcommand), so the executable must be the docker binary.
+            // The docker-compose shim on newer Docker Desktop is V2 and generates invalid image tags when
+            // called through the V1 code path.
+            Optional<String> dockerBinary = Arrays.asList("/usr/local/bin/docker", "/usr/bin/docker")
                 .stream()
                 .filter(path -> project.file(path).exists())
                 .findFirst();
 
-            composeExtension.getExecutable().set(dockerCompose.isPresent() ? dockerCompose.get() : "/usr/bin/docker");
-            composeExtension.getUseDockerComposeV2().set(false);
+            composeExtension.getExecutable().set(dockerBinary.isPresent() ? dockerBinary.get() : "docker");
+            composeExtension.getUseDockerComposeV2().set(true);
 
             tasks.named("composeUp").configure(t -> {
                 // Avoid running docker-compose tasks in parallel in CI due to some issues on certain Linux distributions

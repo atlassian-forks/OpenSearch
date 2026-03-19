@@ -2,6 +2,8 @@ version: '3'
 services:
   peppa:
     hostname: kerberos.build.opensearch.org
+    extra_hosts:
+      - "kerberos.build.opensearch.org:127.0.0.1"
     build:
       context: .
       dockerfile: Dockerfile
@@ -15,6 +17,8 @@ services:
       - "88/udp"
   hdfs:
     hostname: kerberos.build.opensearch.org
+    extra_hosts:
+      - "kerberos.build.opensearch.org:127.0.0.1"
     build:
       context: .
       dockerfile: Dockerfile
