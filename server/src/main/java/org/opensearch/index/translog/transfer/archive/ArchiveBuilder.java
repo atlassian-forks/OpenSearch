@@ -55,9 +55,38 @@ public final class ArchiveBuilder {
      * @return total bytes that buildWithComment would write
      */
     public static long computeSizeWithComment(Iterable<ArchiveBuildEntry> entries) throws IOException {
+        return computeSizeAndOffsetsWithComment(entries).getSize();
+    }
+
+    /**
+     * Result holding both the computed ZIP size and the per-entry path offsets.
+     */
+    public static final class SizeAndOffsets {
+        private final long size;
+        private final List<ArchiveCommentFormat.PathOffsetLength> offsets;
+
+        SizeAndOffsets(long size, List<ArchiveCommentFormat.PathOffsetLength> offsets) {
+            this.size = size;
+            this.offsets = offsets;
+        }
+
+        public long getSize() {
+            return size;
+        }
+
+        public List<ArchiveCommentFormat.PathOffsetLength> getOffsets() {
+            return offsets;
+        }
+    }
+
+    /**
+     * Computes the byte size and per-entry offsets of the ZIP that would be produced by {@link #buildWithComment}.
+     * Used for streaming upload with known size and for populating archive recovery metadata.
+     */
+    public static SizeAndOffsets computeSizeAndOffsetsWithComment(Iterable<ArchiveBuildEntry> entries) throws IOException {
         CountingOutputStream counter = new CountingOutputStream(new NullOutputStream());
-        buildWithComment(counter, entries);
-        return counter.getCount();
+        List<ArchiveCommentFormat.PathOffsetLength> offsets = buildWithCommentAndOffsets(counter, entries);
+        return new SizeAndOffsets(counter.getCount(), offsets);
     }
 
     /**
@@ -69,6 +98,19 @@ public final class ArchiveBuilder {
      * @throws IOException on read/write or invalid entry
      */
     public static void buildWithComment(OutputStream out, Iterable<ArchiveBuildEntry> entries) throws IOException {
+        buildWithCommentAndOffsets(out, entries);
+    }
+
+    /**
+     * Builds a ZIP with EOCD comment and returns the per-entry path offsets for archive-based recovery.
+     * Callers can use the returned offsets to populate metadata with exact byte ranges for range-reads.
+     *
+     * @return list of (path, offset, length) for each entry in the archive
+     */
+    public static List<ArchiveCommentFormat.PathOffsetLength> buildWithCommentAndOffsets(
+        OutputStream out,
+        Iterable<ArchiveBuildEntry> entries
+    ) throws IOException {
         CountingOutputStream countingOut = new CountingOutputStream(out);
         List<ArchiveCommentFormat.PathOffsetLength> pathOffsets = new ArrayList<>();
         try (ZipOutputStream zos = new ZipOutputStream(countingOut)) {
@@ -80,6 +122,7 @@ public final class ArchiveBuilder {
             String comment = ArchiveCommentFormat.serializeWithIndex(indexUUID, indexEntries);
             zos.setComment(comment);
         }
+        return pathOffsets;
     }
 
     private static String extractIndexUUID(String memberPath) {

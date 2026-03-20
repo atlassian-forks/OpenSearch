@@ -80,6 +80,178 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
     }
 
     /**
+     * Multi-shard index with archive upload: index data across multiple shards,
+     * stop the primary node, restore from remote, verify all shards' data is recovered.
+     */
+    public void testRestoreMultiShardIndexWithArchiveUpload() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
+        internalCluster().startDataOnlyNodes(2);
+        Settings indexSettings = Settings.builder()
+            .put(remoteStoreIndexSettings(0, 3)) // 3 shards, 0 replicas
+            .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+            .build();
+        createIndex(INDEX_NAME, indexSettings);
+        ensureYellowAndNoInitializingShards(INDEX_NAME);
+        ensureGreen(INDEX_NAME);
+
+        Map<String, Long> indexStats = indexData(3, true, false, INDEX_NAME);
+        waitForTranslogArchiveUpload();
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNodeName(INDEX_NAME)));
+        ensureRed(INDEX_NAME);
+
+        assertTrue(client().admin().indices().prepareClose(INDEX_NAME).get().isAcknowledged());
+        PlainActionFuture<RestoreRemoteStoreResponse> future = PlainActionFuture.newFuture();
+        client().admin()
+            .cluster()
+            .restoreRemoteStore(new RestoreRemoteStoreRequest().indices(INDEX_NAME).restoreAllShards(true).waitForCompletion(true), future);
+        future.actionGet();
+
+        ensureGreen(TimeValue.timeValueSeconds(120), INDEX_NAME);
+        verifyRestoredData(indexStats, INDEX_NAME);
+    }
+
+    /**
+     * Multi-node: primary uploads translog archives, stop primary,
+     * restore from remote on surviving node → verify all data recovered.
+     *
+     * Unlike the single-node tests above, this proves archives uploaded by one node
+     * are downloadable and usable by a different node for restore.
+     */
+    public void testRestoreOnDifferentNodeFromTranslogArchiveWhenPrimaryDown() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
+        internalCluster().startDataOnlyNodes(2);
+
+        // 1 shard, 0 replicas with archive enabled
+        Settings indexSettings = Settings.builder()
+            .put(remoteStoreIndexSettings(0, 1))
+            .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+            .build();
+        createIndex(INDEX_NAME, indexSettings);
+        ensureYellowAndNoInitializingShards(INDEX_NAME);
+        ensureGreen(INDEX_NAME);
+
+        // Index data and wait for archives
+        Map<String, Long> indexStats = indexData(3, true, false, INDEX_NAME);
+        waitForTranslogArchiveUpload();
+
+        // Stop the primary node — shard goes red
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNodeName(INDEX_NAME)));
+        ensureRed(INDEX_NAME);
+
+        // Restore on surviving data node using the archive
+        assertTrue(client().admin().indices().prepareClose(INDEX_NAME).get().isAcknowledged());
+        PlainActionFuture<RestoreRemoteStoreResponse> future = PlainActionFuture.newFuture();
+        client().admin()
+            .cluster()
+            .restoreRemoteStore(new RestoreRemoteStoreRequest().indices(INDEX_NAME).restoreAllShards(true).waitForCompletion(true), future);
+        future.actionGet();
+
+        // Verify data restored on the surviving (different) node
+        ensureGreen(TimeValue.timeValueSeconds(120), INDEX_NAME);
+        verifyRestoredData(indexStats, INDEX_NAME);
+    }
+
+    /**
+     * Multi-shard multi-node: primary uploads translog archives for 3 shards,
+     * stop primary → restore from remote on surviving node → all shards recovered.
+     */
+    public void testMultiShardRestoreOnDifferentNodeFromTranslogArchive() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
+        internalCluster().startDataOnlyNodes(2);
+
+        // 3 shards, 0 replicas with archive enabled
+        Settings indexSettings = Settings.builder()
+            .put(remoteStoreIndexSettings(0, 3))
+            .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+            .build();
+        createIndex(INDEX_NAME, indexSettings);
+        ensureYellowAndNoInitializingShards(INDEX_NAME);
+        ensureGreen(INDEX_NAME);
+
+        Map<String, Long> indexStats = indexData(3, true, false, INDEX_NAME);
+        waitForTranslogArchiveUpload();
+
+        // Stop the primary node
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNodeName(INDEX_NAME)));
+        ensureRed(INDEX_NAME);
+
+        // Restore on surviving node
+        assertTrue(client().admin().indices().prepareClose(INDEX_NAME).get().isAcknowledged());
+        PlainActionFuture<RestoreRemoteStoreResponse> future = PlainActionFuture.newFuture();
+        client().admin()
+            .cluster()
+            .restoreRemoteStore(new RestoreRemoteStoreRequest().indices(INDEX_NAME).restoreAllShards(true).waitForCompletion(true), future);
+        future.actionGet();
+
+        // All shards restored on different node
+        ensureGreen(TimeValue.timeValueSeconds(120), INDEX_NAME);
+        verifyRestoredData(indexStats, INDEX_NAME);
+    }
+
+    /**
+     * Index data in multiple batches with archives → stop primary → restore →
+     * verify all batches' data recovered from multiple archive ZIPs.
+     */
+    public void testRestoreFromMultipleTranslogArchivesOnDifferentNode() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
+        internalCluster().startDataOnlyNodes(2);
+
+        Settings indexSettings = Settings.builder()
+            .put(remoteStoreIndexSettings(0, 1))
+            .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+            .build();
+        createIndex(INDEX_NAME, indexSettings);
+        ensureYellowAndNoInitializingShards(INDEX_NAME);
+        ensureGreen(INDEX_NAME);
+
+        // Multiple indexing iterations to create multiple archive ZIPs
+        Map<String, Long> indexStats = indexData(5, true, false, INDEX_NAME);
+        waitForTranslogArchiveUpload();
+
+        // Stop primary → restore on different node
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNodeName(INDEX_NAME)));
+        ensureRed(INDEX_NAME);
+
+        assertTrue(client().admin().indices().prepareClose(INDEX_NAME).get().isAcknowledged());
+        PlainActionFuture<RestoreRemoteStoreResponse> future = PlainActionFuture.newFuture();
+        client().admin()
+            .cluster()
+            .restoreRemoteStore(new RestoreRemoteStoreRequest().indices(INDEX_NAME).restoreAllShards(true).waitForCompletion(true), future);
+        future.actionGet();
+
+        ensureGreen(TimeValue.timeValueSeconds(120), INDEX_NAME);
+        verifyRestoredData(indexStats, INDEX_NAME);
+    }
+
+    /**
      * Wait until at least one translog archive ZIP appears in the translog repo and has been
      * present for at least 1 second, so the collector has time to include the latest ops.
      * Checks path translog/data/{hashPrefix}/{genBucket}/*.zip.

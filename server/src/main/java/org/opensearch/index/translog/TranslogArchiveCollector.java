@@ -11,6 +11,7 @@ package org.opensearch.index.translog;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
+import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
@@ -40,12 +41,8 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import org.opensearch.action.support.PlainActionFuture;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -61,7 +58,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * Node-level collector for translog archive upload. Runs a scheduled task at buffer_interval;
  * collects from eligible shards that have pending data, builds one ZIP (stored) per batch, uploads one blob.
  * <p>
- * <b>Archive path layout</b>: Blobs live at {@code basePath/translog/data/{hashTypeIndex}/{hashNodeId}/{yyyyMMddHHmmssSSS}.zip}.
+ * <b>Archive path layout</b>: Blobs live at {@code repoBasePath/translog/data/{hashTypeIndex}/{hashNodeId}/{yyyyMMddHHmmssSSS}.zip}.
+ * {@code repoBasePath} is the repository root (no index-UUID or shard-ID components); archives are index+node scoped.
  * Inside each ZIP, member paths are {@code indexUUID/shardId/primaryTerm/translog-<gen>.tlog} or {@code .ckp}.
  * See {@link org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper} for path parsing and retention.
  * <p>
@@ -97,6 +95,8 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     private final ThreadPool threadPool;
     private final RemoteStoreSettings remoteStoreSettings;
     private volatile Scheduler.Cancellable scheduledTask;
+    /** Set of index UUIDs that use coordinator-based (school bus) uploads. */
+    private final Set<String> coordinatorEnabledIndices = ConcurrentHashMap.newKeySet();
 
     public TranslogArchiveCollector(IndicesService indicesService) {
         this(indicesService, null, null);
@@ -139,36 +139,32 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
         return out.toByteArray();
     }
 
-    /**
-     * Build a ZIP (stored) archive to a file on disk; used for upload to keep memory small.
-     */
-    private static void buildArchiveToFile(Path path, Iterable<ArchiveBuilder.ArchiveBuildEntry> entries) throws IOException {
-        try (OutputStream out = Files.newOutputStream(path)) {
-            ArchiveBuilder.build(out, entries);
-        }
-    }
-
-    /**
-     * Build a ZIP (stored) with index in EOCD comment to a file; used for upload on new path.
-     */
-    private static void buildArchiveToFileWithComment(Path path, Iterable<ArchiveBuilder.ArchiveBuildEntry> entries) throws IOException {
-        try (OutputStream out = Files.newOutputStream(path)) {
-            ArchiveBuilder.buildWithComment(out, entries);
-        }
-    }
+    /** Maximum bytes for all entries from a single snapshot to prevent OOM. */
+    private static final long MAX_SNAPSHOT_ARCHIVE_BYTES = 128 * 1024 * 1024L;
 
     /**
      * Convert a transfer snapshot to archive entries (path = pathPrefix/primaryTerm/name). Reads file content into memory.
+     *
+     * @throws IOException if total content exceeds MAX_SNAPSHOT_ARCHIVE_BYTES
      */
     public static List<ArchiveBuilder.ArchiveBuildEntry> snapshotToEntries(TransferSnapshot snapshot, String pathPrefix)
         throws IOException {
         long primaryTerm = snapshot.getTranslogTransferMetadata().getPrimaryTerm();
         String prefix = pathPrefix + "/" + primaryTerm + "/";
         List<ArchiveBuilder.ArchiveBuildEntry> entries = new ArrayList<>();
+        long totalBytes = 0;
         for (FileSnapshot.TransferFileSnapshot file : snapshot.getTranslogFileSnapshotWithMetadata()) {
+            totalBytes += file.getContentLength();
+            if (totalBytes > MAX_SNAPSHOT_ARCHIVE_BYTES) {
+                throw new IOException("Snapshot archive size " + totalBytes + " exceeds limit " + MAX_SNAPSHOT_ARCHIVE_BYTES);
+            }
             entries.add(streamEntry(prefix + file.getName(), file));
         }
         for (FileSnapshot.TransferFileSnapshot file : snapshot.getCheckpointFileSnapshots()) {
+            totalBytes += file.getContentLength();
+            if (totalBytes > MAX_SNAPSHOT_ARCHIVE_BYTES) {
+                throw new IOException("Snapshot archive size " + totalBytes + " exceeds limit " + MAX_SNAPSHOT_ARCHIVE_BYTES);
+            }
             entries.add(streamEntry(prefix + file.getName(), file));
         }
         return entries;
@@ -212,6 +208,12 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
 
     private void runBatch() {
         runArchiveRetention();
+        // When the school-bus batch coordinator is active, archive uploads are handled inline
+        // with the translog sync flow (via TranslogArchiveBatchCoordinator). The collector only
+        // performs retention cleanup. Skip the upload path to avoid double uploads.
+        if (isCoordinatorBasedUploadEnabled()) {
+            return;
+        }
         List<ShardId> eligible = getEligibleShardIds();
         if (eligible.isEmpty()) {
             return;
@@ -250,7 +252,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             synchronized (lock) {
                 runBatchForIndex(
                     transferManager.getTransferService(),
-                    transferManager.getRemoteDataTransferPath(),
+                    transferManager.getArchiveBasePath(),
                     indexUUID,
                     nodeId,
                     indexShards,
@@ -339,7 +341,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             return;
         }
         try {
-            BlobPath dataPath = transferManager.getRemoteDataTransferPath().add("translog").add("data");
+            BlobPath dataPath = transferManager.getArchiveBasePath().add("translog").add("data");
             deleteArchivesOlderThanRetentionNewPath(transferManager.getTransferService(), dataPath, retentionByShard);
         } catch (IOException e) {
             logger.warn(() -> new ParameterizedMessage("Archive retention delete failed"), e);
@@ -519,31 +521,46 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     ) throws IOException {
         BlobPath archivePath = basePath.add("translog").add("data").add(hashPrefix).add(String.valueOf(genBucket));
 
+        // Pre-compute size and capture per-entry offsets for archive-based recovery metadata.
+        // Since the ZIP uses STORED (no compression), offsets are deterministic across builds.
+        ArchiveBuilder.SizeAndOffsets sizeAndOffsets = ArchiveBuilder.computeSizeAndOffsetsWithComment(allEntries);
+        List<ArchiveCommentFormat.PathOffsetLength> entryOffsets = sizeAndOffsets.getOffsets();
+
+        AtomicReference<String> uploadedBlobName = new AtomicReference<>();
         IOException lastFailure = null;
         for (int attempt = 0; attempt < UPLOAD_RETRY_MAX_ATTEMPTS; attempt++) {
             String blobName = TranslogArchivePathHelper.blobNameFromCurrentTime();
-            long contentLength = ArchiveBuilder.computeSizeWithComment(allEntries);
+            long contentLength = sizeAndOffsets.getSize();
             try (PipedOutputStream pos = new PipedOutputStream(); PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)) {
                 AtomicReference<IOException> uploadError = new AtomicReference<>();
-                Thread uploadThread = new Thread(() -> {
+                java.util.concurrent.CountDownLatch uploadLatch = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                    Thread t = new Thread(r, "translog-archive-upload");
+                    t.setDaemon(true);
+                    return t;
+                });
+                executor.submit(() -> {
                     try {
                         transferService.uploadBlobStream(pis, contentLength, archivePath, blobName, WritePriority.HIGH, null);
                     } catch (IOException e) {
                         uploadError.set(e);
+                    } finally {
+                        uploadLatch.countDown();
                     }
-                }, "translog-archive-upload");
-                uploadThread.start();
+                });
                 try {
                     ArchiveBuilder.buildWithComment(pos, allEntries);
                 } finally {
                     pos.close();
                 }
                 try {
-                    uploadThread.join();
+                    uploadLatch.await();
                 } catch (InterruptedException e) {
+                    executor.shutdownNow();
                     Thread.currentThread().interrupt();
                     throw new IOException("Interrupted while waiting for archive upload", e);
                 }
+                executor.shutdown();
                 if (uploadError.get() != null) {
                     lastFailure = uploadError.get();
                     if (attempt < UPLOAD_RETRY_MAX_ATTEMPTS - 1) {
@@ -577,14 +594,27 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 genBucket,
                 blobName
             );
+            uploadedBlobName.set(blobName);
             break;
         }
+        // Build archive entry offsets map for recovery metadata: entryPath → "offset,length"
+        Map<String, String> archiveEntryOffsetsMap = new HashMap<>();
+        for (ArchiveCommentFormat.PathOffsetLength pol : entryOffsets) {
+            archiveEntryOffsetsMap.put(pol.getPath(), pol.getOffset() + "," + pol.getLength());
+        }
+        String fullArchiveBlobPath = archivePath.buildAsString() + uploadedBlobName.get();
+
+        int metadataSuccessCount = 0;
         for (int i = 0; i < contributingShards.size(); i++) {
             final int shardIndex = i;
             Optional<TranslogTransferManager> managerOpt = contributingShards.get(i).getTranslogTransferManager();
             if (managerOpt.isPresent()) {
                 try {
+                    // Populate archive location in metadata for archive-based recovery
+                    snapshots.get(i).getTranslogTransferMetadata().setArchiveBlobPath(fullArchiveBlobPath);
+                    snapshots.get(i).getTranslogTransferMetadata().setArchiveEntryOffsets(archiveEntryOffsetsMap);
                     managerOpt.get().uploadMetadata(snapshots.get(i));
+                    metadataSuccessCount++;
                 } catch (IOException e) {
                     logger.warn(
                         () -> new ParameterizedMessage(
@@ -594,6 +624,17 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                         e
                     );
                 }
+            }
+        }
+
+        // If no metadata was uploaded successfully, the ZIP blob is orphaned — attempt cleanup.
+        if (metadataSuccessCount == 0 && uploadedBlobName.get() != null) {
+            logger.warn("All metadata uploads failed; attempting to delete orphaned archive blob {}", uploadedBlobName.get());
+            try {
+                transferService.deleteBlobs(archivePath, java.util.Collections.singletonList(uploadedBlobName.get()));
+                logger.info("Deleted orphaned archive blob {}", uploadedBlobName.get());
+            } catch (IOException deleteEx) {
+                logger.warn("Failed to delete orphaned archive blob {}: {}", uploadedBlobName.get(), deleteEx.getMessage());
             }
         }
     }
@@ -644,6 +685,30 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 releases.get(i).run();
             }
         }
+    }
+
+    /**
+     * Register an index as using coordinator-based (school bus) upload.
+     * When registered, the collector skips upload for that index — only retention runs.
+     */
+    public void registerCoordinatorIndex(String indexUUID) {
+        coordinatorEnabledIndices.add(indexUUID);
+    }
+
+    /**
+     * Unregister an index from coordinator-based upload (e.g. on index deletion).
+     */
+    public void unregisterCoordinatorIndex(String indexUUID) {
+        coordinatorEnabledIndices.remove(indexUUID);
+    }
+
+    /**
+     * Returns true if the coordinator-based (school bus) upload model is active for any index.
+     * When true, the collector only runs retention — uploads are handled inline by
+     * {@link TranslogArchiveBatchCoordinator} in the sync path.
+     */
+    private boolean isCoordinatorBasedUploadEnabled() {
+        return !coordinatorEnabledIndices.isEmpty();
     }
 
     /**

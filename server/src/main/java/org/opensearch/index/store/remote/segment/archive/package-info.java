@@ -10,4 +10,3 @@
  * Archive utilities for remote store segment files.
  */
 package org.opensearch.index.store.remote.segment.archive;
-

@@ -21,6 +21,8 @@ import org.opensearch.action.LatchedActionListener;
 import org.opensearch.action.bulk.BackoffPolicy;
 import org.opensearch.action.support.GroupedActionListener;
 import org.opensearch.cluster.routing.RecoverySource;
+import org.opensearch.common.UUIDs;
+import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.unit.TimeValue;
@@ -31,18 +33,25 @@ import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.remote.RemoteSegmentTransferTracker;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.CompositeDirectory;
+import org.opensearch.index.store.RemoteDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
+import org.opensearch.index.store.remote.metadata.SegmentArchiveEntry;
+import org.opensearch.index.store.remote.segment.archive.SegmentArchiveBuilder;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 import org.opensearch.indices.replication.checkpoint.SegmentReplicationCheckpointPublisher;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -93,6 +102,14 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
     private volatile Iterator<TimeValue> backoffDelayIterator;
     private final SegmentReplicationCheckpointPublisher checkpointPublisher;
     private final RemoteStoreSettings remoteStoreSettings;
+
+    /**
+     * When segment archive upload is enabled, these fields track the latest archive blob name
+     * and per-file entries (offset, length, checksum) within the archive ZIP.
+     * Reset on each successful archive upload.
+     */
+    private volatile String lastArchiveBlobName;
+    private volatile Map<String, SegmentArchiveEntry> lastArchiveEntries;
 
     public RemoteStoreRefreshListener(
         IndexShard indexShard,
@@ -414,14 +431,31 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
             throw new UnsupportedOperationException("Encountered null TranslogGeneration while uploading metadata to remote segment store");
         } else {
             long translogFileGeneration = translogGeneration.translogFileGeneration;
-            remoteDirectory.uploadMetadata(
-                localSegmentsPostRefresh,
-                segmentInfosSnapshot,
-                storeDirectory,
-                translogFileGeneration,
-                replicationCheckpoint,
-                indexShard.getNodeId()
-            );
+            if (indexShard.indexSettings().isSegmentArchiveUploadEnabled() && lastArchiveBlobName != null && lastArchiveEntries != null) {
+                // Upload metadata with archive fields
+                remoteDirectory.uploadMetadata(
+                    localSegmentsPostRefresh,
+                    segmentInfosSnapshot,
+                    storeDirectory,
+                    translogFileGeneration,
+                    replicationCheckpoint,
+                    indexShard.getNodeId(),
+                    lastArchiveBlobName,
+                    lastArchiveEntries
+                );
+                // Clear archive state after metadata upload
+                this.lastArchiveBlobName = null;
+                this.lastArchiveEntries = null;
+            } else {
+                remoteDirectory.uploadMetadata(
+                    localSegmentsPostRefresh,
+                    segmentInfosSnapshot,
+                    storeDirectory,
+                    translogFileGeneration,
+                    replicationCheckpoint,
+                    indexShard.getNodeId()
+                );
+            }
         }
     }
 
@@ -437,6 +471,123 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
             return;
         }
 
+        // Check if segment archive upload is enabled
+        if (indexShard.indexSettings().isSegmentArchiveUploadEnabled()) {
+            uploadNewSegmentsAsArchive(filteredFiles, localSegmentsSizeMap, listener);
+        } else {
+            uploadNewSegmentsPerFile(filteredFiles, localSegmentsSizeMap, listener);
+        }
+    }
+
+    private static final int SEGMENT_ARCHIVE_UPLOAD_MAX_ATTEMPTS = 2;
+
+    /**
+     * Maximum total bytes of segment files to include in a single archive ZIP.
+     * If the total exceeds this, falls back to per-file upload to avoid OOM.
+     * 256 MB is generous for a single refresh; typical refreshes produce much less.
+     */
+    static final long MAX_SEGMENT_ARCHIVE_BYTES = 256 * 1024 * 1024L;
+
+    /**
+     * Archive upload: bundles all new segment files into a single ZIP blob.
+     * One S3 PUT instead of N individual PUTs. Retries on transient failure.
+     */
+    private void uploadNewSegmentsAsArchive(
+        Collection<String> filteredFiles,
+        Map<String, Long> localSegmentsSizeMap,
+        ActionListener<Void> listener
+    ) {
+        try {
+            logger.debug("Uploading {} segment files as archive ZIP", filteredFiles.size());
+
+            // Build archive entries from local segment files with size guard
+            List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> buildEntries = new ArrayList<>();
+            Directory directory = ((FilterDirectory) (((FilterDirectory) storeDirectory).getDelegate())).getDelegate();
+            long totalArchiveBytes = 0;
+            for (String src : filteredFiles) {
+                try (IndexInput input = storeDirectory.openInput(src, IOContext.DEFAULT)) {
+                    long fileLen = input.length();
+                    totalArchiveBytes += fileLen;
+                    if (totalArchiveBytes > MAX_SEGMENT_ARCHIVE_BYTES) {
+                        logger.warn(
+                            "Segment archive size {} exceeds limit {}, falling back to per-file upload",
+                            totalArchiveBytes,
+                            MAX_SEGMENT_ARCHIVE_BYTES
+                        );
+                        uploadNewSegmentsPerFile(filteredFiles, localSegmentsSizeMap, listener);
+                        return;
+                    }
+                    byte[] content = new byte[(int) fileLen];
+                    input.readBytes(content, 0, content.length);
+                    buildEntries.add(SegmentArchiveBuilder.fromBytes(src, content));
+                }
+            }
+
+            // Build ZIP and extract offsets
+            ByteArrayOutputStream archiveOut = new ByteArrayOutputStream();
+            Map<String, SegmentArchiveEntry> archiveEntries = SegmentArchiveBuilder.buildAndExtractOffsets(archiveOut, buildEntries);
+            byte[] archiveBytes = archiveOut.toByteArray();
+
+            // Upload single archive blob to remote data directory with retry
+            BlobContainer blobContainer = ((RemoteDirectory) remoteDirectory.getDelegate()).getBlobContainer();
+            String archiveBlobName = null;
+            IOException lastFailure = null;
+            for (int attempt = 0; attempt < SEGMENT_ARCHIVE_UPLOAD_MAX_ATTEMPTS; attempt++) {
+                archiveBlobName = "segment_archive_" + System.currentTimeMillis() + "_" + UUIDs.base64UUID() + ".zip";
+                try {
+                    blobContainer.writeBlob(archiveBlobName, new ByteArrayInputStream(archiveBytes), archiveBytes.length, true);
+                    lastFailure = null;
+                    break;
+                } catch (IOException e) {
+                    lastFailure = e;
+                    logger.warn("Segment archive upload attempt {} failed: {}", attempt + 1, e.getMessage());
+                }
+            }
+            if (lastFailure != null) {
+                throw lastFailure;
+            }
+
+            // Update the cache: register each file as uploaded (for containsFile checks)
+            for (String src : filteredFiles) {
+                SegmentArchiveEntry entry = archiveEntries.get(src);
+                if (entry != null) {
+                    remoteDirectory.postUploadForArchive(src, archiveBlobName, entry, storeDirectory);
+                }
+            }
+
+            // Store archive info for metadata upload
+            this.lastArchiveBlobName = archiveBlobName;
+            this.lastArchiveEntries = archiveEntries;
+
+            // Track upload stats
+            for (String src : filteredFiles) {
+                UploadListener statsListener = createUploadListener(localSegmentsSizeMap);
+                statsListener.beforeUpload(src);
+                statsListener.onSuccess(src);
+                if (directory instanceof CompositeDirectory) {
+                    ((CompositeDirectory) directory).afterSyncToRemote(src);
+                }
+            }
+
+            logger.debug("Archive upload successful: {} ({} bytes, {} files)", archiveBlobName, archiveBytes.length, filteredFiles.size());
+            listener.onResponse(null);
+        } catch (Exception e) {
+            logger.warn("Exception while uploading segment archive", e);
+            // Clear archive state on failure
+            this.lastArchiveBlobName = null;
+            this.lastArchiveEntries = null;
+            listener.onFailure(e);
+        }
+    }
+
+    /**
+     * Legacy per-file upload: uploads each segment file individually.
+     */
+    private void uploadNewSegmentsPerFile(
+        Collection<String> filteredFiles,
+        Map<String, Long> localSegmentsSizeMap,
+        ActionListener<Void> listener
+    ) {
         logger.debug("Effective new segments files to upload {}", filteredFiles);
         ActionListener<Collection<Void>> mappedListener = ActionListener.map(listener, resp -> null);
         GroupedActionListener<Void> batchUploadListener = new GroupedActionListener<>(mappedListener, filteredFiles.size());

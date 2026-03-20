@@ -44,13 +44,26 @@ public class TranslogTransferMetadata {
 
     private final SetOnce<Map<String, String>> generationToPrimaryTermMapper = new SetOnce<>();
 
+    /**
+     * When translog archive upload is enabled, this records the full blob path (including blob name) of the
+     * archive ZIP that contains this shard's translog files. Null when archive mode is not used.
+     */
+    private volatile String archiveBlobPath;
+
+    /**
+     * Maps generation (as String) → "offset,length" within the archive ZIP blob.
+     * Each value encodes the byte offset and byte length of the translog file's data inside the ZIP,
+     * enabling range-read recovery. Null when archive mode is not used.
+     */
+    private volatile Map<String, String> archiveEntryOffsets;
+
     public static final String METADATA_SEPARATOR = "__";
 
     public static final String METADATA_PREFIX = "metadata";
 
     static final int BUFFER_SIZE = 4096;
 
-    static final int CURRENT_VERSION = 1;
+    static final int CURRENT_VERSION = 2;
 
     static final String METADATA_CODEC = "md";
 
@@ -96,6 +109,31 @@ public class TranslogTransferMetadata {
 
     public Map<String, String> getGenerationToPrimaryTermMapper() {
         return generationToPrimaryTermMapper.get();
+    }
+
+    /** Sets the archive blob path (full path including blob name) for archive-based recovery. */
+    public void setArchiveBlobPath(String archiveBlobPath) {
+        this.archiveBlobPath = archiveBlobPath;
+    }
+
+    /** Returns the archive blob path, or null if this metadata was not uploaded in archive mode. */
+    public String getArchiveBlobPath() {
+        return archiveBlobPath;
+    }
+
+    /**
+     * Sets the archive entry offsets: generation → "offset,length" for range-read recovery from archive ZIP.
+     */
+    public void setArchiveEntryOffsets(Map<String, String> archiveEntryOffsets) {
+        this.archiveEntryOffsets = archiveEntryOffsets;
+    }
+
+    /**
+     * Returns archive entry offsets, or null if not in archive mode.
+     * Values are "offset,length" strings for range-reading individual files from the archive ZIP.
+     */
+    public Map<String, String> getArchiveEntryOffsets() {
+        return archiveEntryOffsets;
     }
 
     /*

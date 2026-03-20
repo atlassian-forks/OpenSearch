@@ -40,6 +40,18 @@ public class TranslogTransferMetadataHandler implements IndexIOStreamHandler<Tra
         TranslogTransferMetadata metadata = new TranslogTransferMetadata(primaryTerm, generation, minTranslogGeneration, count);
         metadata.setGenerationToPrimaryTermMapper(generationToPrimaryTermMapper);
 
+        // v2: archive fields (optional — absent in v1 metadata files)
+        if (indexInput.getFilePointer() < indexInput.length()) {
+            String archiveBlobPath = indexInput.readString();
+            if (!archiveBlobPath.isEmpty()) {
+                metadata.setArchiveBlobPath(archiveBlobPath);
+            }
+            Map<String, String> archiveEntryOffsets = indexInput.readMapOfStrings();
+            if (!archiveEntryOffsets.isEmpty()) {
+                metadata.setArchiveEntryOffsets(archiveEntryOffsets);
+            }
+        }
+
         return metadata;
     }
 
@@ -56,6 +68,15 @@ public class TranslogTransferMetadataHandler implements IndexIOStreamHandler<Tra
         indexOutput.writeLong(content.getMinTranslogGeneration());
         if (content.getGenerationToPrimaryTermMapper() != null) {
             indexOutput.writeMapOfStrings(content.getGenerationToPrimaryTermMapper());
+        } else {
+            indexOutput.writeMapOfStrings(new HashMap<>());
+        }
+        // v2: archive fields
+        String archiveBlobPath = content.getArchiveBlobPath();
+        indexOutput.writeString(archiveBlobPath != null ? archiveBlobPath : "");
+        Map<String, String> archiveEntryOffsets = content.getArchiveEntryOffsets();
+        if (archiveEntryOffsets != null) {
+            indexOutput.writeMapOfStrings(archiveEntryOffsets);
         } else {
             indexOutput.writeMapOfStrings(new HashMap<>());
         }

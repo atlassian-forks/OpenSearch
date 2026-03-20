@@ -65,6 +65,8 @@ public class TranslogTransferManager {
     private final TransferService transferService;
     private final BlobPath remoteDataTransferPath;
     private final BlobPath remoteMetadataTransferPath;
+    /** Repository-root path used as base for index-scoped translog archives (no shard component). */
+    private final BlobPath archiveBasePath;
     private final FileTransferTracker fileTransferTracker;
     private final RemoteTranslogTransferTracker remoteTranslogTransferTracker;
     private final RemoteStoreSettings remoteStoreSettings;
@@ -86,6 +88,7 @@ public class TranslogTransferManager {
         TransferService transferService,
         BlobPath remoteDataTransferPath,
         BlobPath remoteMetadataTransferPath,
+        BlobPath archiveBasePath,
         FileTransferTracker fileTransferTracker,
         RemoteTranslogTransferTracker remoteTranslogTransferTracker,
         RemoteStoreSettings remoteStoreSettings,
@@ -95,6 +98,7 @@ public class TranslogTransferManager {
         this.transferService = transferService;
         this.remoteDataTransferPath = remoteDataTransferPath;
         this.remoteMetadataTransferPath = remoteMetadataTransferPath;
+        this.archiveBasePath = archiveBasePath;
         this.fileTransferTracker = fileTransferTracker;
         this.logger = Loggers.getLogger(getClass(), shardId);
         this.remoteTranslogTransferTracker = remoteTranslogTransferTracker;
@@ -108,6 +112,14 @@ public class TranslogTransferManager {
 
     public BlobPath getRemoteDataTransferPath() {
         return remoteDataTransferPath;
+    }
+
+    /**
+     * Returns the repository-root base path for translog archives. Archives are index+node scoped
+     * (spanning all shards), so this path contains no shard-specific components.
+     */
+    public BlobPath getArchiveBasePath() {
+        return archiveBasePath;
     }
 
     public RemoteTranslogTransferTracker getRemoteTranslogTransferTracker() {
@@ -253,12 +265,38 @@ public class TranslogTransferManager {
     }
 
     public boolean downloadTranslog(String primaryTerm, String generation, Path location) throws IOException {
+        return downloadTranslog(primaryTerm, generation, location, null, null);
+    }
+
+    /**
+     * Downloads a translog generation to local FS. When {@code archiveBlobPath} and {@code archiveEntryOffsets}
+     * are provided (archive mode), files are range-read from the archive ZIP blob instead of individual blobs.
+     *
+     * @param primaryTerm      primary term of the generation
+     * @param generation       generation number (as String)
+     * @param location         local directory to write files to
+     * @param archiveBlobPath  full blob path of the archive ZIP (null for legacy per-shard mode)
+     * @param archiveEntryOffsets map of entryPath → "offset,length" within the ZIP (null for legacy mode)
+     */
+    public boolean downloadTranslog(
+        String primaryTerm,
+        String generation,
+        Path location,
+        String archiveBlobPath,
+        Map<String, String> archiveEntryOffsets
+    ) throws IOException {
         logger.trace(
-            "Downloading translog files with: Primary Term = {}, Generation = {}, Location = {}",
+            "Downloading translog files with: Primary Term = {}, Generation = {}, Location = {}, archiveMode = {}",
             primaryTerm,
             generation,
-            location
+            location,
+            archiveBlobPath != null
         );
+
+        if (archiveBlobPath != null && archiveEntryOffsets != null) {
+            return downloadTranslogFromArchive(primaryTerm, generation, location, archiveBlobPath, archiveEntryOffsets);
+        }
+
         String ckpFileName = Translog.getCommitCheckpointFileName(Long.parseLong(generation));
         String translogFilename = Translog.getFilename(Long.parseLong(generation));
         if (isTranslogMetadataEnabled == false) {
@@ -276,6 +314,81 @@ public class TranslogTransferManager {
             }
         }
         return true;
+    }
+
+    /**
+     * Downloads translog and checkpoint files for a single generation from an archive ZIP blob
+     * using range-reads. Entry paths inside the ZIP follow the pattern:
+     * {@code {indexUUID}/{shardId}/{primaryTerm}/{filename}}
+     */
+    private boolean downloadTranslogFromArchive(
+        String primaryTerm,
+        String generation,
+        Path location,
+        String archiveBlobPath,
+        Map<String, String> archiveEntryOffsets
+    ) throws IOException {
+        String indexUUID = shardId.getIndex().getUUID();
+        String shardIdStr = String.valueOf(shardId.id());
+        String translogFilename = Translog.getFilename(Long.parseLong(generation));
+        String ckpFileName = Translog.getCommitCheckpointFileName(Long.parseLong(generation));
+
+        // Entry paths in the archive: {indexUUID}/{shardId}/{primaryTerm}/{filename}
+        String tlogEntryPath = indexUUID + "/" + shardIdStr + "/" + primaryTerm + "/" + translogFilename;
+        String ckpEntryPath = indexUUID + "/" + shardIdStr + "/" + primaryTerm + "/" + ckpFileName;
+
+        // Parse the archive blob path into BlobPath + blobName
+        int lastSlash = archiveBlobPath.lastIndexOf('/');
+        String blobName = archiveBlobPath.substring(lastSlash + 1);
+        String pathStr = lastSlash > 0 ? archiveBlobPath.substring(0, lastSlash) : "";
+        BlobPath blobPath = new BlobPath();
+        if (!pathStr.isEmpty()) {
+            for (String segment : pathStr.split("/")) {
+                blobPath = blobPath.add(segment);
+            }
+        }
+
+        downloadEntryFromArchive(blobPath, blobName, tlogEntryPath, archiveEntryOffsets, translogFilename, location);
+        downloadEntryFromArchive(blobPath, blobName, ckpEntryPath, archiveEntryOffsets, ckpFileName, location);
+
+        return true;
+    }
+
+    /**
+     * Range-reads a single entry from the archive ZIP blob and writes it to local FS.
+     */
+    private void downloadEntryFromArchive(
+        BlobPath blobPath,
+        String blobName,
+        String entryPath,
+        Map<String, String> archiveEntryOffsets,
+        String localFileName,
+        Path location
+    ) throws IOException {
+        String offsetLength = archiveEntryOffsets.get(entryPath);
+        if (offsetLength == null) {
+            throw new IOException("Archive entry not found for: " + entryPath);
+        }
+        String[] parts = offsetLength.split(",");
+        long offset = Long.parseLong(parts[0]);
+        long length = Long.parseLong(parts[1]);
+
+        Path filePath = location.resolve(localFileName);
+        deleteFileIfExists(filePath);
+
+        long downloadStartTime = System.nanoTime();
+        boolean downloadStatus = false;
+        try (InputStream in = transferService.downloadBlob(blobPath, blobName, offset, length)) {
+            Files.copy(in, filePath);
+            downloadStatus = true;
+        } finally {
+            remoteTranslogTransferTracker.addDownloadTimeInMillis((System.nanoTime() - downloadStartTime) / 1_000_000L);
+            if (downloadStatus) {
+                remoteTranslogTransferTracker.addDownloadBytesSucceeded(length);
+            }
+        }
+
+        fileTransferTracker.add(localFileName, true);
     }
 
     /**

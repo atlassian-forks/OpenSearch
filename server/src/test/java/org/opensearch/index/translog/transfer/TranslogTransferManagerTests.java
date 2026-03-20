@@ -115,6 +115,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             transferService,
             remoteBaseTransferPath.add(TRANSLOG.getName()),
             remoteBaseTransferPath.add(METADATA.getName()),
+            remoteBaseTransferPath,
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
@@ -182,6 +183,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             transferService,
             remoteBaseTransferPath.add(TRANSLOG.getName()),
             remoteBaseTransferPath.add(METADATA.getName()),
+            remoteBaseTransferPath,
             fileTransferTracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
@@ -235,6 +237,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             transferService,
             remoteBaseTransferPath.add(TRANSLOG.getName()),
             remoteBaseTransferPath.add(METADATA.getName()),
+            remoteBaseTransferPath,
             fileTransferTracker,
             remoteTranslogTransferTracker,
             remoteStoreSettings,
@@ -279,6 +282,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             transferService,
             remoteBaseTransferPath.add(TRANSLOG.getName()),
             remoteBaseTransferPath.add(METADATA.getName()),
+            remoteBaseTransferPath,
             fileTransferTracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
@@ -519,6 +523,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             blobStoreTransferService,
             remoteBaseTransferPath.add(TRANSLOG.getName()),
             remoteBaseTransferPath.add(METADATA.getName()),
+            remoteBaseTransferPath,
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
@@ -585,6 +590,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             blobStoreTransferService,
             remoteBaseTransferPath.add(TRANSLOG.getName()),
             remoteBaseTransferPath.add(METADATA.getName()),
+            remoteBaseTransferPath,
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
@@ -694,6 +700,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             transferService,
             remoteBaseTransferPath.add(TRANSLOG.getName()),
             remoteBaseTransferPath.add(METADATA.getName()),
+            remoteBaseTransferPath,
             fileTransferTracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
@@ -725,6 +732,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             transferService,
             remoteBaseTransferPath.add(TRANSLOG.getName()),
             remoteBaseTransferPath.add(METADATA.getName()),
+            remoteBaseTransferPath,
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
@@ -907,6 +915,7 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             transferService,
             remoteBaseTransferPath.add(TRANSLOG.getName()),
             remoteBaseTransferPath.add(METADATA.getName()),
+            remoteBaseTransferPath,
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
@@ -923,5 +932,209 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             Set.of("translog-12.tlog", "translog-12.ckp", "translog-23.tlog", "translog-23.ckp"),
             translogTransferManager.getFileTransferTracker().allUploaded()
         );
+    }
+
+    public void testMetadataRoundTripWithArchiveFields() throws IOException {
+        TranslogTransferMetadata metadata = new TranslogTransferMetadata(2L, 10L, 5L, 3, "node-1");
+        HashMap<String, String> genMap = new HashMap<>();
+        genMap.put("5", "2");
+        genMap.put("6", "2");
+        genMap.put("7", "2");
+        metadata.setGenerationToPrimaryTermMapper(genMap);
+        metadata.setArchiveBlobPath("repo-root/translog/data/hashPrefix/0/20260320.zip");
+        HashMap<String, String> offsets = new HashMap<>();
+        offsets.put("indexUUID/0/2/translog-5.tlog", "100,500");
+        offsets.put("indexUUID/0/2/translog-5.ckp", "600,50");
+        metadata.setArchiveEntryOffsets(offsets);
+
+        // Serialize via the same codec wrapper used in production
+        byte[] metadataBytes = translogTransferManager.getMetadataBytes(metadata);
+        assertNotNull(metadataBytes);
+        assertTrue(metadataBytes.length > 0);
+
+        // Deserialize via TranslogTransferManager.readMetadata(filename) path — simulate by uploading+downloading
+        // For simplicity, use the handler directly with the codec wrapper
+        org.opensearch.common.io.VersionedCodecStreamWrapper<TranslogTransferMetadata> wrapper =
+            new org.opensearch.common.io.VersionedCodecStreamWrapper<>(
+                new TranslogTransferMetadataHandler(),
+                TranslogTransferMetadata.CURRENT_VERSION,
+                "md"
+            );
+        org.apache.lucene.store.IndexInput indexInput = new org.opensearch.common.lucene.store.ByteArrayIndexInput(
+            "test-metadata",
+            metadataBytes
+        );
+        TranslogTransferMetadata read = wrapper.readStream(indexInput);
+
+        assertEquals(2L, read.getPrimaryTerm());
+        assertEquals(10L, read.getGeneration());
+        assertEquals(5L, read.getMinTranslogGeneration());
+        assertEquals(genMap, read.getGenerationToPrimaryTermMapper());
+        assertEquals("repo-root/translog/data/hashPrefix/0/20260320.zip", read.getArchiveBlobPath());
+        assertEquals(offsets, read.getArchiveEntryOffsets());
+    }
+
+    public void testMetadataRoundTripWithoutArchiveFields() throws IOException {
+        TranslogTransferMetadata metadata = new TranslogTransferMetadata(1L, 5L, 3L, 1, "node-1");
+        HashMap<String, String> genMap = new HashMap<>();
+        genMap.put("3", "1");
+        metadata.setGenerationToPrimaryTermMapper(genMap);
+        // No archive fields set
+
+        byte[] metadataBytes = translogTransferManager.getMetadataBytes(metadata);
+        org.opensearch.common.io.VersionedCodecStreamWrapper<TranslogTransferMetadata> wrapper =
+            new org.opensearch.common.io.VersionedCodecStreamWrapper<>(
+                new TranslogTransferMetadataHandler(),
+                TranslogTransferMetadata.CURRENT_VERSION,
+                "md"
+            );
+        org.apache.lucene.store.IndexInput indexInput = new org.opensearch.common.lucene.store.ByteArrayIndexInput(
+            "test-metadata",
+            metadataBytes
+        );
+        TranslogTransferMetadata read = wrapper.readStream(indexInput);
+
+        assertEquals(1L, read.getPrimaryTerm());
+        assertEquals(5L, read.getGeneration());
+        assertEquals(3L, read.getMinTranslogGeneration());
+        assertNull("archiveBlobPath should be null when not set", read.getArchiveBlobPath());
+        assertNull("archiveEntryOffsets should be null when not set", read.getArchiveEntryOffsets());
+    }
+
+    public void testDownloadTranslogFromArchive() throws IOException {
+        Path location = createTempDir();
+        String indexUUID = "indexUUid";
+        String shardIdStr = "0";
+        String primaryTerm = "12";
+        String generation = "23";
+        String translogFilename = Translog.getFilename(Long.parseLong(generation));
+        String ckpFilename = Translog.getCommitCheckpointFileName(Long.parseLong(generation));
+        String tlogEntryPath = indexUUID + "/" + shardIdStr + "/" + primaryTerm + "/" + translogFilename;
+        String ckpEntryPath = indexUUID + "/" + shardIdStr + "/" + primaryTerm + "/" + ckpFilename;
+
+        byte[] tlogContent = "translog archive content".getBytes(StandardCharsets.UTF_8);
+        byte[] ckpContent = "checkpoint archive content".getBytes(StandardCharsets.UTF_8);
+
+        String archiveBlobPath = "repo-root/translog/data/hashPrefix/0/20260320.zip";
+        HashMap<String, String> archiveEntryOffsets = new HashMap<>();
+        archiveEntryOffsets.put(tlogEntryPath, "100," + tlogContent.length);
+        archiveEntryOffsets.put(ckpEntryPath, "600," + ckpContent.length);
+
+        // Mock range-read for tlog entry
+        when(transferService.downloadBlob(any(BlobPath.class), eq("20260320.zip"), eq(100L), eq((long) tlogContent.length))).thenReturn(
+            new ByteArrayInputStream(tlogContent)
+        );
+        // Mock range-read for ckp entry
+        when(transferService.downloadBlob(any(BlobPath.class), eq("20260320.zip"), eq(600L), eq((long) ckpContent.length))).thenReturn(
+            new ByteArrayInputStream(ckpContent)
+        );
+
+        translogTransferManager.downloadTranslog(primaryTerm, generation, location, archiveBlobPath, archiveEntryOffsets);
+
+        assertTrue(Files.exists(location.resolve(translogFilename)));
+        assertTrue(Files.exists(location.resolve(ckpFilename)));
+        assertArrayEquals(tlogContent, Files.readAllBytes(location.resolve(translogFilename)));
+        assertArrayEquals(ckpContent, Files.readAllBytes(location.resolve(ckpFilename)));
+
+        // Verify range-reads were made (not full blob downloads)
+        verify(transferService).downloadBlob(any(BlobPath.class), eq("20260320.zip"), eq(100L), eq((long) tlogContent.length));
+        verify(transferService).downloadBlob(any(BlobPath.class), eq("20260320.zip"), eq(600L), eq((long) ckpContent.length));
+    }
+
+    public void testDownloadTranslogFromArchiveMissingEntryThrows() throws IOException {
+        Path location = createTempDir();
+        String archiveBlobPath = "repo-root/translog/data/hashPrefix/0/20260320.zip";
+        HashMap<String, String> archiveEntryOffsets = new HashMap<>();
+        // Only tlog entry, no ckp entry — should fail when looking for ckp
+
+        String indexUUID = "indexUUid";
+        String tlogEntryPath = indexUUID + "/0/12/translog-23.tlog";
+        archiveEntryOffsets.put(tlogEntryPath, "100,500");
+
+        // Mock tlog range-read to succeed so the error happens on the ckp lookup
+        byte[] tlogContent = "tlog".getBytes(StandardCharsets.UTF_8);
+        when(transferService.downloadBlob(any(BlobPath.class), eq("20260320.zip"), eq(100L), eq(500L))).thenReturn(
+            new ByteArrayInputStream(tlogContent)
+        );
+
+        IOException e = expectThrows(
+            IOException.class,
+            () -> translogTransferManager.downloadTranslog("12", "23", location, archiveBlobPath, archiveEntryOffsets)
+        );
+        assertTrue(e.getMessage().contains("Archive entry not found"));
+    }
+
+    /**
+     * Backward compatibility: metadata with archive fields set, then metadata without archive fields.
+     * Verifies both paths work without data loss — v2 (archive) metadata is backward compatible with v1 (no archive).
+     * Simulates the sequence: flag off (v1) → flag on (v2 with archive) → flag off (v1 again).
+     */
+    public void testBackwardCompatFlagOffOnOff() throws IOException {
+        // Phase 1: "flag off" — metadata without archive fields (v1 style)
+        TranslogTransferMetadata metaV1 = new TranslogTransferMetadata(1L, 5L, 3L, 1, "node-1");
+        HashMap<String, String> genMapV1 = new HashMap<>();
+        genMapV1.put("3", "1");
+        genMapV1.put("4", "1");
+        genMapV1.put("5", "1");
+        metaV1.setGenerationToPrimaryTermMapper(genMapV1);
+        // No archive fields
+
+        byte[] bytesV1 = translogTransferManager.getMetadataBytes(metaV1);
+        org.opensearch.common.io.VersionedCodecStreamWrapper<TranslogTransferMetadata> wrapper =
+            new org.opensearch.common.io.VersionedCodecStreamWrapper<>(
+                new TranslogTransferMetadataHandler(),
+                TranslogTransferMetadata.CURRENT_VERSION,
+                "md"
+            );
+        TranslogTransferMetadata readV1 = wrapper.readStream(
+            new org.opensearch.common.lucene.store.ByteArrayIndexInput("v1-meta", bytesV1)
+        );
+        assertEquals(1L, readV1.getPrimaryTerm());
+        assertEquals(5L, readV1.getGeneration());
+        assertEquals(genMapV1, readV1.getGenerationToPrimaryTermMapper());
+        assertNull("v1 should have null archiveBlobPath", readV1.getArchiveBlobPath());
+        assertNull("v1 should have null archiveEntryOffsets", readV1.getArchiveEntryOffsets());
+
+        // Phase 2: "flag on" — metadata WITH archive fields (v2 style)
+        TranslogTransferMetadata metaV2 = new TranslogTransferMetadata(1L, 6L, 3L, 1, "node-1");
+        HashMap<String, String> genMapV2 = new HashMap<>(genMapV1);
+        genMapV2.put("6", "1");
+        metaV2.setGenerationToPrimaryTermMapper(genMapV2);
+        metaV2.setArchiveBlobPath("repo-root/translog/data/hash/0/20260320.zip");
+        HashMap<String, String> offsets = new HashMap<>();
+        offsets.put("indexUUid/0/1/translog-6.tlog", "100,500");
+        offsets.put("indexUUid/0/1/translog-6.ckp", "600,50");
+        metaV2.setArchiveEntryOffsets(offsets);
+
+        byte[] bytesV2 = translogTransferManager.getMetadataBytes(metaV2);
+        TranslogTransferMetadata readV2 = wrapper.readStream(
+            new org.opensearch.common.lucene.store.ByteArrayIndexInput("v2-meta", bytesV2)
+        );
+        assertEquals(1L, readV2.getPrimaryTerm());
+        assertEquals(6L, readV2.getGeneration());
+        assertEquals(genMapV2, readV2.getGenerationToPrimaryTermMapper());
+        assertEquals("repo-root/translog/data/hash/0/20260320.zip", readV2.getArchiveBlobPath());
+        assertEquals(offsets, readV2.getArchiveEntryOffsets());
+
+        // Phase 3: "flag off again" — metadata without archive fields (back to v1 style)
+        TranslogTransferMetadata metaV1Again = new TranslogTransferMetadata(1L, 7L, 3L, 1, "node-1");
+        HashMap<String, String> genMapV1Again = new HashMap<>(genMapV2);
+        genMapV1Again.put("7", "1");
+        metaV1Again.setGenerationToPrimaryTermMapper(genMapV1Again);
+        // No archive fields set — simulating flag turned off
+
+        byte[] bytesV1Again = translogTransferManager.getMetadataBytes(metaV1Again);
+        TranslogTransferMetadata readV1Again = wrapper.readStream(
+            new org.opensearch.common.lucene.store.ByteArrayIndexInput("v1-again-meta", bytesV1Again)
+        );
+        assertEquals(1L, readV1Again.getPrimaryTerm());
+        assertEquals(7L, readV1Again.getGeneration());
+        assertEquals(genMapV1Again, readV1Again.getGenerationToPrimaryTermMapper());
+        assertNull("v1-again should have null archiveBlobPath", readV1Again.getArchiveBlobPath());
+        assertNull("v1-again should have null archiveEntryOffsets", readV1Again.getArchiveEntryOffsets());
+
+        // Verify v1-again can still be read correctly even after a v2 was written
+        // (ensures no corruption or state leakage between flag transitions)
+        assertNotEquals("v2 and v1-again should have different generations", readV2.getGeneration(), readV1Again.getGeneration());
     }
 }

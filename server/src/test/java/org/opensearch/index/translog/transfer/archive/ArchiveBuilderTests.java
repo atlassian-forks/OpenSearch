@@ -99,4 +99,103 @@ public class ArchiveBuilderTests extends OpenSearchTestCase {
         assertArrayEquals(tlogContent, extractedTlog);
         assertArrayEquals(ckpContent, extractedCkp);
     }
+
+    /**
+     * End-to-end: build a ZIP from 2 shards' translog files, compute offsets, then range-read each
+     * shard's individual files back from the ZIP bytes — proving the full archive→recovery cycle works.
+     */
+    public void testMultiShardArchiveBuildAndIndividualRecover() throws IOException {
+        // Shard 0: translog-5.tlog + translog-5.ckp
+        String indexUUID = "test-index-uuid";
+        byte[] shard0Tlog = "shard0 translog content gen5".getBytes(StandardCharsets.UTF_8);
+        byte[] shard0Ckp = "shard0 ckp gen5".getBytes(StandardCharsets.UTF_8);
+        String shard0TlogPath = indexUUID + "/0/1/translog-5.tlog";
+        String shard0CkpPath = indexUUID + "/0/1/translog-5.ckp";
+
+        // Shard 1: translog-3.tlog + translog-3.ckp
+        byte[] shard1Tlog = "shard1 translog content gen3".getBytes(StandardCharsets.UTF_8);
+        byte[] shard1Ckp = "shard1 ckp gen3".getBytes(StandardCharsets.UTF_8);
+        String shard1TlogPath = indexUUID + "/1/1/translog-3.tlog";
+        String shard1CkpPath = indexUUID + "/1/1/translog-3.ckp";
+
+        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+            ArchiveBuilder.fromBytes(shard0TlogPath, shard0Tlog),
+            ArchiveBuilder.fromBytes(shard0CkpPath, shard0Ckp),
+            ArchiveBuilder.fromBytes(shard1TlogPath, shard1Tlog),
+            ArchiveBuilder.fromBytes(shard1CkpPath, shard1Ckp)
+        );
+
+        // Step 1: compute size + offsets (same as upload path)
+        ArchiveBuilder.SizeAndOffsets sizeAndOffsets = ArchiveBuilder.computeSizeAndOffsetsWithComment(entries);
+        assertThat(sizeAndOffsets.getOffsets(), hasSize(4));
+
+        // Step 2: build the actual ZIP (same as upload stream)
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ArchiveBuilder.buildWithComment(out, entries);
+        byte[] zipBytes = out.toByteArray();
+        assertThat((long) zipBytes.length, equalTo(sizeAndOffsets.getSize()));
+
+        // Step 3: build offset map (same as what TranslogArchiveCollector populates in metadata)
+        Map<String, String> offsetMap = new java.util.HashMap<>();
+        for (ArchiveCommentFormat.PathOffsetLength pol : sizeAndOffsets.getOffsets()) {
+            offsetMap.put(pol.getPath(), pol.getOffset() + "," + pol.getLength());
+        }
+        assertThat(offsetMap.size(), equalTo(4));
+
+        // Step 4: recover each shard's files individually via range-read (simulated)
+        // Shard 0 translog
+        assertEntryExtractedCorrectly(zipBytes, offsetMap, shard0TlogPath, shard0Tlog);
+        // Shard 0 checkpoint
+        assertEntryExtractedCorrectly(zipBytes, offsetMap, shard0CkpPath, shard0Ckp);
+        // Shard 1 translog — different shard, same ZIP
+        assertEntryExtractedCorrectly(zipBytes, offsetMap, shard1TlogPath, shard1Tlog);
+        // Shard 1 checkpoint
+        assertEntryExtractedCorrectly(zipBytes, offsetMap, shard1CkpPath, shard1Ckp);
+    }
+
+    private void assertEntryExtractedCorrectly(byte[] zipBytes, Map<String, String> offsetMap, String entryPath, byte[] expectedContent) {
+        String offsetLength = offsetMap.get(entryPath);
+        assertNotNull("offset should exist for " + entryPath, offsetLength);
+        String[] parts = offsetLength.split(",");
+        int offset = Integer.parseInt(parts[0]);
+        int length = Integer.parseInt(parts[1]);
+        byte[] extracted = Arrays.copyOfRange(zipBytes, offset, offset + length);
+        assertArrayEquals("content mismatch for " + entryPath, expectedContent, extracted);
+    }
+
+    public void testComputeSizeAndOffsetsWithComment() throws IOException {
+        String tlogPath = "index-uuid/0/1/translog-5.tlog";
+        String ckpPath = "index-uuid/0/1/translog-5.ckp";
+        byte[] tlogContent = "translog data here".getBytes(StandardCharsets.UTF_8);
+        byte[] ckpContent = "ckp data".getBytes(StandardCharsets.UTF_8);
+
+        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+            ArchiveBuilder.fromBytes(tlogPath, tlogContent),
+            ArchiveBuilder.fromBytes(ckpPath, ckpContent)
+        );
+
+        ArchiveBuilder.SizeAndOffsets result = ArchiveBuilder.computeSizeAndOffsetsWithComment(entries);
+        assertThat(result.getSize(), org.hamcrest.Matchers.greaterThan(0L));
+        assertThat(result.getOffsets(), hasSize(2));
+
+        // Verify offsets match actual ZIP content
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ArchiveBuilder.buildWithComment(out, entries);
+        byte[] zipBytes = out.toByteArray();
+        assertThat((long) zipBytes.length, equalTo(result.getSize()));
+
+        // Verify each offset allows correct extraction
+        for (ArchiveCommentFormat.PathOffsetLength pol : result.getOffsets()) {
+            int offset = (int) pol.getOffset();
+            int length = (int) pol.getLength();
+            byte[] extracted = Arrays.copyOfRange(zipBytes, offset, offset + length);
+            if (pol.getPath().equals(tlogPath)) {
+                assertArrayEquals(tlogContent, extracted);
+            } else if (pol.getPath().equals(ckpPath)) {
+                assertArrayEquals(ckpContent, extracted);
+            } else {
+                fail("Unexpected path: " + pol.getPath());
+            }
+        }
+    }
 }

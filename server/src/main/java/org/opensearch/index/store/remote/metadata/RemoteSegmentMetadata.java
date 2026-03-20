@@ -199,19 +199,19 @@ public class RemoteSegmentMetadata {
         int byteArraySize = (int) indexInput.readLong();
         byte[] segmentInfosBytes = new byte[byteArraySize];
         indexInput.readBytes(segmentInfosBytes, 0, byteArraySize);
-        
+
         // Read archive fields (v2 format) - backward compatible approach
         boolean archiveEnabled = false;
         String archiveBlob = null;
         String archiveFormat = null;
         Map<String, SegmentArchiveEntry> archiveEntries = null;
-        
+
         try {
             archiveEnabled = indexInput.readByte() != 0;
             if (archiveEnabled) {
                 archiveBlob = indexInput.readString();
                 archiveFormat = indexInput.readString();
-                
+
                 // Read archive entries map
                 int entryCount = indexInput.readVInt();
                 archiveEntries = new java.util.HashMap<>(entryCount);
@@ -224,7 +224,7 @@ public class RemoteSegmentMetadata {
         } catch (java.io.EOFException e) {
             // v1 format, no archive fields - ignore EOF
         }
-        
+
         return new RemoteSegmentMetadata(
             uploadedSegmentMetadataMap,
             segmentInfosBytes,

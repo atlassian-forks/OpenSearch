@@ -26,9 +26,11 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.index.translog.transfer.FileTransferTracker;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
+import org.opensearch.index.translog.transfer.TranslogArchiveRecovery;
 import org.opensearch.index.translog.transfer.TranslogCheckpointTransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.TranslogTransferMetadata;
+import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
 import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -41,7 +43,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -260,11 +264,48 @@ public class RemoteFsTranslog extends Translog {
                 Files.delete(file);
             }
 
-            Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
-            for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
-                String generation = Long.toString(i);
-                translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
+            // Check if metadata has archive info (new school-bus model) or legacy per-shard info
+            String archiveBlobPath = translogMetadata.getArchiveBlobPath();
+            Map<String, String> archiveEntryOffsets = translogMetadata.getArchiveEntryOffsets();
+
+            if (archiveBlobPath != null && archiveEntryOffsets != null) {
+                // Archive mode with explicit offsets: range-read from ZIP using metadata offsets
+                Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
+                for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
+                    String generation = Long.toString(i);
+                    translogTransferManager.downloadTranslog(
+                        generationToPrimaryTermMapper.get(generation),
+                        generation,
+                        location,
+                        archiveBlobPath,
+                        archiveEntryOffsets
+                    );
+                }
+            } else {
+                // Try legacy per-shard download first; fall back to ZIP-based recovery if files not found
+                Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
+                try {
+                    for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
+                        String generation = Long.toString(i);
+                        translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
+                    }
+                } catch (FileNotFoundException | NoSuchFileException e) {
+                    // Individual translog files not found — likely coordinator (school bus) mode
+                    // where only ZIPs were uploaded. Fall back to archive recovery.
+                    logger.info("Per-shard translog files not found, falling back to archive ZIP recovery");
+                    TranslogArchiveRecovery.recover(
+                        translogTransferManager.getTransferService(),
+                        translogTransferManager.getArchiveBasePath(),
+                        translogTransferManager.getShardId().getIndex().getUUID(),
+                        translogTransferManager.getShardId().id(),
+                        translogMetadata.getMinTranslogGeneration(),
+                        translogMetadata.getGeneration(),
+                        location,
+                        org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+                    );
+                }
             }
+
             logger.info(
                 "Downloaded translog and checkpoint files from={} to={}",
                 translogMetadata.getMinTranslogGeneration(),
@@ -280,20 +321,68 @@ public class RemoteFsTranslog extends Translog {
                 location.resolve(Translog.CHECKPOINT_FILE_NAME)
             );
         } else {
-            // When code flow reaches this block, it means we don't have any translog files uploaded to remote store.
-            // If local filesystem contains empty translog or no translog, we don't do anything.
-            // If local filesystem contains non-empty translog, we clean up these files and create empty translog.
-            logger.debug("No translog files found on remote, checking local filesystem for cleanup");
-            if (FileSystemUtils.exists(location.resolve(CHECKPOINT_FILE_NAME))) {
-                final Checkpoint checkpoint = readCheckpoint(location);
-                if (seedRemote) {
-                    logger.debug("Remote migration ongoing. Retaining the translog on local, skipping clean-up");
-                } else if (isEmptyTranslog(checkpoint) == false) {
-                    logger.debug("Translog files exist on local without any metadata in remote, cleaning up these files");
-                    // Creating empty translog will cleanup the older un-referenced tranlog files, we don't have to explicitly delete
-                    Translog.createEmptyTranslog(location, translogTransferManager.getShardId(), checkpoint);
-                } else {
-                    logger.debug("Empty translog on local, skipping clean-up");
+            // No per-shard metadata found. Per the archive design (school bus model),
+            // metadata is embedded in ZIP comments — no separate metadata files are uploaded.
+            // Attempt archive recovery via binary search on ZIP blob names.
+            String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
+            TranslogArchiveBatchCoordinator coordinator = TranslogArchiveBatchCoordinator.get(indexUUID);
+            boolean archiveRecovered = false;
+            if (coordinator != null && seedRemote == false) {
+                logger.info("No per-shard metadata found, attempting archive ZIP recovery (coordinator mode)");
+                // Use a sibling temporary directory for archive recovery to avoid destroying local
+                // translog files if no archive ZIPs are found (fresh shard case).
+                // Must be a sibling (not child) of location to avoid interference with FileSystemUtils.files().
+                Path tempRecoveryDir = location.resolveSibling("translog_archive_recovery_tmp");
+                if (Files.exists(tempRecoveryDir)) {
+                    IOUtils.rm(tempRecoveryDir);
+                }
+                Files.createDirectories(tempRecoveryDir);
+                try {
+                    TranslogArchiveRecovery.recover(
+                        translogTransferManager.getTransferService(),
+                        translogTransferManager.getArchiveBasePath(),
+                        indexUUID,
+                        translogTransferManager.getShardId().id(),
+                        tempRecoveryDir,
+                        org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+                    );
+                    // If archive recovery found and downloaded files, translog.ckp will exist in temp dir.
+                    if (FileSystemUtils.exists(tempRecoveryDir.resolve(CHECKPOINT_FILE_NAME))) {
+                        // Archive ZIPs found and recovered — move files to actual location.
+                        if (Files.notExists(location)) {
+                            Files.createDirectories(location);
+                        }
+                        for (Path file : FileSystemUtils.files(location)) {
+                            Files.delete(file);
+                        }
+                        for (Path recoveredFile : FileSystemUtils.files(tempRecoveryDir)) {
+                            Files.move(recoveredFile, location.resolve(recoveredFile.getFileName().toString()));
+                        }
+                        archiveRecovered = true;
+                        statsTracker.recordDownloadStats(prevDownloadBytesSucceeded, prevDownloadTimeInMillis);
+                    } else {
+                        logger.info("No archive ZIPs found (fresh shard), falling through to legacy translog handling");
+                    }
+                } finally {
+                    IOUtils.rm(tempRecoveryDir);
+                }
+            }
+            if (archiveRecovered == false) {
+                // Legacy: no translog files uploaded to remote store, or no coordinator active,
+                // or archive recovery found no ZIPs (fresh shard).
+                // If local filesystem contains empty translog or no translog, we don't do anything.
+                // If local filesystem contains non-empty translog, we clean up these files and create empty translog.
+                logger.debug("No translog files found on remote, checking local filesystem for cleanup");
+                if (FileSystemUtils.exists(location.resolve(CHECKPOINT_FILE_NAME))) {
+                    final Checkpoint checkpoint = readCheckpoint(location);
+                    if (seedRemote) {
+                        logger.debug("Remote migration ongoing. Retaining the translog on local, skipping clean-up");
+                    } else if (isEmptyTranslog(checkpoint) == false) {
+                        logger.debug("Translog files exist on local without any metadata in remote, cleaning up these files");
+                        Translog.createEmptyTranslog(location, translogTransferManager.getShardId(), checkpoint);
+                    } else {
+                        logger.debug("Empty translog on local, skipping clean-up");
+                    }
                 }
             }
         }
@@ -344,6 +433,7 @@ public class RemoteFsTranslog extends Translog {
             transferService,
             dataPath,
             mdPath,
+            blobStoreRepository.basePath(),
             fileTransferTracker,
             tracker,
             remoteStoreSettings,
@@ -430,6 +520,30 @@ public class RemoteFsTranslog extends Translog {
     }
 
     private boolean upload(long primaryTerm, long generation, long maxSeqNo) throws IOException {
+        // When archive upload is enabled, submit data to the per-index batch coordinator.
+        // The coordinator bundles all shards' data into a single ZIP and blocks until uploaded.
+        TranslogArchiveBatchCoordinator archiveBatchCoordinator = TranslogArchiveBatchCoordinator.get(shardId.getIndex().getUUID());
+        if (indexSettings().isTranslogArchiveUploadEnabled() && archiveBatchCoordinator != null) {
+            try {
+                logger.trace("submitting to archive batch coordinator for primary term {} generation {}", primaryTerm, generation);
+                List<ArchiveBuilder.ArchiveBuildEntry> entries = buildArchiveEntries(primaryTerm, generation);
+                TranslogArchiveBatchCoordinator.ShardArchiveData shardData = new TranslogArchiveBatchCoordinator.ShardArchiveData(
+                    shardId.id(),
+                    primaryTerm,
+                    generation,
+                    getMinFileGeneration(),
+                    entries
+                );
+                archiveBatchCoordinator.submitAndWait(shardData, translogTransferManager.getTransferService());
+                // No per-shard metadata upload — recovery uses TranslogArchiveRecovery to find
+                // and download translog files directly from archive ZIPs via binary search.
+                maxRemoteTranslogGenerationUploaded = generation;
+                minRemoteGenReferenced = getMinFileGeneration();
+                return true;
+            } finally {
+                syncPermit.release(SYNC_PERMIT);
+            }
+        }
         logger.trace("uploading translog for primary term {} generation {}", primaryTerm, generation);
         try (
             TranslogCheckpointTransferSnapshot transferSnapshotProvider = new TranslogCheckpointTransferSnapshot.Builder(
@@ -449,6 +563,70 @@ public class RemoteFsTranslog extends Translog {
             syncPermit.release(SYNC_PERMIT);
         }
 
+    }
+
+    /**
+     * Maximum total bytes for a single shard's translog archive entries.
+     * Translog files are typically small (KB-MB), but a guard prevents OOM on pathological cases.
+     */
+    private static final long MAX_TRANSLOG_ARCHIVE_ENTRY_BYTES = 128 * 1024 * 1024L;
+
+    /**
+     * Builds archive entries (tlog + ckp) for the given generation from the current readers.
+     * Entry paths follow the pattern: {indexUUID}/{shardId}/{primaryTerm}/{filename}
+     *
+     * @throws IOException if files exceed MAX_TRANSLOG_ARCHIVE_ENTRY_BYTES or I/O fails
+     */
+    private List<ArchiveBuilder.ArchiveBuildEntry> buildArchiveEntries(long primaryTerm, long generation) throws IOException {
+        List<ArchiveBuilder.ArchiveBuildEntry> entries = new ArrayList<>();
+        String indexUUID = shardId.getIndex().getUUID();
+        String prefix = indexUUID + "/" + shardId.id() + "/" + primaryTerm + "/";
+
+        String tlogFilename = Translog.getFilename(generation);
+        String ckpFilename = Translog.getCommitCheckpointFileName(generation);
+
+        Path tlogFile = location.resolve(tlogFilename);
+        Path ckpFile = location.resolve(ckpFilename);
+
+        long totalBytes = 0;
+        if (Files.exists(tlogFile)) {
+            long tlogSize = Files.size(tlogFile);
+            totalBytes += tlogSize;
+            if (totalBytes > MAX_TRANSLOG_ARCHIVE_ENTRY_BYTES) {
+                throw new IOException(
+                    "Translog archive entry size "
+                        + totalBytes
+                        + " exceeds limit "
+                        + MAX_TRANSLOG_ARCHIVE_ENTRY_BYTES
+                        + " for shard "
+                        + shardId
+                        + " gen "
+                        + generation
+                );
+            }
+            byte[] tlogBytes = Files.readAllBytes(tlogFile);
+            entries.add(ArchiveBuilder.fromBytes(prefix + tlogFilename, tlogBytes));
+        }
+        if (Files.exists(ckpFile)) {
+            long ckpSize = Files.size(ckpFile);
+            totalBytes += ckpSize;
+            if (totalBytes > MAX_TRANSLOG_ARCHIVE_ENTRY_BYTES) {
+                throw new IOException(
+                    "Translog archive entry size "
+                        + totalBytes
+                        + " exceeds limit "
+                        + MAX_TRANSLOG_ARCHIVE_ENTRY_BYTES
+                        + " for shard "
+                        + shardId
+                        + " gen "
+                        + generation
+                );
+            }
+            byte[] ckpBytes = Files.readAllBytes(ckpFile);
+            entries.add(ArchiveBuilder.fromBytes(prefix + ckpFilename, ckpBytes));
+        }
+
+        return entries;
     }
 
     public void buildSnapshotForArchive(BiConsumer<TransferSnapshot, Runnable> consumer) throws IOException {
@@ -642,6 +820,12 @@ public class RemoteFsTranslog extends Translog {
     public void trimUnreferencedReaders() throws IOException {
         // clean up local translog files and updates readers
         super.trimUnreferencedReaders();
+
+        // When archive upload is enabled, individual translog files are not uploaded to remote,
+        // so there is nothing to clean up. Archive retention is handled by TranslogArchiveCollector.
+        if (indexSettings().isTranslogArchiveUploadEnabled()) {
+            return;
+        }
 
         // This is to ensure that after the permits are acquired during primary relocation, there are no further modification on remote
         // store.

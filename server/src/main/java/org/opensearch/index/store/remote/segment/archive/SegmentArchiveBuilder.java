@@ -56,19 +56,17 @@ public final class SegmentArchiveBuilder {
      * @return map of filename → SegmentArchiveEntry with offset/length/checksum
      * @throws IOException on read/write or invalid entry
      */
-    public static Map<String, SegmentArchiveEntry> buildAndExtractOffsets(
-        OutputStream out,
-        Iterable<SegmentArchiveBuildEntry> entries
-    ) throws IOException {
+    public static Map<String, SegmentArchiveEntry> buildAndExtractOffsets(OutputStream out, Iterable<SegmentArchiveBuildEntry> entries)
+        throws IOException {
         Map<String, SegmentArchiveEntry> archiveEntries = new HashMap<>();
         CountingOutputStream countingOut = new CountingOutputStream(out);
-        
+
         try (ZipOutputStream zos = new ZipOutputStream(countingOut)) {
             for (SegmentArchiveBuildEntry entry : entries) {
                 addStoredEntryWithOffset(zos, entry, countingOut, archiveEntries);
             }
         }
-        
+
         return archiveEntries;
     }
 
@@ -84,14 +82,14 @@ public final class SegmentArchiveBuilder {
     ) throws IOException {
         String path = entry.getPath();
         long size = entry.getSize();
-        
+
         if (size < 0 || size > Integer.MAX_VALUE) {
             throw new IOException("Invalid size for entry " + path + ": " + size);
         }
-        
+
         int len = (int) size;
         byte[] buf = new byte[len];
-        
+
         // Read entry content
         try (InputStream in = entry.getContent()) {
             int total = 0;
@@ -104,27 +102,27 @@ public final class SegmentArchiveBuilder {
                 throw new IOException("Entry " + path + ": expected " + len + " bytes, got " + total);
             }
         }
-        
+
         // Calculate CRC32
         CRC32 crc = new CRC32();
         crc.update(buf, 0, len);
-        
+
         // Create ZIP entry with stored format
         ZipEntry ze = new ZipEntry(path);
         ze.setMethod(ZipEntry.STORED);
         ze.setSize(len);
         ze.setCompressedSize(len);
         ze.setCrc(crc.getValue());
-        
+
         zos.putNextEntry(ze);
         long dataOffset = countingOut.getCount();
-        
+
         // Write data
         zos.write(buf, 0, len);
         long dataLength = countingOut.getCount() - dataOffset;
-        
+
         zos.closeEntry();
-        
+
         // Record offset and length for recovery
         offsets.put(path, new SegmentArchiveEntry(path, dataOffset, dataLength, crc.getValue()));
     }
@@ -135,14 +133,14 @@ public final class SegmentArchiveBuilder {
     private static void addStoredEntry(ZipOutputStream zos, SegmentArchiveBuildEntry entry) throws IOException {
         String path = entry.getPath();
         long size = entry.getSize();
-        
+
         if (size < 0 || size > Integer.MAX_VALUE) {
             throw new IOException("Invalid size for entry " + path + ": " + size);
         }
-        
+
         int len = (int) size;
         byte[] buf = new byte[len];
-        
+
         // Read entry content
         try (InputStream in = entry.getContent()) {
             int total = 0;
@@ -155,18 +153,18 @@ public final class SegmentArchiveBuilder {
                 throw new IOException("Entry " + path + ": expected " + len + " bytes, got " + total);
             }
         }
-        
+
         // Calculate CRC32
         CRC32 crc = new CRC32();
         crc.update(buf, 0, len);
-        
+
         // Create ZIP entry with stored format
         ZipEntry ze = new ZipEntry(path);
         ze.setMethod(ZipEntry.STORED);
         ze.setSize(len);
         ze.setCompressedSize(len);
         ze.setCrc(crc.getValue());
-        
+
         zos.putNextEntry(ze);
         zos.write(buf, 0, len);
         zos.closeEntry();

@@ -78,7 +78,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.concurrent.AbstractRefCounted;
-import org.opensearch.index.translog.TranslogArchiveCollector;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.common.util.concurrent.OpenSearchThreadPoolExecutor;
@@ -144,6 +143,8 @@ import org.opensearch.index.shard.IndexingStats.Stats.DocStatusStats;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.translog.InternalTranslogFactory;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
+import org.opensearch.index.translog.TranslogArchiveBatchCoordinator;
+import org.opensearch.index.translog.TranslogArchiveCollector;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogStats;
 import org.opensearch.indices.cluster.IndicesClusterStateService;
@@ -939,6 +940,30 @@ public class IndicesService extends AbstractLifecycleComponent
             }
             indexService.getIndexEventListener().afterIndexCreated(indexService);
             indices = newMapBuilder(indices).put(index.getUUID(), indexService).immutableMap();
+
+            // Wire archive batch coordinator for indices with archive upload enabled
+            if (indexService.getIndexSettings().isTranslogArchiveUploadEnabled()
+                && indexService.getIndexSettings().isRemoteTranslogStoreEnabled()) {
+                TimeValue batchInterval = remoteStoreSettings != null
+                    ? remoteStoreSettings.getClusterRemoteTranslogBufferInterval()
+                    : TimeValue.timeValueMillis(650);
+                org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm hashAlgo = remoteStoreSettings != null
+                    ? remoteStoreSettings.getPathHashAlgorithm()
+                    : org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
+                // Archive basePath is intentionally empty: BlobStore.blobContainer() prepends the
+                // repository root automatically. The coordinator's archiveBasePath is relative to the
+                // repo root, and "translog/data/{hash}/{bucket}" is appended at upload time.
+                // This matches how TranslogArchiveCollector resolves paths via TransferManager.
+                TranslogArchiveBatchCoordinator coordinator = new TranslogArchiveBatchCoordinator(
+                    index.getUUID(),
+                    new org.opensearch.common.blobstore.BlobPath(),
+                    hashAlgo,
+                    batchInterval
+                );
+                TranslogArchiveBatchCoordinator.register(coordinator);
+                translogArchiveCollector.registerCoordinatorIndex(index.getUUID());
+                logger.info("Registered translog archive batch coordinator for index {}", index);
+            }
             if (writeDanglingIndices) {
                 if (nodeWriteDanglingIndicesInfo) {
                     updateDanglingIndicesInfo(index);
@@ -1209,6 +1234,9 @@ public class IndicesService extends AbstractLifecycleComponent
 
     @Override
     public void removeIndex(final Index index, final IndexRemovalReason reason, final String extraInfo) {
+        // Unregister archive batch coordinator if present
+        TranslogArchiveBatchCoordinator.unregister(index.getUUID());
+        translogArchiveCollector.unregisterCoordinatorIndex(index.getUUID());
         final String indexName = index.getName();
         try {
             final IndexService indexService;

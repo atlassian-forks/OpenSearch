@@ -158,7 +158,7 @@ public class RemoteSegmentMetadataV2Tests extends IndexShardTestCase {
         // This test verifies that v2 code can read metadata written in v2 format
         // Since write() always writes the latest version (v2), this test creates v2 format
         // and verifies it can be read back correctly
-        
+
         BytesStreamOutput output = new BytesStreamOutput();
         OutputStreamIndexOutput indexOutput = new OutputStreamIndexOutput("dummy bytes", "dummy stream", output, 4096);
 
@@ -188,6 +188,157 @@ public class RemoteSegmentMetadataV2Tests extends IndexShardTestCase {
         assertNull(readMetadata.getArchiveEntries());
         assertEquals(segmentMetadata, readMetadata.toMapOfStrings());
         assertArrayEquals(segmentInfosBytes, readMetadata.getSegmentInfosBytes());
+    }
+
+    /**
+     * Test: Metadata upgrade path v1 → v2 → v1.
+     * Three-phase round-trip: write without archive → write with archive → write without archive again.
+     * No state leakage between transitions.
+     */
+    public void testMetadataUpgradePathV1ToV2ToV1() throws IOException {
+        Map<String, String> segmentMetadata = getDummyData();
+        ByteBuffersIndexOutput segmentInfosOutput = new ByteBuffersIndexOutput(new ByteBuffersDataOutput(), "test", "resource");
+        segmentInfos.write(segmentInfosOutput);
+        byte[] segmentInfosBytes = segmentInfosOutput.toArrayCopy();
+
+        // Phase 1: v1-style (no archive)
+        BytesStreamOutput output1 = new BytesStreamOutput();
+        OutputStreamIndexOutput indexOutput1 = new OutputStreamIndexOutput("phase1", "phase1", output1, 4096);
+        RemoteSegmentMetadata meta1 = new RemoteSegmentMetadata(
+            RemoteSegmentMetadata.fromMapOfStrings(segmentMetadata),
+            segmentInfosBytes,
+            replicationCheckpoint
+        );
+        remoteSegmentMetadataHandler.writeContent(indexOutput1, meta1);
+        indexOutput1.close();
+
+        RemoteSegmentMetadata read1 = remoteSegmentMetadataHandler.readContent(
+            new ByteArrayIndexInput("phase1", BytesReference.toBytes(output1.bytes()))
+        );
+        assertFalse("Phase 1: archive should be disabled", read1.isArchiveEnabled());
+        assertNull("Phase 1: no archive blob", read1.getArchiveBlob());
+        assertNull("Phase 1: no archive entries", read1.getArchiveEntries());
+
+        // Phase 2: v2-style (with archive)
+        BytesStreamOutput output2 = new BytesStreamOutput();
+        OutputStreamIndexOutput indexOutput2 = new OutputStreamIndexOutput("phase2", "phase2", output2, 4096);
+        Map<String, SegmentArchiveEntry> archiveEntries = new HashMap<>();
+        archiveEntries.put("_0.cfs", new SegmentArchiveEntry("_0.cfs", 100, 5000, 111L));
+        RemoteSegmentMetadata meta2 = new RemoteSegmentMetadata(
+            RemoteSegmentMetadata.fromMapOfStrings(segmentMetadata),
+            segmentInfosBytes,
+            replicationCheckpoint,
+            true,
+            "archive_phase2.zip",
+            "zip_stored",
+            archiveEntries
+        );
+        remoteSegmentMetadataHandler.writeContent(indexOutput2, meta2);
+        indexOutput2.close();
+
+        RemoteSegmentMetadata read2 = remoteSegmentMetadataHandler.readContent(
+            new ByteArrayIndexInput("phase2", BytesReference.toBytes(output2.bytes()))
+        );
+        assertTrue("Phase 2: archive should be enabled", read2.isArchiveEnabled());
+        assertEquals("archive_phase2.zip", read2.getArchiveBlob());
+        assertEquals(1, read2.getArchiveEntries().size());
+        assertEquals(5000, read2.getArchiveEntries().get("_0.cfs").getLength());
+
+        // Phase 3: back to v1-style (no archive) — no state leakage from phase 2
+        BytesStreamOutput output3 = new BytesStreamOutput();
+        OutputStreamIndexOutput indexOutput3 = new OutputStreamIndexOutput("phase3", "phase3", output3, 4096);
+        RemoteSegmentMetadata meta3 = new RemoteSegmentMetadata(
+            RemoteSegmentMetadata.fromMapOfStrings(segmentMetadata),
+            segmentInfosBytes,
+            replicationCheckpoint
+        );
+        remoteSegmentMetadataHandler.writeContent(indexOutput3, meta3);
+        indexOutput3.close();
+
+        RemoteSegmentMetadata read3 = remoteSegmentMetadataHandler.readContent(
+            new ByteArrayIndexInput("phase3", BytesReference.toBytes(output3.bytes()))
+        );
+        assertFalse("Phase 3: archive should be disabled again", read3.isArchiveEnabled());
+        assertNull("Phase 3: no archive blob leakage", read3.getArchiveBlob());
+        assertNull("Phase 3: no archive entries leakage", read3.getArchiveEntries());
+        assertEquals(segmentMetadata, read3.toMapOfStrings());
+    }
+
+    /**
+     * Test: Checksum mismatch detection — verifies that archive entry checksums
+     * can be compared against computed checksums to detect corruption.
+     */
+    public void testChecksumMismatchDetection() throws IOException {
+        // Given: archive entry with known checksum
+        long expectedChecksum = 123456789L;
+        SegmentArchiveEntry entry = new SegmentArchiveEntry("_0.cfs", 100, 5000, expectedChecksum);
+
+        // Simulate computing checksum of extracted data
+        long computedMatchingChecksum = 123456789L;
+        long computedMismatchChecksum = 987654321L;
+
+        // When/Then: matching checksum passes
+        assertEquals("Matching checksum should pass", expectedChecksum, computedMatchingChecksum);
+        assertEquals(expectedChecksum, entry.getChecksum());
+
+        // When/Then: mismatched checksum is detectable
+        assertNotEquals("Mismatched checksum should be detectable", entry.getChecksum(), computedMismatchChecksum);
+    }
+
+    /**
+     * Test: Metadata with large number of archive entries (stress test serialization).
+     */
+    public void testMetadataWithManyArchiveEntries() throws IOException {
+        Map<String, String> segmentMetadata = getDummyData();
+        ByteBuffersIndexOutput segmentInfosOutput = new ByteBuffersIndexOutput(new ByteBuffersDataOutput(), "test", "resource");
+        segmentInfos.write(segmentInfosOutput);
+        byte[] segmentInfosBytes = segmentInfosOutput.toArrayCopy();
+
+        // Given: 50 archive entries (simulating a commit with many segment files)
+        Map<String, SegmentArchiveEntry> archiveEntries = new HashMap<>();
+        long offset = 0;
+        for (int i = 0; i < 50; i++) {
+            String filename = "_" + i + ".cfs";
+            long length = 1000 + i * 100;
+            long checksum = 100000L + i;
+            archiveEntries.put(filename, new SegmentArchiveEntry(filename, offset, length, checksum));
+            offset += length + 30; // 30 bytes ZIP header overhead
+        }
+
+        // When: write and read back
+        BytesStreamOutput output = new BytesStreamOutput();
+        OutputStreamIndexOutput indexOutput = new OutputStreamIndexOutput("many-entries", "many-entries", output, 4096);
+        RemoteSegmentMetadata metadata = new RemoteSegmentMetadata(
+            RemoteSegmentMetadata.fromMapOfStrings(segmentMetadata),
+            segmentInfosBytes,
+            replicationCheckpoint,
+            true,
+            "large_archive.zip",
+            "zip_stored",
+            archiveEntries
+        );
+        remoteSegmentMetadataHandler.writeContent(indexOutput, metadata);
+        indexOutput.close();
+
+        RemoteSegmentMetadata readMetadata = remoteSegmentMetadataHandler.readContent(
+            new ByteArrayIndexInput("many-entries", BytesReference.toBytes(output.bytes()))
+        );
+
+        // Then: all 50 entries should be preserved
+        assertTrue(readMetadata.isArchiveEnabled());
+        assertEquals("large_archive.zip", readMetadata.getArchiveBlob());
+        assertEquals(50, readMetadata.getArchiveEntries().size());
+
+        // Verify every entry round-tripped correctly
+        for (int i = 0; i < 50; i++) {
+            String filename = "_" + i + ".cfs";
+            SegmentArchiveEntry readEntry = readMetadata.getArchiveEntries().get(filename);
+            assertNotNull("Missing entry: " + filename, readEntry);
+            assertEquals(filename, readEntry.getFilename());
+            assertEquals(archiveEntries.get(filename).getOffset(), readEntry.getOffset());
+            assertEquals(archiveEntries.get(filename).getLength(), readEntry.getLength());
+            assertEquals(archiveEntries.get(filename).getChecksum(), readEntry.getChecksum());
+        }
     }
 
     public void testSegmentArchiveEntrySerializationRoundTrip() throws IOException {

@@ -77,10 +77,7 @@ public class SegmentArchiveEntry {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         SegmentArchiveEntry that = (SegmentArchiveEntry) o;
-        return offset == that.offset
-            && length == that.length
-            && checksum == that.checksum
-            && Objects.equals(filename, that.filename);
+        return offset == that.offset && length == that.length && checksum == that.checksum && Objects.equals(filename, that.filename);
     }
 
     @Override

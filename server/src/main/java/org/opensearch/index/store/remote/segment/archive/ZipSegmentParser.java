@@ -49,12 +49,12 @@ public final class ZipSegmentParser {
         if (tail.length < EOCD_MIN_SIZE) {
             throw new IOException("Tail too short for EOCD (need at least " + EOCD_MIN_SIZE + " bytes)");
         }
-        
+
         int eocdPos = findEocd(tail);
         int cdSize = getInt(tail, eocdPos + 12);
         int cdOffsetInFile = getInt(tail, eocdPos + 16);
         int cdOffsetInTail = (int) (cdOffsetInFile - tailStartOffset);
-        
+
         if (cdOffsetInTail < 0 || cdOffsetInTail + cdSize > tail.length) {
             throw new IOException(
                 "Central directory not fully in tail: cdOffset="
@@ -67,7 +67,7 @@ public final class ZipSegmentParser {
                     + tail.length
             );
         }
-        
+
         return parseCentralDirectory(tail, cdOffsetInTail, cdSize, tailStartOffset + cdOffsetInTail);
     }
 
@@ -105,21 +105,17 @@ public final class ZipSegmentParser {
      * Parse central directory entries from the tail buffer.
      * Each entry provides: path, offset (in archive), length.
      */
-    private static List<SegmentArchiveEntry> parseCentralDirectory(
-        byte[] buf,
-        int cdStart,
-        int cdSize,
-        long cdStartInFile
-    ) throws IOException {
+    private static List<SegmentArchiveEntry> parseCentralDirectory(byte[] buf, int cdStart, int cdSize, long cdStartInFile)
+        throws IOException {
         List<SegmentArchiveEntry> entries = new ArrayList<>();
         int pos = cdStart;
         int end = cdStart + cdSize;
-        
+
         while (pos + 46 <= end) {
             if (getInt(buf, pos) != CD_ENTRY_SIG) {
                 break;
             }
-            
+
             // Read central directory entry header
             int method = getShort(buf, pos + 10) & 0xffff;
             int compressedSize = getInt(buf, pos + 20);
@@ -127,30 +123,30 @@ public final class ZipSegmentParser {
             int extraLen = getShort(buf, pos + 30) & 0xffff;
             int commentLen = getShort(buf, pos + 32) & 0xffff;
             int localHeaderOffset = getInt(buf, pos + 42);
-            
+
             // Verify compression method is "stored" (0)
             if (method != 0) {
                 throw new IOException("Unsupported compression method " + method + " (expected 0 stored)");
             }
-            
+
             pos += 46;
-            
+
             // Check bounds
             if (pos + filenameLen + extraLen + commentLen > end) {
                 throw new IOException("Central directory entry overflows");
             }
-            
+
             // Extract filename
             String path = new String(buf, pos, filenameLen, StandardCharsets.UTF_8);
             pos += filenameLen + extraLen + commentLen;
-            
+
             // Calculate data offset: local file header offset + local header size + filename length + extra field
             long dataOffset = localHeaderOffset + LOCAL_HEADER_SIZE + filenameLen + extraLen;
-            
+
             // Create archive entry with offset, length, and checksum (0 for now - can be added later)
             entries.add(new SegmentArchiveEntry(path, dataOffset, compressedSize, 0L));
         }
-        
+
         return entries;
     }
 
@@ -158,8 +154,7 @@ public final class ZipSegmentParser {
      * Read a 4-byte little-endian integer from buffer at offset.
      */
     private static int getInt(byte[] b, int off) {
-        return (b[off] & 0xff) | ((b[off + 1] & 0xff) << 8) | ((b[off + 2] & 0xff) << 16)
-            | ((b[off + 3] & 0xff) << 24);
+        return (b[off] & 0xff) | ((b[off + 1] & 0xff) << 8) | ((b[off + 2] & 0xff) << 16) | ((b[off + 3] & 0xff) << 24);
     }
 
     /**

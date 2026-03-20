@@ -146,9 +146,7 @@ public class RemoteStoreSettings {
         10080,
         v -> {
             if (v < 30 || v > 10080) {
-                throw new IllegalArgumentException(
-                    "Translog archive retention must be between 30 minutes and 7 days (10080 minutes)"
-                );
+                throw new IllegalArgumentException("Translog archive retention must be between 30 minutes and 7 days (10080 minutes)");
             }
         },
         Property.NodeScope,
