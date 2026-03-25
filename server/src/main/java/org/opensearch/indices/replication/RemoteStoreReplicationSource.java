@@ -148,7 +148,11 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
 
     private boolean remoteMetadataExists() throws IOException {
         final AtomicBoolean metadataExists = new AtomicBoolean(false);
-        cancellableThreads.executeIO(() -> metadataExists.set(remoteDirectory.readLatestMetadataFile() != null));
+        // Use init() instead of readLatestMetadataFile() so that currentArchiveBlobName and
+        // currentArchiveEntries are refreshed before downloadAsync() calls openInput().
+        // readLatestMetadataFile() only reads metadata but does NOT update the archive state fields,
+        // which would cause archive range-reads in openInput() to use stale offsets → CorruptIndexException.
+        cancellableThreads.executeIO(() -> metadataExists.set(remoteDirectory.init() != null));
         return metadataExists.get();
     }
 

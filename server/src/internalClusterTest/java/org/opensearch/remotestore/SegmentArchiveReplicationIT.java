@@ -13,7 +13,10 @@ import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.search.SearchResponse;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.QueryBuilders;
@@ -22,6 +25,14 @@ import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.test.InternalTestCluster;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
+import java.io.IOException;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
@@ -44,6 +55,16 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
     private static final int DOCS_PER_BATCH = 50;
 
     @Override
+    public void setUp() throws Exception {
+        // Force a fresh repo path per test so listSegmentArchives() cannot find ZIPs
+        // written by a previous test in this class (segmentRepoPath is lazily initialized
+        // in RemoteStoreBaseIntegTestCase and would otherwise be reused across tests).
+        segmentRepoPath = null;
+        translogRepoPath = null;
+        super.setUp();
+    }
+
+    @Override
     protected Settings nodeSettings(int nodeOrdinal) {
         return Settings.builder()
             .put(super.nodeSettings(nodeOrdinal))
@@ -58,16 +79,15 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
      *   1. Start 2 data nodes (primary + replica)
      *   2. Create index with 1 shard, 1 replica, archive upload enabled, SEGMENT replication
      *   3. Index documents on primary → flush → refresh
-     *   4. Verify replica has same document count as primary
-     *   5. Index more documents → flush → verify replica catches up
+     *   4. Assert archive ZIP blob was written to remote store
+     *   5. Assert replica node (pinned via _local preference) serves the same document count
+     *   6. Index more documents → flush → verify replica catches up
      */
     public void testReplicaDownloadsArchivedSegmentsFromPrimary() throws Exception {
-        // Start cluster: 1 cluster manager + 2 data nodes
         internalCluster().startClusterManagerOnlyNode();
         String primaryNode = internalCluster().startDataOnlyNode();
         String replicaNode = internalCluster().startDataOnlyNode();
 
-        // Create index with archive enabled and 1 replica (SEGMENT replication)
         Settings indexSettings = Settings.builder()
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
@@ -79,24 +99,47 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         createIndex(INDEX_NAME, indexSettings);
         ensureGreen(INDEX_NAME);
 
-        // Index first batch
+        // Determine which node actually holds the replica (allocation is non-deterministic)
+        String actualReplicaNode = getReplicaNodeName(INDEX_NAME, 0);
+
+        // Index first batch and flush so archive upload is triggered
         indexDocuments(DOCS_PER_BATCH);
         flushAndRefresh(INDEX_NAME);
 
-        // Wait for segment replication to complete
+        // CRITICAL: assert an archive ZIP blob was actually written to the remote segment data path
         assertBusy(() -> {
-            SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get();
-            assertHitCount(response, DOCS_PER_BATCH);
+            List<String> archives = listSegmentArchives();
+            assertFalse("Primary must have uploaded at least one archive ZIP to remote store", archives.isEmpty());
+        }, 30, TimeUnit.SECONDS);
+
+        // Assert the replica shard is STARTED on its node (definitive role check via routing table)
+        assertReplicaShardStarted(INDEX_NAME, 0, actualReplicaNode);
+
+        // Assert replica node exclusively serves the data.
+        // Preference.ONLY_LOCAL ("_only_local") routes only to the local node's shard copy;
+        // it throws NoShardAvailableActionException if no local copy exists — unlike "_local"
+        // which silently falls back to any node. See Preference.ONLY_LOCAL in OperationRouting.
+        assertBusy(() -> {
+            SearchResponse replicaResponse = client(actualReplicaNode).prepareSearch(INDEX_NAME)
+                .setPreference("_only_local") // Preference.ONLY_LOCAL — fail if no local shard
+                .setSize(0)
+                .setQuery(QueryBuilders.matchAllQuery())
+                .get();
+            assertHitCount(replicaResponse, DOCS_PER_BATCH);
         }, 30, TimeUnit.SECONDS);
 
         // Index second batch
         indexDocuments(DOCS_PER_BATCH);
         flushAndRefresh(INDEX_NAME);
 
-        // Verify replica has all documents from both batches
+        // Verify replica catches up with second batch
         assertBusy(() -> {
-            SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get();
-            assertHitCount(response, DOCS_PER_BATCH * 2);
+            SearchResponse replicaResponse = client(actualReplicaNode).prepareSearch(INDEX_NAME)
+                .setPreference("_only_local") // Preference.ONLY_LOCAL — fail if no local shard
+                .setSize(0)
+                .setQuery(QueryBuilders.matchAllQuery())
+                .get();
+            assertHitCount(replicaResponse, DOCS_PER_BATCH * 2);
         }, 30, TimeUnit.SECONDS);
     }
 
@@ -106,13 +149,13 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
      * Flow:
      *   1. Start primary + replica
      *   2. Index small batches with refresh between each (creates multiple archive ZIPs)
-     *   3. Verify replica has all documents after each batch
+     *   3. Assert archive count grows after each batch (each refresh = new archive)
      *   4. Force merge → verify data integrity on both primary and replica
      */
     public void testMultipleArchiveUploadsRecoverableByReplica() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
         internalCluster().startDataOnlyNode();
-        internalCluster().startDataOnlyNode();
+        String replicaNode = internalCluster().startDataOnlyNode();
 
         Settings indexSettings = Settings.builder()
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
@@ -125,6 +168,9 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         createIndex(INDEX_NAME, indexSettings);
         ensureGreen(INDEX_NAME);
 
+        // Determine which node actually holds the replica (allocation is non-deterministic)
+        String actualReplicaNode = getReplicaNodeName(INDEX_NAME, 0);
+
         // Index 5 batches with flush between each → creates multiple archives
         int totalDocs = 0;
         for (int batch = 0; batch < 5; batch++) {
@@ -133,19 +179,44 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
             flushAndRefresh(INDEX_NAME);
 
             final int expectedDocs = totalDocs;
+            final int batchNum = batch;
+
+            // Assert archive count has grown (each flush with new segments should produce a new ZIP)
             assertBusy(() -> {
-                SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get();
+                List<String> archives = listSegmentArchives();
+                assertTrue(
+                    "Archive count should grow after batch " + batchNum + ", got: " + archives.size(),
+                    archives.size() > batchNum  // at least one archive per batch
+                );
+            }, 30, TimeUnit.SECONDS);
+
+            // Assert replica shard role on first batch (routing table confirms it's not primary)
+            if (batch == 0) {
+                assertReplicaShardStarted(INDEX_NAME, 0, actualReplicaNode);
+            }
+
+            // Assert replica exclusively serves the data (_only_local proves local shard copy exists)
+            assertBusy(() -> {
+                SearchResponse response = client(actualReplicaNode).prepareSearch(INDEX_NAME)
+                    .setPreference("_only_local")
+                    .setSize(0)
+                    .setQuery(QueryBuilders.matchAllQuery())
+                    .get();
                 assertHitCount(response, expectedDocs);
             }, 30, TimeUnit.SECONDS);
         }
 
-        // Force merge and verify data integrity
+        // Force merge and verify data integrity on replica
         client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get();
         flushAndRefresh(INDEX_NAME);
 
         final int finalTotalDocs = totalDocs;
         assertBusy(() -> {
-            SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get();
+            SearchResponse response = client(actualReplicaNode).prepareSearch(INDEX_NAME)
+                .setPreference("_only_local")
+                .setSize(0)
+                .setQuery(QueryBuilders.matchAllQuery())
+                .get();
             assertHitCount(response, finalTotalDocs);
         }, 30, TimeUnit.SECONDS);
     }
@@ -157,10 +228,10 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
      *
      * Flow:
      *   1. Start primary + replica
-     *   2. Index data → flush → verify both nodes have data
+     *   2. Index data → flush → assert archive blob exists
      *   3. Stop original primary node
-     *   4. Replica gets promoted to primary
-     *   5. Verify promoted replica serves all documents
+     *   4. Assert replicaNode became the new primary via cluster routing state
+     *   5. Verify promoted replica serves all documents (pinned to that node)
      *   6. Index more data on new primary → verify searchable
      */
     public void testReplicaServesDataAfterPrimaryFailure() throws Exception {
@@ -183,22 +254,56 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         indexDocuments(DOCS_PER_BATCH * 2);
         flushAndRefresh(INDEX_NAME);
 
-        // Verify both nodes have the data
+        // Assert archive blob was written before killing primary
+        assertBusy(() -> {
+            List<String> archives = listSegmentArchives();
+            assertFalse("Archive ZIP must exist before primary failure", archives.isEmpty());
+        }, 30, TimeUnit.SECONDS);
+
+        // Verify cluster is fully green before stopping primary
         assertBusy(() -> {
             SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get();
             assertHitCount(response, DOCS_PER_BATCH * 2);
         }, 30, TimeUnit.SECONDS);
 
-        // Stop primary — replica should be promoted
+        // Stop original primary — replica should be promoted
         internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNode));
 
-        // Wait for cluster to stabilize (replica promoted to primary)
+        // Wait for cluster to stabilize (at least yellow = promoted replica is primary)
         ensureYellow(INDEX_NAME);
 
-        // Verify promoted replica serves all documents
+        // Assert that the replicaNode is now the primary shard holder
         assertBusy(() -> {
-            SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get();
+            ClusterState state = client().admin().cluster().prepareState().get().getState();
+            ShardRouting primary = state.routingTable().index(INDEX_NAME).shard(0).primaryShard();
+            assertNotNull("Primary shard must be assigned", primary);
+            assertTrue("Primary shard must be active", primary.active());
+            String newPrimaryNodeId = primary.currentNodeId();
+            String replicaNodeId = state.nodes().resolveNode(replicaNode).getId();
+            assertEquals("replicaNode must have been promoted to primary", replicaNodeId, newPrimaryNodeId);
+        }, 30, TimeUnit.SECONDS);
+
+        // Verify promoted primary (former replica) serves all documents exclusively
+        assertBusy(() -> {
+            SearchResponse response = client(replicaNode).prepareSearch(INDEX_NAME)
+                .setPreference("_only_local")
+                .setSize(0)
+                .setQuery(QueryBuilders.matchAllQuery())
+                .get();
             assertHitCount(response, DOCS_PER_BATCH * 2);
+        }, 30, TimeUnit.SECONDS);
+
+        // Step 6 (was missing): Index more data on promoted primary → verify searchable
+        indexDocuments(DOCS_PER_BATCH);
+        flushAndRefresh(INDEX_NAME);
+
+        assertBusy(() -> {
+            SearchResponse response = client(replicaNode).prepareSearch(INDEX_NAME)
+                .setPreference("_only_local")
+                .setSize(0)
+                .setQuery(QueryBuilders.matchAllQuery())
+                .get();
+            assertHitCount(response, DOCS_PER_BATCH * 3);
         }, 30, TimeUnit.SECONDS);
     }
 
@@ -209,12 +314,13 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
      *   1. Start 2 data nodes
      *   2. Create index with 3 shards, 1 replica, archive enabled
      *   3. Index data across all shards
-     *   4. Verify replica has all documents across all shards
+     *   4. Assert archive ZIPs exist (one per shard that had new segments)
+     *   5. Verify replica has all documents across all shards (node-pinned)
      */
     public void testMultiShardArchiveReplication() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
-        internalCluster().startDataOnlyNode();
-        internalCluster().startDataOnlyNode();
+        String node1 = internalCluster().startDataOnlyNode();
+        String node2 = internalCluster().startDataOnlyNode();
 
         Settings indexSettings = Settings.builder()
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 3)
@@ -227,12 +333,18 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         createIndex(INDEX_NAME, indexSettings);
         ensureGreen(INDEX_NAME);
 
-        // Index enough data to distribute across all 3 shards
+        // Index enough data to touch all 3 shards
         int totalDocs = DOCS_PER_BATCH * 6; // 300 docs across 3 shards
         indexDocuments(totalDocs);
         flushAndRefresh(INDEX_NAME);
 
-        // Verify all documents searchable (served by primary + replica shards)
+        // Assert archive ZIPs exist for the shards that uploaded
+        assertBusy(() -> {
+            List<String> archives = listSegmentArchives();
+            assertFalse("At least one archive ZIP must exist after multi-shard upload", archives.isEmpty());
+        }, 30, TimeUnit.SECONDS);
+
+        // Verify all documents searchable on both nodes
         assertBusy(() -> {
             SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get();
             assertHitCount(response, totalDocs);
@@ -254,10 +366,10 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
      *
      * Flow:
      *   1. Start with 1 data node (primary only, 0 replicas)
-     *   2. Index data → flush → create archives
+     *   2. Index data → flush → assert archive blob exists on primary
      *   3. Add a second data node and increase replica count to 1
      *   4. New replica recovers segment files from archived ZIPs in remote store
-     *   5. Verify new replica serves all documents
+     *   5. Verify new replica serves all documents (pinned via _local)
      */
     public void testNewReplicaRecoversFromArchivedSegments() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
@@ -279,31 +391,40 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         indexDocuments(DOCS_PER_BATCH * 3);
         flushAndRefresh(INDEX_NAME);
 
-        // Verify primary has the data
+        // Assert primary has written archives to remote store before replica joins
         assertBusy(() -> {
-            SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get();
-            assertHitCount(response, DOCS_PER_BATCH * 3);
+            List<String> archives = listSegmentArchives();
+            assertFalse("Primary must have archived segments before replica joins", archives.isEmpty());
         }, 30, TimeUnit.SECONDS);
 
         // Add new data node and increase replicas to 1
-        internalCluster().startDataOnlyNode();
+        String newReplicaNode = internalCluster().startDataOnlyNode();
         client().admin()
             .indices()
             .prepareUpdateSettings(INDEX_NAME)
             .setSettings(Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1))
             .get();
 
-        // Wait for replica to recover from remote store (archived segments)
+        // Wait for replica to fully recover from remote store (archived segments)
         ensureGreen(INDEX_NAME);
 
-        // Verify new replica serves all documents
+        // Assert new node holds a started replica shard (not primary)
+        assertReplicaShardStarted(INDEX_NAME, 0, newReplicaNode);
+
+        // Verify new replica exclusively serves all documents (_only_local proves local shard exists)
         assertBusy(() -> {
-            SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get();
+            SearchResponse response = client(newReplicaNode).prepareSearch(INDEX_NAME)
+                .setPreference("_only_local")
+                .setSize(0)
+                .setQuery(QueryBuilders.matchAllQuery())
+                .get();
             assertHitCount(response, DOCS_PER_BATCH * 3);
         }, 30, TimeUnit.SECONDS);
     }
 
-    // Helper methods
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
 
     private void indexDocuments(int count) throws Exception {
         BulkRequest bulkRequest = new BulkRequest();
@@ -314,12 +435,94 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         assertFalse("Bulk indexing should succeed", response.hasFailures());
     }
 
+    /**
+     * Lists all segment archive ZIP blobs under the segment remote repository path.
+     * Shared logic mirrors {@code SegmentArchiveRetentionIT#listSegmentArchives()}.
+     */
+    private List<String> listSegmentArchives() throws Exception {
+        List<String> archives = new ArrayList<>();
+        if (segmentRepoPath == null) {
+            return archives;
+        }
+        Files.walkFileTree(segmentRepoPath, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (file.getFileName().toString().endsWith(".zip") && isUnderSegmentsDataPath(file)) {
+                    archives.add(file.toString());
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return archives;
+    }
+
+    private boolean isUnderSegmentsDataPath(Path file) {
+        Path p = file.getParent();
+        while (p != null) {
+            if ("segments".equals(p.getFileName() != null ? p.getFileName().toString() : "")) {
+                return true;
+            }
+            p = p.getParent();
+        }
+        return false;
+    }
+
+    /**
+     * Returns the node name holding the replica shard for the given index/shardId.
+     * Allocation is non-deterministic — do not assume a specific node holds the replica.
+     */
+    private String getReplicaNodeName(String indexName, int shardId) {
+        ClusterState state = client().admin().cluster().prepareState().get().getState();
+        ShardRouting replicaShard = state.routingTable()
+            .index(indexName)
+            .shard(shardId)
+            .shardsWithState(ShardRoutingState.STARTED)
+            .stream()
+            .filter(s -> !s.primary())
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("No started replica shard for " + indexName + "/" + shardId));
+        return state.nodes().get(replicaShard.currentNodeId()).getName();
+    }
+
+    /**
+     * Asserts that the given node holds a STARTED, non-primary shard copy for the specified index/shard.
+     *
+     * <p>This is more definitive than {@code setPreference("_only_local")} alone:
+     * <ul>
+     *   <li>{@code _only_local} (see {@link org.opensearch.cluster.routing.Preference#ONLY_LOCAL}) routes
+     *       exclusively to the local node's shard copy and throws {@code NoShardAvailableActionException}
+     *       if absent — but it cannot distinguish primary from replica.</li>
+     *   <li>This method checks the cluster routing table directly to assert the shard role
+     *       ({@code !ShardRouting.primary()}) and state ({@code ShardRoutingState.STARTED}).</li>
+     * </ul>
+     * Used together, they guarantee data is served from a STARTED replica shard on the specified node.
+     */
+    private void assertReplicaShardStarted(String indexName, int shardId, String nodeName) {
+        ClusterState state = client().admin().cluster().prepareState().get().getState();
+        String nodeId = state.nodes().resolveNode(nodeName).getId();
+        ShardRouting replicaShard = state.routingTable()
+            .index(indexName)
+            .shard(shardId)
+            .shardsWithState(ShardRoutingState.STARTED)
+            .stream()
+            .filter(s -> nodeId.equals(s.currentNodeId()) && !s.primary())
+            .findFirst()
+            .orElse(null);
+        assertNotNull("Node [" + nodeName + "] must hold a STARTED replica shard for " + indexName + "/" + shardId, replicaShard);
+    }
+
     @Override
     public void tearDown() throws Exception {
         try {
-            assertAcked(client().admin().indices().delete(new DeleteIndexRequest(INDEX_NAME)).get());
+            assertAcked(client().admin().indices().delete(new DeleteIndexRequest(INDEX_NAME)).actionGet());
         } catch (Exception e) {
-            // Index may not exist
+            // Index may not exist if test failed before creation
+            logger.warn("Could not delete index during tearDown: {}", e.getMessage());
         }
         super.tearDown();
     }
