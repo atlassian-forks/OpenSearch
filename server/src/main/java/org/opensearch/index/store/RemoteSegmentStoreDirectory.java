@@ -40,7 +40,6 @@ import org.opensearch.index.store.lockmanager.RemoteStoreMetadataLockManager;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandler;
 import org.opensearch.index.store.remote.metadata.SegmentArchiveEntry;
-import org.opensearch.index.store.remote.segment.archive.SegmentArchiveRetentionHelper;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 import org.opensearch.node.remotestore.RemoteStorePinnedTimestampService;
 import org.opensearch.threadpool.ThreadPool;
@@ -1096,6 +1095,8 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
         Map<String, UploadedSegmentMetadata> activeSegmentFilesMetadataMap = new HashMap<>();
         Set<String> activeSegmentRemoteFilenames = new HashSet<>();
+        // Collect active archive blob names directly from active metadata — no extra LIST needed.
+        Set<String> activeArchiveBlobNames = new HashSet<>();
 
         final Set<String> metadataFilesToFilterActiveSegments = getMetadataFilesToFilterActiveSegments(
             lastNMetadataFilesToKeep,
@@ -1104,15 +1105,20 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         );
 
         for (String metadataFile : metadataFilesToFilterActiveSegments) {
-            Map<String, UploadedSegmentMetadata> segmentMetadataMap = readMetadataFile(metadataFile).getMetadata();
+            RemoteSegmentMetadata activeMeta = readMetadataFile(metadataFile);
+            Map<String, UploadedSegmentMetadata> segmentMetadataMap = activeMeta.getMetadata();
             activeSegmentFilesMetadataMap.putAll(segmentMetadataMap);
             activeSegmentRemoteFilenames.addAll(
                 segmentMetadataMap.values().stream().map(metadata -> metadata.uploadedFilename).collect(Collectors.toSet())
             );
+            if (activeMeta.isArchiveEnabled() && activeMeta.getArchiveBlob() != null) {
+                activeArchiveBlobNames.add(activeMeta.getArchiveBlob());
+            }
         }
         Set<String> deletedSegmentFiles = new HashSet<>();
         for (String metadataFile : metadataFilesToBeDeleted) {
-            Map<String, UploadedSegmentMetadata> staleSegmentFilesMetadataMap = readMetadataFile(metadataFile).getMetadata();
+            RemoteSegmentMetadata staleMeta = readMetadataFile(metadataFile);
+            Map<String, UploadedSegmentMetadata> staleSegmentFilesMetadataMap = staleMeta.getMetadata();
             Set<String> staleSegmentRemoteFilenames = staleSegmentFilesMetadataMap.values()
                 .stream()
                 .map(metadata -> metadata.uploadedFilename)
@@ -1139,35 +1145,28 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                         );
                     }
                 });
+            // Delete stale archive blob directly from metadata — no extra LIST needed.
+            // The archive blob name is stored in every metadata file (VERSION_TWO+), so we can
+            // delete it the same way per-file blobs are deleted: read stale metadata → get blob name → delete.
+            if (deletionSuccessful.get() && staleMeta.isArchiveEnabled() && staleMeta.getArchiveBlob() != null) {
+                String staleArchiveBlob = staleMeta.getArchiveBlob();
+                if (!activeArchiveBlobNames.contains(staleArchiveBlob)) {
+                    try {
+                        remoteDataDirectory.deleteFile(staleArchiveBlob);
+                        logger.debug("Deleted stale segment archive blob {} from metadata file {}", staleArchiveBlob, metadataFile);
+                    } catch (NoSuchFileException e) {
+                        logger.trace("Stale segment archive blob {} already deleted", staleArchiveBlob);
+                    } catch (IOException e) {
+                        logger.warn("Exception while deleting stale segment archive blob {}", staleArchiveBlob, e);
+                    }
+                }
+            }
             if (deletionSuccessful.get()) {
                 logger.debug("Deleting stale metadata file {} from remote segment store", metadataFile);
                 remoteMetadataDirectory.deleteFile(metadataFile);
             }
         }
         logger.debug("deletedSegmentFiles={}", deletedSegmentFiles);
-
-        // Clean up stale segment archive blobs (ZIP files) that are no longer referenced
-        // by any active metadata file. Archive blobs are identified by their naming convention.
-        try {
-            Set<String> allBlobsInDataDir = new HashSet<>(java.util.Arrays.asList(remoteDataDirectory.listAll()));
-            List<String> staleArchives = SegmentArchiveRetentionHelper.findStaleArchiveBlobs(
-                allBlobsInDataDir,
-                activeSegmentRemoteFilenames
-            );
-            if (!staleArchives.isEmpty()) {
-                for (String archiveBlob : staleArchives) {
-                    try {
-                        remoteDataDirectory.deleteFile(archiveBlob);
-                        logger.debug("Deleted stale segment archive: {}", archiveBlob);
-                    } catch (NoSuchFileException e) {
-                        logger.trace("Stale segment archive already deleted: {}", archiveBlob);
-                    }
-                }
-                logger.debug("Deleted {} stale segment archive blobs", staleArchives.size());
-            }
-        } catch (IOException e) {
-            logger.warn("Exception while cleaning up stale segment archive blobs", e);
-        }
     }
 
     public void deleteStaleSegmentsAsync(int lastNMetadataFilesToKeep) {

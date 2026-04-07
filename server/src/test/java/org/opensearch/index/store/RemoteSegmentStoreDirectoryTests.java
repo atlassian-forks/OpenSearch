@@ -546,8 +546,7 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
         populateMetadata();
         // deleteStaleSegments calls fetchLockedMetadataFiles — return empty set so deletion proceeds.
         when(mdLockManager.fetchLockedMetadataFiles(any())).thenReturn(Collections.emptySet());
-        // deleteStaleSegments calls remoteDataDirectory.listAll() for archive blob GC — return empty array.
-        when(remoteDataDirectory.listAll()).thenReturn(new String[0]);
+        // No remoteDataDirectory.listAll() stub needed — archive GC now uses metadata directly (no LIST).
         // deleteIfEmpty calls remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(METADATA_PREFIX, 1)
         // We need it to return empty so deleteIfEmpty proceeds to delete.
         when(
