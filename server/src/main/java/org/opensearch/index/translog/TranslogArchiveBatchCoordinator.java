@@ -72,7 +72,19 @@ public class TranslogArchiveBatchCoordinator {
     private static final int PIPE_BUFFER_BYTES = 256 * 1024;
     private static final int UPLOAD_RETRY_MAX_ATTEMPTS = 2;
 
+    /**
+     * Maximum total uncompressed bytes across all shard entries in one batch.
+     * Prevents OOM when many large shards accumulate in a single batch window.
+     * Default: 128 MB — a batch exceeding this triggers an early dispatch before
+     * the interval elapses, bounding heap usage at ~256 MB worst case per batch
+     * (the triggering shard itself can be up to 128 MB; ZIP assembly re-uses
+     * the entry byte arrays via getBackingBytes() so no second copy is made).
+     * This matches the per-shard file size limit (MAX_TRANSLOG_ARCHIVE_ENTRY_BYTES).
+     */
+    static final long MAX_BATCH_BYTES = 128L * 1024 * 1024;
+
     private final String indexUUID;
+    private final String nodeId;
     private final BlobPath archiveBasePath;
     private final RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm;
     private final TimeValue batchInterval;
@@ -85,6 +97,8 @@ public class TranslogArchiveBatchCoordinator {
 
     /** Accumulated shard data for current batch. */
     private final Map<Integer, ShardArchiveData> pendingShards = new HashMap<>();
+    /** Running total of entry bytes in the current batch. */
+    private long pendingBatchBytes;
     /** Latch released when the current batch upload completes (or fails). */
     private volatile CountDownLatch dispatchLatch;
     /** Error from the most recent dispatch, if any. */
@@ -142,11 +156,13 @@ public class TranslogArchiveBatchCoordinator {
 
     public TranslogArchiveBatchCoordinator(
         String indexUUID,
+        String nodeId,
         BlobPath archiveBasePath,
         RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm,
         TimeValue batchInterval
     ) {
         this.indexUUID = indexUUID;
+        this.nodeId = nodeId;
         this.archiveBasePath = archiveBasePath;
         this.pathHashAlgorithm = pathHashAlgorithm;
         this.batchInterval = batchInterval;
@@ -180,25 +196,35 @@ public class TranslogArchiveBatchCoordinator {
 
             // Add to current batch
             pendingShards.put(shardData.getShardId(), shardData);
+            long shardBytes = shardData.getEntries().stream().mapToLong(ArchiveBuilder.ArchiveBuildEntry::getSize).sum();
+            pendingBatchBytes += shardBytes;
             if (batchStartNanos == 0) {
                 batchStartNanos = System.nanoTime();
             }
             myLatch = dispatchLatch;
 
-            // Wait for remaining batch interval, then dispatch
-            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - batchStartNanos);
-            long remainingMs = batchInterval.millis() - elapsedMs;
-            if (remainingMs > 0) {
-                try {
-                    batchReady.await(remainingMs, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while waiting for batch interval", e);
+            // If batch size limit reached, dispatch immediately without waiting for interval.
+            if (pendingBatchBytes >= MAX_BATCH_BYTES) {
+                logger.debug("Batch size limit reached ({} bytes), dispatching early for index {}", pendingBatchBytes, indexUUID);
+                if (!dispatching) {
+                    dispatchUnderLock(transferService);
                 }
-            }
-            // After waiting, if no one else dispatched yet, this thread dispatches
-            if (!dispatching && !pendingShards.isEmpty()) {
-                dispatchUnderLock(transferService);
+            } else {
+                // Wait for remaining batch interval, then dispatch
+                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - batchStartNanos);
+                long remainingMs = batchInterval.millis() - elapsedMs;
+                if (remainingMs > 0) {
+                    try {
+                        batchReady.await(remainingMs, TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted while waiting for batch interval", e);
+                    }
+                }
+                // After waiting, if no one else dispatched yet, this thread dispatches
+                if (!dispatching && !pendingShards.isEmpty()) {
+                    dispatchUnderLock(transferService);
+                }
             }
         } finally {
             lock.unlock();
@@ -253,6 +279,7 @@ public class TranslogArchiveBatchCoordinator {
 
         // Reset for next batch
         pendingShards.clear();
+        pendingBatchBytes = 0;
         batchStartNanos = 0;
         dispatchError = null;
         dispatchLatch = new CountDownLatch(1);
@@ -287,10 +314,10 @@ public class TranslogArchiveBatchCoordinator {
             return;
         }
 
-        // Compute path
-        String hashPrefix = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
-        long genBucket = 0; // Single bucket for simplicity; can be sharded later
-        BlobPath archivePath = archiveBasePath.add("translog").add("data").add(hashPrefix).add(String.valueOf(genBucket));
+        // Compute path: translog/data/{hashTypeIndex}/{hashNodeId}/
+        String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
+        String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, pathHashAlgorithm);
+        BlobPath archivePath = archiveBasePath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
         // Compute size (deterministic because ZIP uses STORED)
         ArchiveBuilder.SizeAndOffsets sizeAndOffsets = ArchiveBuilder.computeSizeAndOffsetsWithComment(allEntries);

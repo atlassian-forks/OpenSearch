@@ -13,6 +13,7 @@ import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.translog.transfer.TransferService;
+import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -40,6 +41,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     private TranslogArchiveBatchCoordinator createCoordinator(TimeValue batchInterval) {
         return new TranslogArchiveBatchCoordinator(
             "test-index-uuid",
+            "test-node-id",
             new BlobPath().add("repo-root"),
             RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
             batchInterval
@@ -184,6 +186,45 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         String path = pathCaptor.getValue().buildAsString();
         assertThat(path, org.hamcrest.Matchers.startsWith("repo-root/translog/data/"));
         assertThat(nameCaptor.getValue(), org.hamcrest.Matchers.endsWith(".zip"));
+
+        // Verify the second path component is hashTypeIndex and third is hashNodeId.
+        String expectedHashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
+            "test-index-uuid",
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+        );
+        String expectedHashNodeId = TranslogArchivePathHelper.hashNodeId(
+            "test-node-id",
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+        );
+        assertThat(path, org.hamcrest.Matchers.containsString("translog/data/" + expectedHashTypeIndex + "/" + expectedHashNodeId + "/"));
+    }
+
+    public void testUploadPathUsesHashNodeIdNotGenBucket() throws Exception {
+        // Regression test: upload path must use hash(nodeId) not a hardcoded bucket like "0".
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
+        TransferService transferService = mock(TransferService.class);
+
+        coordinator.submitAndWait(createShardData(0, "hello"), transferService);
+
+        org.mockito.ArgumentCaptor<BlobPath> pathCaptor = org.mockito.ArgumentCaptor.forClass(BlobPath.class);
+        verify(transferService).uploadBlobStream(
+            any(InputStream.class),
+            anyLong(),
+            pathCaptor.capture(),
+            anyString(),
+            eq(WritePriority.HIGH),
+            eq(null)
+        );
+
+        String path = pathCaptor.getValue().buildAsString();
+        String expectedHashNodeId = TranslogArchivePathHelper.hashNodeId(
+            "test-node-id",
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+        );
+
+        // Must contain hashNodeId — not a bare numeric bucket like "/0/"
+        assertThat("Path must contain hashNodeId", path, org.hamcrest.Matchers.containsString(expectedHashNodeId));
+        assertFalse("Path must NOT use bare bucket '0'", path.endsWith("/0/") || path.contains("/0/" + expectedHashNodeId));
     }
 
     /**

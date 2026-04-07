@@ -145,16 +145,20 @@ public final class ArchiveBuilder {
             throw new IOException("Invalid size for entry " + path + ": " + size);
         }
         int len = (int) size;
-        byte[] buf = new byte[len];
-        try (InputStream in = entry.getContent()) {
-            int total = 0;
-            while (total < len) {
-                int r = in.read(buf, total, len - total);
-                if (r <= 0) break;
-                total += r;
-            }
-            if (total != len) {
-                throw new IOException("Entry " + path + ": expected " + len + " bytes, got " + total);
+        // Re-use the backing bytes directly if available to avoid a second allocation.
+        byte[] buf = entry.getBackingBytes();
+        if (buf == null) {
+            buf = new byte[len];
+            try (InputStream in = entry.getContent()) {
+                int total = 0;
+                while (total < len) {
+                    int r = in.read(buf, total, len - total);
+                    if (r <= 0) break;
+                    total += r;
+                }
+                if (total != len) {
+                    throw new IOException("Entry " + path + ": expected " + len + " bytes, got " + total);
+                }
             }
         }
         CRC32 crc = new CRC32();
@@ -179,16 +183,20 @@ public final class ArchiveBuilder {
             throw new IOException("Invalid size for entry " + path + ": " + size);
         }
         int len = (int) size;
-        byte[] buf = new byte[len];
-        try (InputStream in = entry.getContent()) {
-            int total = 0;
-            while (total < len) {
-                int r = in.read(buf, total, len - total);
-                if (r <= 0) break;
-                total += r;
-            }
-            if (total != len) {
-                throw new IOException("Entry " + path + ": expected " + len + " bytes, got " + total);
+        // Re-use the backing bytes directly if available to avoid a second allocation.
+        byte[] buf = entry.getBackingBytes();
+        if (buf == null) {
+            buf = new byte[len];
+            try (InputStream in = entry.getContent()) {
+                int total = 0;
+                while (total < len) {
+                    int r = in.read(buf, total, len - total);
+                    if (r <= 0) break;
+                    total += r;
+                }
+                if (total != len) {
+                    throw new IOException("Entry " + path + ": expected " + len + " bytes, got " + total);
+                }
             }
         }
         CRC32 crc = new CRC32();
@@ -216,6 +224,15 @@ public final class ArchiveBuilder {
         InputStream getContent() throws IOException;
 
         long getSize();
+
+        /**
+         * Returns the raw backing bytes for this entry, or null if not available.
+         * When non-null, ArchiveBuilder will re-use this array directly instead of
+         * allocating a second buffer — halving per-entry heap usage during ZIP assembly.
+         */
+        default byte[] getBackingBytes() {
+            return null;
+        }
     }
 
     /**
@@ -236,6 +253,11 @@ public final class ArchiveBuilder {
             @Override
             public long getSize() {
                 return content.length;
+            }
+
+            @Override
+            public byte[] getBackingBytes() {
+                return content;
             }
         };
     }

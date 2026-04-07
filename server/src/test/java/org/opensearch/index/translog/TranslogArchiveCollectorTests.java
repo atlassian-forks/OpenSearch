@@ -28,6 +28,7 @@ import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.index.translog.transfer.FileSnapshot;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
+import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
 import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
@@ -50,7 +51,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -162,12 +162,12 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         try {
             TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
             String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex("idx-uuid",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data")
-                .add(hashTypeIndex).add(hashNodeId);
+            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
+                "idx-uuid",
+                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+            );
+            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
             // Blob name: timestamp 1 hour ago → past 5-minute retention
             String oldBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(1))) + ".zip";
@@ -200,12 +200,12 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         try {
             TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
             String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex("idx-uuid",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data")
-                .add(hashTypeIndex).add(hashNodeId);
+            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
+                "idx-uuid",
+                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+            );
+            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
             // Blob name: current timestamp → within 60-minute retention
             String freshBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
@@ -802,10 +802,11 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
             String uniqueBase = "base-" + randomAlphaOfLength(12);
             BlobPath baseTranslogPath = new BlobPath().add(uniqueBase);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUuid,
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
+                indexUuid,
+                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+            );
+            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
             BlobPath zipDir = baseTranslogPath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
             // Blob name: 2 hours ago → past any reasonable retention
             String oldBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(2))) + ".zip";
@@ -1034,12 +1035,12 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         try {
             TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
             String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex("idx-uuid",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data")
-                .add(hashTypeIndex).add(hashNodeId);
+            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
+                "idx-uuid",
+                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+            );
+            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
             // Fresh ZIP → within 60-minute retention window
             String freshName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
@@ -1097,12 +1098,12 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         try {
             TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
             String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUuid,
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data")
-                .add(hashTypeIndex).add(hashNodeId);
+            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
+                indexUuid,
+                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+            );
+            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
             // Old ZIPs: timestamps 2 hours ago — past 5-minute retention
             Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));

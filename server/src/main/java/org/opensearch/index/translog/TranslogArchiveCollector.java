@@ -30,8 +30,6 @@ import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
 import org.opensearch.index.translog.transfer.archive.ArchiveCommentFormat;
 import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
-import org.opensearch.index.translog.transfer.archive.ArchiveEntry;
-import org.opensearch.index.translog.transfer.archive.ZipCentralDirectoryParser;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -285,7 +283,15 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             for (int i = 0; i < snapshots.size(); i++) {
                 allEntries.addAll(snapshotToEntries(snapshots.get(i), pathPrefixes.get(i)));
             }
-            uploadArchiveNewPathAndMetadata(transferService, basePath, hashTypeIndex, hashNodeId, snapshots, contributingShards, allEntries);
+            uploadArchiveNewPathAndMetadata(
+                transferService,
+                basePath,
+                hashTypeIndex,
+                hashNodeId,
+                snapshots,
+                contributingShards,
+                allEntries
+            );
         } catch (Exception ex) {
             logger.error(() -> new ParameterizedMessage("Failed to build or upload translog archive for index {}", indexUUID), ex);
             runFallbackIfEnabled(contributingShards, snapshots);
@@ -338,9 +344,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             if (tm == null || nodeId == null) continue;
             String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
             String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, pathHashAlgorithm);
-            BlobPath zipDir = tm.getArchiveBasePath()
-                .add("translog").add("data")
-                .add(hashTypeIndex).add(hashNodeId);
+            BlobPath zipDir = tm.getArchiveBasePath().add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
             try {
                 deleteArchivesOlderThanRetention(tm.getTransferService(), zipDir, bounds);
             } catch (IOException ex) {
@@ -403,11 +407,19 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 try {
                     transferService.deleteBlobs(zipDir, new ArrayList<>(batch));
                     deleted += batch.size();
-                    logger.debug("Deleted {} archive ZIPs older than {} minutes from {}", batch.size(),
-                        effectiveRetentionMinutes, zipDir.buildAsString());
+                    logger.debug(
+                        "Deleted {} archive ZIPs older than {} minutes from {}",
+                        batch.size(),
+                        effectiveRetentionMinutes,
+                        zipDir.buildAsString()
+                    );
                 } catch (IOException e) {
-                    logger.warn("Failed to delete archive batch ({} blobs) from {}: {}", batch.size(),
-                        zipDir.buildAsString(), e.getMessage());
+                    logger.warn(
+                        "Failed to delete archive batch ({} blobs) from {}: {}",
+                        batch.size(),
+                        zipDir.buildAsString(),
+                        e.getMessage()
+                    );
                 }
             }
             morePages = blobs.size() >= MAX_ARCHIVE_BLOBS_PER_NODE;
@@ -457,7 +469,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     ) throws IOException {
         // Path: translog/data/{hashTypeIndex}/{hashNodeId}/{timestamp}.zip
         // hashTypeIndex = hash("translog_zip|{indexUUID}") — same for all nodes, used for per-index GC
-        // hashNodeId    = hash(nodeId) — unique per node, isolates writes for S3 partition safety
+        // hashNodeId = hash(nodeId) — unique per node, isolates writes for S3 partition safety
         BlobPath archivePath = basePath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
         // Pre-compute size and capture per-entry offsets for archive-based recovery metadata.

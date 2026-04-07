@@ -956,6 +956,7 @@ public class IndicesService extends AbstractLifecycleComponent
                 // This matches how TranslogArchiveCollector resolves paths via TransferManager.
                 TranslogArchiveBatchCoordinator coordinator = new TranslogArchiveBatchCoordinator(
                     index.getUUID(),
+                    clusterService.localNode().getId(),
                     new org.opensearch.common.blobstore.BlobPath(),
                     hashAlgo,
                     batchInterval

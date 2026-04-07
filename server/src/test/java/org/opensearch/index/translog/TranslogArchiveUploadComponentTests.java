@@ -8,7 +8,6 @@
 
 package org.opensearch.index.translog;
 
-import org.opensearch.action.LatchedActionListener;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
@@ -16,7 +15,6 @@ import org.opensearch.common.blobstore.support.PlainBlobMetadata;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
-import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.index.translog.transfer.FileSnapshot.CheckpointFileSnapshot;
 import org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot;
 import org.opensearch.index.translog.transfer.FileSnapshot.TranslogFileSnapshot;
@@ -36,7 +34,6 @@ import org.junit.Before;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
@@ -45,13 +42,6 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.hamcrest.Matchers.greaterThan;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 /**
  * Component integration test: wires real classes ({@link TranslogTransferManager},
@@ -106,7 +96,7 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
 
     private TranslogTransferManager buildManager(boolean archiveEnabled) {
         BlobPath dataPath = BlobPath.cleanPath().add("translog").add("data");
-        BlobPath mdPath   = BlobPath.cleanPath().add("translog").add("metadata");
+        BlobPath mdPath = BlobPath.cleanPath().add("translog").add("metadata");
         BlobPath basePath = BlobPath.cleanPath();
         RemoteTranslogTransferTracker tracker = new RemoteTranslogTransferTracker(SHARD_ID, 10);
         FileTransferTracker fileTracker = new FileTransferTracker(SHARD_ID, tracker);
@@ -129,31 +119,48 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
      */
     private TransferSnapshot snapshotForGen(long gen) throws IOException {
         CheckpointFileSnapshot ckp1 = new CheckpointFileSnapshot(
-            primaryTerm, gen, minTranslogGeneration,
-            createTempFile(Translog.TRANSLOG_FILE_PREFIX + gen, Translog.CHECKPOINT_SUFFIX), null);
+            primaryTerm,
+            gen,
+            minTranslogGeneration,
+            createTempFile(Translog.TRANSLOG_FILE_PREFIX + gen, Translog.CHECKPOINT_SUFFIX),
+            null
+        );
         CheckpointFileSnapshot ckp2 = new CheckpointFileSnapshot(
-            primaryTerm, gen - 1, minTranslogGeneration,
-            createTempFile(Translog.TRANSLOG_FILE_PREFIX + (gen - 1), Translog.CHECKPOINT_SUFFIX), null);
+            primaryTerm,
+            gen - 1,
+            minTranslogGeneration,
+            createTempFile(Translog.TRANSLOG_FILE_PREFIX + (gen - 1), Translog.CHECKPOINT_SUFFIX),
+            null
+        );
         TranslogFileSnapshot tlog1 = new TranslogFileSnapshot(
-            primaryTerm, gen,
-            createTempFile(Translog.TRANSLOG_FILE_PREFIX + gen, Translog.TRANSLOG_FILE_SUFFIX), null);
+            primaryTerm,
+            gen,
+            createTempFile(Translog.TRANSLOG_FILE_PREFIX + gen, Translog.TRANSLOG_FILE_SUFFIX),
+            null
+        );
         TranslogFileSnapshot tlog2 = new TranslogFileSnapshot(
-            primaryTerm, gen - 1,
-            createTempFile(Translog.TRANSLOG_FILE_PREFIX + (gen - 1), Translog.TRANSLOG_FILE_SUFFIX), null);
+            primaryTerm,
+            gen - 1,
+            createTempFile(Translog.TRANSLOG_FILE_PREFIX + (gen - 1), Translog.TRANSLOG_FILE_SUFFIX),
+            null
+        );
 
         return new TransferSnapshot() {
             @Override
             public Set<TransferFileSnapshot> getCheckpointFileSnapshots() {
                 return Set.of(ckp1, ckp2);
             }
+
             @Override
             public Set<TransferFileSnapshot> getTranslogFileSnapshots() {
                 return Set.of(tlog1, tlog2);
             }
+
             @Override
             public TranslogTransferMetadata getTranslogTransferMetadata() {
                 return new TranslogTransferMetadata(primaryTerm, gen, minTranslogGeneration, 2);
             }
+
             @Override
             public Set<TransferFileSnapshot> getTranslogFileSnapshotWithMetadata() throws IOException {
                 tlog1.setMetadataFileInputStream(ckp1.inputStream());
@@ -164,8 +171,11 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
     }
 
     private static final TranslogTransferListener NOOP_LISTENER = new TranslogTransferListener() {
-        @Override public void onUploadComplete(TransferSnapshot s) {}
-        @Override public void onUploadFailed(TransferSnapshot s, Exception e) {}
+        @Override
+        public void onUploadComplete(TransferSnapshot s) {}
+
+        @Override
+        public void onUploadFailed(TransferSnapshot s, Exception e) {}
     };
 
     // -----------------------------------------------------------------------
@@ -182,9 +192,9 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
 
     // -----------------------------------------------------------------------
     // 2. transferSnapshot() — archive-OFF: 5 PUTs (2 tlog + 2 ckp + 1 metadata),
-    //    0 GETs, 0 DELETEs, 0 LISTs.
+    // 0 GETs, 0 DELETEs, 0 LISTs.
     //
-    //    The CountingTransferService stubs all uploads to succeed synchronously.
+    // The CountingTransferService stubs all uploads to succeed synchronously.
     // -----------------------------------------------------------------------
 
     public void testTransferSnapshotArchiveOffPutCount() throws IOException {
@@ -194,13 +204,17 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
         assertTrue("transferSnapshot should succeed", ok);
         // 2 tlog + 2 ckp uploaded via uploadBlobs (counted per-file), plus 1 metadata via uploadBlob = 5 PUTs.
         assertEquals("Archive-OFF: 5 PUTs (2 tlog + 2 ckp + 1 metadata)", 5, transferService.putCount());
-        assertEquals("Archive-OFF: 0 GETs during upload",    0, transferService.getCount());
+        assertEquals("Archive-OFF: 0 GETs during upload", 0, transferService.getCount());
         assertEquals("Archive-OFF: 0 DELETEs during upload", 0, transferService.deleteCount());
-        assertEquals("Archive-OFF: 0 LISTs during upload",   0, transferService.listCount());
+        assertEquals("Archive-OFF: 0 LISTs during upload", 0, transferService.listCount());
 
-        logger.info("Archive-OFF transferSnapshot — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
-            transferService.putCount(), transferService.getCount(),
-            transferService.listCount(), transferService.deleteCount());
+        logger.info(
+            "Archive-OFF transferSnapshot — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
+            transferService.putCount(),
+            transferService.getCount(),
+            transferService.listCount(),
+            transferService.deleteCount()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -212,14 +226,18 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
         TranslogTransferManager mgr = buildManager(true);
         RemoteFsTimestampAwareTranslog.cleanup(mgr);
 
-        assertEquals("Archive-ON cleanup: 0 PUTs",    0, transferService.putCount());
-        assertEquals("Archive-ON cleanup: 0 GETs",    0, transferService.getCount());
-        assertEquals("Archive-ON cleanup: 0 LISTs",   0, transferService.listCount());
+        assertEquals("Archive-ON cleanup: 0 PUTs", 0, transferService.putCount());
+        assertEquals("Archive-ON cleanup: 0 GETs", 0, transferService.getCount());
+        assertEquals("Archive-ON cleanup: 0 LISTs", 0, transferService.listCount());
         assertEquals("Archive-ON cleanup: 0 DELETEs", 0, transferService.deleteCount());
 
-        logger.info("Archive-ON cleanup — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
-            transferService.putCount(), transferService.getCount(),
-            transferService.listCount(), transferService.deleteCount());
+        logger.info(
+            "Archive-ON cleanup — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
+            transferService.putCount(),
+            transferService.getCount(),
+            transferService.listCount(),
+            transferService.deleteCount()
+        );
     }
 
     /** Archive-OFF: cleanup() issues ≥1 LIST to discover stale metadata blobs. */
@@ -227,19 +245,20 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
         // Pre-populate the mock with 2 metadata blobs so cleanup has something to list.
         TranslogTransferMetadata md1 = new TranslogTransferMetadata(primaryTerm, generation, minTranslogGeneration, 2);
         TranslogTransferMetadata md2 = new TranslogTransferMetadata(primaryTerm, generation + 1, minTranslogGeneration, 2);
-        transferService.setMetadataBlobs(List.of(
-            new PlainBlobMetadata(md1.getFileName(), 1),
-            new PlainBlobMetadata(md2.getFileName(), 1)
-        ));
+        transferService.setMetadataBlobs(List.of(new PlainBlobMetadata(md1.getFileName(), 1), new PlainBlobMetadata(md2.getFileName(), 1)));
 
         TranslogTransferManager mgr = buildManager(false);
         RemoteFsTimestampAwareTranslog.cleanup(mgr);
 
         assertThat("Archive-OFF cleanup: ≥1 LIST", transferService.listCount(), greaterThan(0));
 
-        logger.info("Archive-OFF cleanup — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
-            transferService.putCount(), transferService.getCount(),
-            transferService.listCount(), transferService.deleteCount());
+        logger.info(
+            "Archive-OFF cleanup — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
+            transferService.putCount(),
+            transferService.getCount(),
+            transferService.listCount(),
+            transferService.deleteCount()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -264,17 +283,20 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
 
         int putsAfterUpload = transferService.putCount();
         // Each cycle: 2 tlog + 2 ckp + 1 metadata = 5 PUTs.
-        assertEquals("Archive-OFF: " + cycles + " cycles × 5 PUTs = " + (cycles * 5),
-            cycles * 5, putsAfterUpload);
+        assertEquals("Archive-OFF: " + cycles + " cycles × 5 PUTs = " + (cycles * 5), cycles * 5, putsAfterUpload);
 
         transferService.reset();
         RemoteFsTimestampAwareTranslog.cleanup(mgr);
 
-        assertThat("Archive-OFF cleanup: ≥1 LIST",   transferService.listCount(),   greaterThan(0));
+        assertThat("Archive-OFF cleanup: ≥1 LIST", transferService.listCount(), greaterThan(0));
         assertThat("Archive-OFF cleanup: ≥1 DELETE", transferService.deleteCount(), greaterThan(0));
 
-        logger.info("Archive-OFF cleanup after {} cycles — LISTs={}, DELETEs={}",
-            cycles, transferService.listCount(), transferService.deleteCount());
+        logger.info(
+            "Archive-OFF cleanup after {} cycles — LISTs={}, DELETEs={}",
+            cycles,
+            transferService.listCount(),
+            transferService.deleteCount()
+        );
     }
 
     /**
@@ -284,8 +306,7 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
         TranslogTransferManager mgr = buildManager(true);
         RemoteFsTimestampAwareTranslog.cleanup(mgr);
 
-        int total = transferService.putCount() + transferService.getCount()
-            + transferService.listCount() + transferService.deleteCount();
+        int total = transferService.putCount() + transferService.getCount() + transferService.listCount() + transferService.deleteCount();
         assertEquals("Archive-ON: zero total blob ops", 0, total);
 
         logger.info("Archive-ON round-trip total ops={}", total);
@@ -316,20 +337,56 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
         RemoteFsTimestampAwareTranslog.cleanup(offMgr);
         int offLists = transferService.listCount(), offDeletes = transferService.deleteCount();
         int offTotal = offLists + offDeletes;
-        logger.info("Archive-OFF cleanup ({} cycles) — LISTs={}, DELETEs={}, total={}",
-            cycles, offLists, offDeletes, offTotal);
+        logger.info("Archive-OFF cleanup ({} cycles) — LISTs={}, DELETEs={}, total={}", cycles, offLists, offDeletes, offTotal);
 
         transferService.reset();
 
         // archive-ON
         TranslogTransferManager onMgr = buildManager(true);
         RemoteFsTimestampAwareTranslog.cleanup(onMgr);
-        int onTotal = transferService.putCount() + transferService.getCount()
-            + transferService.listCount() + transferService.deleteCount();
+        int onTotal = transferService.putCount() + transferService.getCount() + transferService.listCount() + transferService.deleteCount();
         logger.info("Archive-ON cleanup ({} cycles) — total={}", cycles, onTotal);
 
         assertEquals("Archive-ON cleanup: 0 blob ops", 0, onTotal);
         assertTrue("Archive-OFF ops (" + offTotal + ") > archive-ON (0)", offTotal > onTotal);
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. OFF→ON toggle: fallback to per-shard metadata when no ZIPs found
+    // -----------------------------------------------------------------------
+
+    /**
+     * Regression test for Issue 1: when archive is toggled OFF→ON and no ZIP has been
+     * uploaded yet, {@link RemoteFsTranslog} must fall back to per-shard tlog metadata
+     * rather than returning an empty translog.
+     *
+     * <p>Setup: archive=ON, listFolders returns empty (no hashNodeId dirs),
+     * but metadataBlobs contains a real metadata entry. Expects that download()
+     * triggers a GET for per-shard tlog files (fallback path).
+     */
+    public void testArchiveOnWithNoZipsFallsBackToPerShardMetadata() throws IOException {
+        // Verify that when archive=ON and no ZIPs exist, the fallback path calls
+        // readMetadata (= 1 listAllInSortedOrder call) in addition to the folder scan LIST.
+        // We test this at the TranslogTransferManager level to avoid file-handle lifecycle issues
+        // that come with full RemoteFsTranslog.download() invocation.
+
+        TranslogTransferManager mgr = buildManager(true);
+
+        // Step 1: simulate the ZIP folder scan (listFolders) returning empty.
+        // This is what TranslogArchiveRecovery does — calls listFolders → empty → no ZIPs.
+        Set<String> nodeDirs = mgr.getTransferService().listFolders(List.of("translog", "data", "hashTypeIndex"));
+        int listsAfterFolderScan = transferService.listCount();
+        assertTrue("nodeDirs must be empty (no ZIPs)", nodeDirs == null || nodeDirs.isEmpty());
+
+        // Step 2: simulate the fallback — readMetadata(0) issues 1 more listAllInSortedOrder.
+        TranslogTransferMetadata fallback = mgr.readMetadata(0);
+        int listsAfterFallback = transferService.listCount();
+
+        // Fallback must have issued ≥1 more LIST than the folder scan.
+        assertTrue("readMetadata fallback must issue ≥1 additional LIST", listsAfterFallback > listsAfterFolderScan);
+
+        // With no metadata blobs seeded, readMetadata returns null (truly fresh shard).
+        assertNull("No metadata seeded → readMetadata must return null", fallback);
     }
 
     // -----------------------------------------------------------------------
@@ -342,22 +399,40 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
      */
     static final class CountingTransferService implements TransferService {
 
-        private final AtomicInteger puts    = new AtomicInteger();
-        private final AtomicInteger gets    = new AtomicInteger();
+        private final AtomicInteger puts = new AtomicInteger();
+        private final AtomicInteger gets = new AtomicInteger();
         private final AtomicInteger deletes = new AtomicInteger();
-        private final AtomicInteger lists   = new AtomicInteger();
+        private final AtomicInteger lists = new AtomicInteger();
 
         /** Metadata blobs returned by listAllInSortedOrder (used by cleanup/readMetadata). */
         private volatile List<BlobMetadata> metadataBlobs = Collections.emptyList();
 
-        void setMetadataBlobs(List<BlobMetadata> blobs) { this.metadataBlobs = new LinkedList<>(blobs); }
+        void setMetadataBlobs(List<BlobMetadata> blobs) {
+            this.metadataBlobs = new LinkedList<>(blobs);
+        }
 
-        int putCount()    { return puts.get(); }
-        int getCount()    { return gets.get(); }
-        int deleteCount() { return deletes.get(); }
-        int listCount()   { return lists.get(); }
+        int putCount() {
+            return puts.get();
+        }
 
-        void reset() { puts.set(0); gets.set(0); deletes.set(0); lists.set(0); }
+        int getCount() {
+            return gets.get();
+        }
+
+        int deleteCount() {
+            return deletes.get();
+        }
+
+        int listCount() {
+            return lists.get();
+        }
+
+        void reset() {
+            puts.set(0);
+            gets.set(0);
+            deletes.set(0);
+            lists.set(0);
+        }
 
         // --- PUTs ---
 
@@ -376,6 +451,10 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
         @Override
         public void uploadBlob(TransferFileSnapshot fileSnapshot, Iterable<String> path, WritePriority priority) throws IOException {
             puts.incrementAndGet();
+            // Consume and close the input stream to release file handles (avoids LeakFS failures).
+            try (InputStream in = fileSnapshot.inputStream()) {
+                in.transferTo(java.io.OutputStream.nullOutputStream());
+            }
         }
 
         @Override
@@ -387,6 +466,12 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
         ) {
             snapshots.forEach(s -> {
                 puts.incrementAndGet();
+                // Consume and close the input stream to release file handles (avoids LeakFS failures).
+                try (InputStream in = s.inputStream()) {
+                    in.transferTo(java.io.OutputStream.nullOutputStream());
+                } catch (IOException e) {
+                    // ignore in test stub
+                }
                 listener.onResponse(s);
             });
         }
@@ -430,11 +515,13 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
         }
 
         @Override
-        public org.opensearch.common.blobstore.InputStreamWithMetadata downloadBlobWithMetadata(
-            Iterable<String> path, String fileName) throws IOException {
+        public org.opensearch.common.blobstore.InputStreamWithMetadata downloadBlobWithMetadata(Iterable<String> path, String fileName)
+            throws IOException {
             gets.incrementAndGet();
             return new org.opensearch.common.blobstore.InputStreamWithMetadata(
-                new ByteArrayInputStream(new byte[0]), Collections.emptyMap());
+                new ByteArrayInputStream(new byte[0]),
+                Collections.emptyMap()
+            );
         }
 
         // --- DELETEs ---

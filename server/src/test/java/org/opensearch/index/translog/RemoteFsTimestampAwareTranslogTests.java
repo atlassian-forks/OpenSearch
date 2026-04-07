@@ -1040,10 +1040,13 @@ public class RemoteFsTimestampAwareTranslogTests extends RemoteFsTranslogTests {
         ((RemoteFsTimestampAwareTranslog) translog).trimUnreferencedReaders(true, false);
         assertBusy(() -> assertTrue(translog.isRemoteGenerationDeletionPermitsAvailable()));
 
-        assertBusy(() -> assertEquals(
-            "Non-archive mode: all metadata blobs deleted on index deletion trim",
-            0, blobStoreTransferService.listAll(getTranslogDirectory().add(METADATA_DIR)).size()
-        ));
+        assertBusy(
+            () -> assertEquals(
+                "Non-archive mode: all metadata blobs deleted on index deletion trim",
+                0,
+                blobStoreTransferService.listAll(getTranslogDirectory().add(METADATA_DIR)).size()
+            )
+        );
     }
 
     public void testDeleteStaleRemotePrimaryTermsPrimaryTermInRemoteIsBigger() throws IOException {
