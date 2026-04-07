@@ -35,6 +35,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -295,13 +296,14 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
         ensureRed(INDEX_NAME);
 
         assertTrue(client().admin().indices().prepareClose(INDEX_NAME).get().isAcknowledged());
+        PlainActionFuture<RestoreRemoteStoreResponse> future1 = PlainActionFuture.newFuture();
         client().admin()
             .cluster()
             .restoreRemoteStore(
                 new RestoreRemoteStoreRequest().indices(INDEX_NAME).restoreAllShards(true).waitForCompletion(true),
-                org.opensearch.action.support.PlainActionFuture.newFuture()
-            )
-            .actionGet();
+                future1
+            );
+        future1.actionGet();
         ensureGreen(org.opensearch.common.unit.TimeValue.timeValueSeconds(120), INDEX_NAME);
 
         // Verify ALL docs by ID and field value — catches count-correct but content-wrong bugs
@@ -395,13 +397,14 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
         ensureRed(INDEX_NAME);
 
         assertTrue(client().admin().indices().prepareClose(INDEX_NAME).get().isAcknowledged());
+        PlainActionFuture<RestoreRemoteStoreResponse> future3 = PlainActionFuture.newFuture();
         client().admin()
             .cluster()
             .restoreRemoteStore(
                 new RestoreRemoteStoreRequest().indices(INDEX_NAME).restoreAllShards(true).waitForCompletion(true),
-                org.opensearch.action.support.PlainActionFuture.newFuture()
-            )
-            .actionGet();
+                future3
+            );
+        future3.actionGet();
         ensureGreen(org.opensearch.common.unit.TimeValue.timeValueSeconds(120), INDEX_NAME);
 
         Map<String, String> all = new HashMap<>(batch1);
@@ -437,7 +440,7 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
         // Refresh to make all restored docs visible.
         client().admin().indices().prepareRefresh(indexName).get();
         // Verify count first — fast fail if obviously wrong.
-        assertBusy(() -> assertHitCount(client().prepareSearch(indexName).setSize(0).get(), expected.size()), 30, TimeUnit.SECONDS);
+        assertBusy(() -> assertHitCount(client().prepareSearch(indexName).setSize(0).get(), (long) expected.size()), 30, TimeUnit.SECONDS);
         // Verify each doc's content by ID — catches wrong-doc or missing-doc bugs.
         for (Map.Entry<String, String> e : expected.entrySet()) {
             GetResponse get = client().prepareGet(indexName, e.getKey()).get();

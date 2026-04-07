@@ -241,6 +241,19 @@ public class ClusterApplierService extends AbstractLifecycleComponent implements
     }
 
     /**
+     * Returns the local node ID directly from the current cluster state without the
+     * cluster state applier thread assertion. Safe to call from the applier thread
+     * (e.g. during {@code createIndex}) where {@link #state()} would throw.
+     */
+    public String getLocalNodeIdUnsafe() {
+        ClusterState clusterState = this.state.get();
+        if (clusterState == null) {
+            return null;
+        }
+        return clusterState.nodes().getLocalNodeId();
+    }
+
+    /**
      * Adds a high priority applier of updated cluster states.
      */
     public void addHighPriorityApplier(ClusterStateApplier applier) {

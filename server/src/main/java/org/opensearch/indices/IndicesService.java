@@ -954,9 +954,14 @@ public class IndicesService extends AbstractLifecycleComponent
                 // repository root automatically. The coordinator's archiveBasePath is relative to the
                 // repo root, and "translog/data/{hash}/{bucket}" is appended at upload time.
                 // This matches how TranslogArchiveCollector resolves paths via TransferManager.
+                // createIndex is called from IndicesClusterStateService on the cluster state applier thread.
+                // We cannot call clusterService.state() or clusterService.localNode() there (both assert
+                // they are NOT called from the applier thread). Use getLocalNodeIdUnsafe() which reads the
+                // raw AtomicReference directly without the assertion guard.
+                String localNodeId = clusterService.getClusterApplierService().getLocalNodeIdUnsafe();
                 TranslogArchiveBatchCoordinator coordinator = new TranslogArchiveBatchCoordinator(
                     index.getUUID(),
-                    clusterService.localNode().getId(),
+                    localNodeId,
                     new org.opensearch.common.blobstore.BlobPath(),
                     hashAlgo,
                     batchInterval
