@@ -383,7 +383,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             try {
                 genBuckets = transferService.listFolders(hashPath);
             } catch (IOException e) {
-                logger.trace("List translog/data/{} failed: {}", hashPrefix, e.getMessage());
+                logger.warn("List translog/data/{} failed during retention cleanup: {}", hashPrefix, e.getMessage());
                 continue;
             }
             if (genBuckets == null || genBuckets.isEmpty()) {
