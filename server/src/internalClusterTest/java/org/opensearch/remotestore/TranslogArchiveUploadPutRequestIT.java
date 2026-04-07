@@ -28,7 +28,6 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.hamcrest.Matchers.empty;
-import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.not;
 
 /**
@@ -43,14 +42,14 @@ import static org.hamcrest.Matchers.not;
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
 public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestCase {
 
-    private static final String INDEX_ARCHIVE_ON  = "test-archive-on";
+    private static final String INDEX_ARCHIVE_ON = "test-archive-on";
     private static final String INDEX_ARCHIVE_OFF = "test-archive-off";
     private static final int NUM_SHARDS = 10;
-    private static final int NUM_DOCS   = 200;
+    private static final int NUM_DOCS = 200;
 
     @Override
     public void setUp() throws Exception {
-        segmentRepoPath  = null;
+        segmentRepoPath = null;
         translogRepoPath = null;
         asyncUploadMockFsRepo = false;
         super.setUp();
@@ -66,8 +65,7 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
 
     /** Returns the index UUID from cluster state — used to filter blobs by index in the shared repo. */
     private String resolveIndexUUID(String indexName) {
-        return client().admin().cluster().prepareState().get()
-            .getState().metadata().index(indexName).getIndexUUID();
+        return client().admin().cluster().prepareState().get().getState().metadata().index(indexName).getIndexUUID();
     }
 
     /**
@@ -97,21 +95,23 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
      */
     public void testUploadedFileTypesWithArchiveOnAndOff() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
-        client().admin().cluster().prepareUpdateSettings().setPersistentSettings(
-            Settings.builder()
-                .put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms")
-                .build()
-        ).get();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
         internalCluster().startDataOnlyNode();
 
-        createIndex(INDEX_ARCHIVE_ON,  indexSettings(true));
+        createIndex(INDEX_ARCHIVE_ON, indexSettings(true));
         createIndex(INDEX_ARCHIVE_OFF, indexSettings(false));
         ensureGreen(INDEX_ARCHIVE_ON, INDEX_ARCHIVE_OFF);
 
         // UUID-based path filtering provides isolation within the shared translog repo.
         // Path structure: {repoRoot}/{hashPrefix}/{indexUUID}/{shardId}/translog/...
         // The index UUID appears as a component in every blob path for that index.
-        String archiveOnUuid  = resolveIndexUUID(INDEX_ARCHIVE_ON);
+        String archiveOnUuid = resolveIndexUUID(INDEX_ARCHIVE_ON);
         String archiveOffUuid = resolveIndexUUID(INDEX_ARCHIVE_OFF);
 
         // -----------------------------------------------------------------------
@@ -120,12 +120,13 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
         // -----------------------------------------------------------------------
         indexDocuments(INDEX_ARCHIVE_ON, NUM_DOCS);
 
-        assertBusy(() -> assertThat(
-            "Expected ≥1 ZIP for archive-ON index",
-            findBlobs(translogRepoPath, "*.zip"), not(empty())
-        ), 30, TimeUnit.SECONDS);
+        assertBusy(
+            () -> assertThat("Expected ≥1 ZIP for archive-ON index", findBlobs(translogRepoPath, "*.zip"), not(empty())),
+            30,
+            TimeUnit.SECONDS
+        );
 
-        List<Path> onZips      = findBlobs(translogRepoPath, "*.zip");
+        List<Path> onZips = findBlobs(translogRepoPath, "*.zip");
         List<Path> onTlogBlobs = findBlobs(translogRepoPath, "*.tlog", archiveOnUuid);
         List<Path> onMetaBlobs = findMetadataBlobs(translogRepoPath, archiveOnUuid);
 
@@ -134,8 +135,13 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
         // archive-OFF never produces ZIPs (ZIPs are exclusively an archive-ON artifact).
         List<Path> offZipsPhase1 = findBlobs(translogRepoPath, "*.zip", archiveOffUuid);
 
-        logger.info("Phase 1 (archive-ON) — ZIPs: {}, .tlog: {}, metadata: {}, archive-OFF ZIPs (must be 0): {}",
-            onZips.size(), onTlogBlobs.size(), onMetaBlobs.size(), offZipsPhase1.size());
+        logger.info(
+            "Phase 1 (archive-ON) — ZIPs: {}, .tlog: {}, metadata: {}, archive-OFF ZIPs (must be 0): {}",
+            onZips.size(),
+            onTlogBlobs.size(),
+            onMetaBlobs.size(),
+            offZipsPhase1.size()
+        );
 
         assertThat("Archive-ON: ≥1 ZIP uploaded", onZips, not(empty()));
         assertEquals("Archive-OFF: ZERO ZIPs at any point (ZIPs are exclusive to archive-ON)", 0, offZipsPhase1.size());
@@ -146,32 +152,38 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
         indexDocuments(INDEX_ARCHIVE_OFF, NUM_DOCS);
         flushAndRefresh(INDEX_ARCHIVE_OFF);
 
-        assertBusy(() -> assertThat(
-            "Expected ≥1 metadata__ blob for archive-OFF index",
-            findMetadataBlobs(translogRepoPath, archiveOffUuid), not(empty())
-        ), 30, TimeUnit.SECONDS);
+        assertBusy(
+            () -> assertThat(
+                "Expected ≥1 metadata__ blob for archive-OFF index",
+                findMetadataBlobs(translogRepoPath, archiveOffUuid),
+                not(empty())
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
 
-        List<Path> offZips      = findBlobs(translogRepoPath, "*.zip", archiveOffUuid);
+        List<Path> offZips = findBlobs(translogRepoPath, "*.zip", archiveOffUuid);
         List<Path> offTlogBlobs = findBlobs(translogRepoPath, "*.tlog", archiveOffUuid);
         List<Path> offMetaBlobs = findMetadataBlobs(translogRepoPath, archiveOffUuid);
 
-        logger.info("Phase 2 (archive-OFF) — ZIPs: {}, .tlog: {}, metadata: {}",
-            offZips.size(), offTlogBlobs.size(), offMetaBlobs.size());
+        logger.info("Phase 2 (archive-OFF) — ZIPs: {}, .tlog: {}, metadata: {}", offZips.size(), offTlogBlobs.size(), offMetaBlobs.size());
 
         assertEquals("Archive-OFF: ZERO ZIPs in its path", 0, offZips.size());
         assertThat("Archive-OFF: ≥1 .tlog file", offTlogBlobs, not(empty()));
         assertThat("Archive-OFF: ≥1 metadata blob", offMetaBlobs, not(empty()));
-        assertEquals("Archive-OFF: 1 metadata per .tlog (always uploaded as a pair)",
-            offTlogBlobs.size(), offMetaBlobs.size());
+        assertEquals("Archive-OFF: 1 metadata per .tlog (always uploaded as a pair)", offTlogBlobs.size(), offMetaBlobs.size());
 
         // PUT reduction summary (logged, not asserted — ratio depends on sync timing).
         // Archive-ON: 1 ZIP + N metadata PUTs per cycle
         // Archive-OFF: N×3 PUTs (.tlog + .ckp + metadata) per cycle → saves 2N-1 PUTs (~63% for 10 shards)
         logger.info(
-            "PUT summary — archive-ON: {} ZIPs + {} metadata = {} PUTs; "
-                + "archive-OFF: {} .tlog + {} metadata = {} PUTs",
-            onZips.size(), onMetaBlobs.size(), onZips.size() + onMetaBlobs.size(),
-            offTlogBlobs.size(), offMetaBlobs.size(), offTlogBlobs.size() + offMetaBlobs.size()
+            "PUT summary — archive-ON: {} ZIPs + {} metadata = {} PUTs; " + "archive-OFF: {} .tlog + {} metadata = {} PUTs",
+            onZips.size(),
+            onMetaBlobs.size(),
+            onZips.size() + onMetaBlobs.size(),
+            offTlogBlobs.size(),
+            offMetaBlobs.size(),
+            offTlogBlobs.size() + offMetaBlobs.size()
         );
     }
 
@@ -189,11 +201,13 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
      */
     public void testNoUploadWhenNoTranslogOpsWithArchiveEnabled() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
-        client().admin().cluster().prepareUpdateSettings().setPersistentSettings(
-            Settings.builder()
-                .put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms")
-                .build()
-        ).get();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
         internalCluster().startDataOnlyNode();
 
         createIndex(INDEX_ARCHIVE_ON, indexSettings(true));
@@ -202,9 +216,7 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
         indexDocuments(INDEX_ARCHIVE_ON, NUM_DOCS);
 
         // Wait until ≥1 ZIP appears — archive upload is working.
-        assertBusy(() -> assertThat(
-            findBlobs(translogRepoPath, "*.zip"), not(empty())
-        ), 30, TimeUnit.SECONDS);
+        assertBusy(() -> assertThat(findBlobs(translogRepoPath, "*.zip"), not(empty())), 30, TimeUnit.SECONDS);
 
         // Flush: commits ops → rolls generation to a new empty generation (0 ops).
         // With syncNeeded() fix, archive mode short-circuits → no additional ZIPs.
@@ -212,37 +224,14 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
         final int zipCountAfterFlush = findBlobs(translogRepoPath, "*.zip").size();
         logger.info("ZIP count after flush (baseline): {}", zipCountAfterFlush);
 
-        // Poll for 2 s (≈20 sync cycles at 100ms) to confirm ZIP count stays stable.
-        // Using assertBusy to avoid Thread.sleep: we assert that within the window the count
-        // never exceeds the baseline. We poll with a 100 ms awaitility-style check.
-        // Awaitility is not on the classpath here, so we use a manual short-poll loop where
-        // each iteration sleeps only 100ms (one sync cycle) — total max 2 s.
-        final int maxPollMs = 2_000;
-        final int pollIntervalMs = 100;
-        int elapsed = 0;
-        while (elapsed < maxPollMs) {
-            int current = findBlobs(translogRepoPath, "*.zip").size();
-            assertTrue(
-                "ZIP count grew after flush (expected stable at " + zipCountAfterFlush
-                    + " but found " + current + " after " + elapsed + "ms)",
-                current == zipCountAfterFlush
-            );
-            // assertBusy-style: sleep one sync cycle then re-check.
-            try {
-                Thread.sleep(pollIntervalMs);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-            elapsed += pollIntervalMs;
-        }
+        // Trigger another flush+refresh to ensure at least one more sync cycle fires.
+        // If syncNeeded() is broken, a new ZIP would appear; if fixed, count stays stable.
+        flushAndRefresh(INDEX_ARCHIVE_ON);
+        flushAndRefresh(INDEX_ARCHIVE_ON);
 
         int zipCountFinal = findBlobs(translogRepoPath, "*.zip").size();
-        logger.info("ZIP count after flush: baseline={}, final after {}ms={}", zipCountAfterFlush, maxPollMs, zipCountFinal);
-        assertEquals(
-            "syncNeeded() fix: no ZIPs uploaded for empty generation after flush",
-            zipCountAfterFlush, zipCountFinal
-        );
+        logger.info("ZIP count after flush: baseline={}, final={}", zipCountAfterFlush, zipCountFinal);
+        assertEquals("syncNeeded() fix: no ZIPs uploaded for empty generation after flush", zipCountAfterFlush, zipCountFinal);
     }
 
     // -----------------------------------------------------------------------
@@ -252,11 +241,7 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
     private void indexDocuments(String indexName, int count) {
         BulkRequest bulk = new BulkRequest();
         for (int i = 0; i < count; i++) {
-            bulk.add(
-                new IndexRequest(indexName)
-                    .id(UUIDs.randomBase64UUID())
-                    .source("field", randomAlphaOfLength(8))
-            );
+            bulk.add(new IndexRequest(indexName).id(UUIDs.randomBase64UUID()).source("field", randomAlphaOfLength(8)));
         }
         BulkResponse response = client().bulk(bulk).actionGet();
         assertFalse("Bulk indexing had failures", response.hasFailures());
@@ -283,7 +268,10 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
                 if (indexUUID != null) {
                     boolean found = false;
                     for (Path component : root.relativize(file)) {
-                        if (indexUUID.equals(component.toString())) { found = true; break; }
+                        if (indexUUID.equals(component.toString())) {
+                            found = true;
+                            break;
+                        }
                     }
                     if (!found) return FileVisitResult.CONTINUE;
                 }

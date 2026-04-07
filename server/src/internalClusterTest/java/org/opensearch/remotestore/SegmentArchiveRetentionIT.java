@@ -73,12 +73,13 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get();
         client().admin().indices().prepareRefresh(INDEX_NAME).get();
 
-        // Wait for cleanup to run (may need to trigger manually in test)
-        Thread.sleep(2000);
+        // Wait for at least one archive to appear after force merge (assertBusy, no Thread.sleep).
+        assertBusy(
+            () -> assertFalse("Should still have archives after merge", listSegmentArchives().isEmpty()),
+            30,
+            java.util.concurrent.TimeUnit.SECONDS
+        );
 
-        // After force merge, new archive is created for the merged segment.
-        // Archive-aware retention/cleanup is not yet implemented, so old archives
-        // may persist. We verify data integrity instead.
         List<String> archivesAfter = listSegmentArchives();
         logger.info("Archives before force merge: {}, after: {}", archives2.size(), archivesAfter.size());
         assertTrue("Should still have archives after merge", archivesAfter.size() > 0);
@@ -121,10 +122,7 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get();
         client().admin().indices().prepareRefresh(INDEX_NAME).get();
 
-        // Wait for potential cleanup
-        Thread.sleep(2000);
-
-        // Verify index is still functional
+        // Verify index is still functional (no sleep needed — refresh was just issued above).
         long docCount = client().prepareSearch(INDEX_NAME).setSize(0).get().getHits().getTotalHits().value;
         assertEquals("Should have all documents", DOCS_PER_BATCH * 3, docCount);
     }
@@ -179,30 +177,22 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         createIndex(INDEX_NAME, indexSettings);
         ensureGreen(INDEX_NAME);
 
-        // Background indexing thread
-        Thread indexingThread = new Thread(() -> {
-            try {
-                for (int i = 0; i < 10; i++) {
-                    indexDocuments(50);
-                    client().admin().indices().prepareRefresh(INDEX_NAME).get();
-                    Thread.sleep(200);
-                }
-            } catch (Exception e) {
-                logger.error("Indexing thread failed", e);
-            }
-        });
+        // Index in the test thread across multiple rounds, refreshing each time to accumulate archives.
+        // Avoids background threads with Thread.sleep — deterministic and CI-safe.
+        for (int i = 0; i < 10; i++) {
+            indexDocuments(50);
+            client().admin().indices().prepareRefresh(INDEX_NAME).get();
+        }
 
-        indexingThread.start();
+        // Wait until at least one archive appears before merging.
+        assertBusy(
+            () -> assertFalse("At least one archive must exist before merge", listSegmentArchives().isEmpty()),
+            30,
+            java.util.concurrent.TimeUnit.SECONDS
+        );
 
-        // Wait a bit to let some archives accumulate
-        Thread.sleep(1000);
-
-        // Trigger force merge while indexing is ongoing
+        // Trigger force merge.
         client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get();
-
-        // Wait for indexing to complete
-        indexingThread.join(10000);
-        assertFalse("Indexing thread should have completed", indexingThread.isAlive());
 
         // Final refresh
         client().admin().indices().prepareRefresh(INDEX_NAME).get();
@@ -230,23 +220,26 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         createIndex(INDEX_NAME, indexSettings);
         ensureGreen(INDEX_NAME);
 
-        // Create multiple archives in sequence
+        // Create multiple archives in sequence — no Thread.sleep between batches.
         List<Integer> archiveCounts = new ArrayList<>();
         for (int i = 0; i < 5; i++) {
             indexDocuments(DOCS_PER_BATCH);
             client().admin().indices().prepareRefresh(INDEX_NAME).get();
             archiveCounts.add(listSegmentArchives().size());
-            Thread.sleep(200);
         }
 
         logger.info("Archive counts after each batch: {}", archiveCounts);
 
-        // Force merge to trigger cleanup of old archives
+        // Force merge to trigger cleanup of old archives.
         client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get();
         client().admin().indices().prepareRefresh(INDEX_NAME).get();
 
-        // Wait for cleanup
-        Thread.sleep(2000);
+        // Wait for at least one archive to be present after merge (assertBusy, no Thread.sleep).
+        assertBusy(
+            () -> assertFalse("Should still have some archives after merge", listSegmentArchives().isEmpty()),
+            30,
+            java.util.concurrent.TimeUnit.SECONDS
+        );
 
         // Recent archives should exist
         List<String> finalArchives = listSegmentArchives();

@@ -11,12 +11,14 @@ package org.opensearch.remotestore;
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
+import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
+import org.opensearch.common.UUIDs;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.QueryBuilders;
@@ -32,7 +34,9 @@ import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
@@ -422,9 +426,134 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         }, 30, TimeUnit.SECONDS);
     }
 
+    /**
+     * Content verification: replica must serve each doc by ID with correct field value.
+     *
+     * Proves that archive download → decompression → segment recovery is byte-correct,
+     * not just count-correct. A truncated or corrupt archive that happens to yield the
+     * same doc count would still fail this test.
+     */
+    public void testReplicaDocumentContentMatchesPrimary() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+        String replicaNode = internalCluster().startDataOnlyNode();
+
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
+            .put(IndexMetadata.SETTING_REPLICATION_TYPE, ReplicationType.SEGMENT)
+            .put(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey(), "1s")
+            .put("index.remote_store.segment.archive_upload_enabled", true)
+            .build();
+
+        createIndex(INDEX_NAME, indexSettings);
+        ensureGreen(INDEX_NAME);
+
+        String actualReplicaNode = getReplicaNodeName(INDEX_NAME, 0);
+
+        // Index known docs with tracked IDs and values
+        Map<String, String> knownDocs = indexKnownDocs(30);
+        flushAndRefresh(INDEX_NAME);
+
+        // Wait for archive upload
+        assertBusy(() -> assertFalse("Archive ZIP must exist", listSegmentArchives().isEmpty()), 30, TimeUnit.SECONDS);
+
+        // Assert replica shard role
+        assertReplicaShardStarted(INDEX_NAME, 0, actualReplicaNode);
+
+        // Verify content on replica using _only_local GET — proves correct archive decompression
+        verifyReplicaDocumentContent(actualReplicaNode, knownDocs);
+    }
+
+    /**
+     * After primary failure, promoted replica must serve correct document content — not just count.
+     * Enhances testReplicaServesDataAfterPrimaryFailure with per-doc content check.
+     */
+    public void testPromotedReplicaDocumentContentAfterPrimaryFailure() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        String primaryNode = internalCluster().startDataOnlyNode();
+        internalCluster().startDataOnlyNode();
+
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
+            .put(IndexMetadata.SETTING_REPLICATION_TYPE, ReplicationType.SEGMENT)
+            .put(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey(), "1s")
+            .put("index.remote_store.segment.archive_upload_enabled", true)
+            .build();
+
+        createIndex(INDEX_NAME, indexSettings);
+        ensureGreen(INDEX_NAME);
+
+        String replicaNode = getReplicaNodeName(INDEX_NAME, 0);
+
+        // Index known docs, flush so replica recovers from archive
+        Map<String, String> knownDocs = indexKnownDocs(30);
+        flushAndRefresh(INDEX_NAME);
+
+        assertBusy(() -> assertFalse("Archive must exist before kill", listSegmentArchives().isEmpty()), 30, TimeUnit.SECONDS);
+
+        // Verify replica has correct content before kill
+        verifyReplicaDocumentContent(replicaNode, knownDocs);
+
+        // Kill primary — replica promoted
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNode));
+        ensureYellow(INDEX_NAME);
+
+        assertBusy(() -> {
+            ClusterState state = client().admin().cluster().prepareState().get().getState();
+            ShardRouting primary = state.routingTable().index(INDEX_NAME).shard(0).primaryShard();
+            assertNotNull("Primary must be assigned", primary);
+            assertTrue("Primary must be active", primary.active());
+            assertEquals("replicaNode must be new primary", state.nodes().resolveNode(replicaNode).getId(), primary.currentNodeId());
+        }, 30, TimeUnit.SECONDS);
+
+        // After promotion, content must still be correct on the new primary (former replica)
+        verifyReplicaDocumentContent(replicaNode, knownDocs);
+    }
+
     // ---------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------
+
+    /**
+     * Index {@code count} docs with known IDs and field values. Returns id → value map.
+     * Does NOT flush — caller decides when to flush.
+     */
+    private Map<String, String> indexKnownDocs(int count) {
+        Map<String, String> docs = new HashMap<>();
+        for (int i = 0; i < count; i++) {
+            String id = UUIDs.randomBase64UUID();
+            String value = randomAlphaOfLength(10);
+            client().index(new IndexRequest(INDEX_NAME).id(id).source("value", value)).actionGet();
+            docs.put(id, value);
+        }
+        return docs;
+    }
+
+    /**
+     * Verify each doc exists on the given node's local shard with the correct field value.
+     * Uses {@code _only_local} GET routed to {@code node} — proves the local shard copy has correct data.
+     */
+    private void verifyReplicaDocumentContent(String node, Map<String, String> expected) throws Exception {
+        client().admin().indices().prepareRefresh(INDEX_NAME).get();
+        // Count check first — fast fail
+        assertBusy(
+            () -> assertHitCount(client(node).prepareSearch(INDEX_NAME).setPreference("_only_local").setSize(0).get(), expected.size()),
+            30,
+            TimeUnit.SECONDS
+        );
+        // Per-doc content check via GET routed to the specific node
+        for (Map.Entry<String, String> e : expected.entrySet()) {
+            GetResponse get = client(node).prepareGet(INDEX_NAME, e.getKey()).setPreference("_only_local").get();
+            assertTrue("Doc " + e.getKey() + " must exist on replica " + node, get.isExists());
+            assertEquals(
+                "Field value mismatch on replica " + node + " for doc " + e.getKey(),
+                e.getValue(),
+                get.getSourceAsMap().get("value")
+            );
+        }
+    }
 
     private void indexDocuments(int count) throws Exception {
         BulkRequest bulkRequest = new BulkRequest();

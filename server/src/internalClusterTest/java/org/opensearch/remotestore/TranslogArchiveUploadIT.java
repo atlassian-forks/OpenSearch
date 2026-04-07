@@ -10,7 +10,10 @@ package org.opensearch.remotestore;
 
 import org.opensearch.action.admin.cluster.remotestore.restore.RestoreRemoteStoreRequest;
 import org.opensearch.action.admin.cluster.remotestore.restore.RestoreRemoteStoreResponse;
+import org.opensearch.action.get.GetResponse;
+import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.PlainActionFuture;
+import org.opensearch.common.UUIDs;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexSettings;
@@ -26,11 +29,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -252,27 +257,210 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
     }
 
     /**
+     * Restore + content verification: index docs with known IDs and field values,
+     * archive-upload, kill primary, restore on different node, verify every doc by ID and content.
+     *
+     * This catches bugs that hitCount alone cannot: wrong-gen recovery, duplicate replay,
+     * or cross-ZIP boundary loss.
+     */
+    public void testRestoreVerifiesDocumentContentNotJustCount() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
+        internalCluster().startDataOnlyNodes(2);
+
+        Settings indexSettings = Settings.builder()
+            .put(remoteStoreIndexSettings(0, 1))
+            .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+            .build();
+        createIndex(INDEX_NAME, indexSettings);
+        ensureGreen(INDEX_NAME);
+
+        // Batch 1: flush → goes to segments, not translog
+        Map<String, String> batch1 = indexKnownDocs(INDEX_NAME, 20);
+        flushAndRefresh(INDEX_NAME);
+
+        // Batch 2: NOT flushed → stays in translog → must be recovered from archive ZIP
+        Map<String, String> batch2 = indexKnownDocs(INDEX_NAME, 20);
+
+        waitForTranslogArchiveUpload();
+
+        // Kill primary — batch2 only exists in the archive ZIP
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNodeName(INDEX_NAME)));
+        ensureRed(INDEX_NAME);
+
+        assertTrue(client().admin().indices().prepareClose(INDEX_NAME).get().isAcknowledged());
+        client().admin()
+            .cluster()
+            .restoreRemoteStore(
+                new RestoreRemoteStoreRequest().indices(INDEX_NAME).restoreAllShards(true).waitForCompletion(true),
+                org.opensearch.action.support.PlainActionFuture.newFuture()
+            )
+            .actionGet();
+        ensureGreen(org.opensearch.common.unit.TimeValue.timeValueSeconds(120), INDEX_NAME);
+
+        // Verify ALL docs by ID and field value — catches count-correct but content-wrong bugs
+        Map<String, String> all = new HashMap<>(batch1);
+        all.putAll(batch2);
+        verifyDocumentContent(INDEX_NAME, all);
+    }
+
+    /**
+     * Same-node restart: primary restarts and must recover its own archive ZIPs from remote.
+     * Verifies the hashNodeId path is correct (same node uploads and downloads its own ZIPs).
+     */
+    public void testSameNodeRestartRecoversFromArchive() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
+        String dataNode = internalCluster().startDataOnlyNode();
+
+        Settings indexSettings = Settings.builder()
+            .put(remoteStoreIndexSettings(0, 1))
+            .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+            .build();
+        createIndex(INDEX_NAME, indexSettings);
+        ensureGreen(INDEX_NAME);
+
+        // Flush batch 1 → segments
+        Map<String, String> batch1 = indexKnownDocs(INDEX_NAME, 15);
+        flushAndRefresh(INDEX_NAME);
+
+        // Batch 2 stays in translog (not flushed) → must come from archive on restart
+        Map<String, String> batch2 = indexKnownDocs(INDEX_NAME, 15);
+        waitForTranslogArchiveUpload();
+
+        // Restart the SAME node (not kill) — node comes back with same nodeId → reads its own hashNodeId dir
+        internalCluster().restartNode(dataNode, new InternalTestCluster.RestartCallback());
+        ensureGreen(org.opensearch.common.unit.TimeValue.timeValueSeconds(120), INDEX_NAME);
+
+        Map<String, String> all = new HashMap<>(batch1);
+        all.putAll(batch2);
+        verifyDocumentContent(INDEX_NAME, all);
+    }
+
+    /**
+     * OFF→ON toggle IT: index with archive OFF, toggle archive ON, index more,
+     * stop primary, restore → both batches must be present.
+     *
+     * Exercises Issue 1 fallback: at restore time, ZIP exists for batch2 but batch1's
+     * ops were uploaded as per-shard tlog files (archive was OFF). Restore must recover all.
+     */
+    public void testRestoreAfterArchiveToggleOffToOn() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
+        internalCluster().startDataOnlyNodes(2);
+
+        // Start with archive OFF
+        Settings indexSettings = Settings.builder()
+            .put(remoteStoreIndexSettings(0, 1))
+            .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), false)
+            .build();
+        createIndex(INDEX_NAME, indexSettings);
+        ensureGreen(INDEX_NAME);
+
+        // Batch 1 with archive OFF — uploaded as per-shard tlog files
+        Map<String, String> batch1 = indexKnownDocs(INDEX_NAME, 20);
+        flushAndRefresh(INDEX_NAME);
+
+        // Toggle archive ON
+        client().admin()
+            .indices()
+            .prepareUpdateSettings(INDEX_NAME)
+            .setSettings(Settings.builder().put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true))
+            .get();
+
+        // Batch 2 with archive ON — uploaded as ZIP
+        Map<String, String> batch2 = indexKnownDocs(INDEX_NAME, 20);
+        waitForTranslogArchiveUpload();
+
+        // Kill primary — batch2 only in ZIP, batch1 only in per-shard tlog
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNodeName(INDEX_NAME)));
+        ensureRed(INDEX_NAME);
+
+        assertTrue(client().admin().indices().prepareClose(INDEX_NAME).get().isAcknowledged());
+        client().admin()
+            .cluster()
+            .restoreRemoteStore(
+                new RestoreRemoteStoreRequest().indices(INDEX_NAME).restoreAllShards(true).waitForCompletion(true),
+                org.opensearch.action.support.PlainActionFuture.newFuture()
+            )
+            .actionGet();
+        ensureGreen(org.opensearch.common.unit.TimeValue.timeValueSeconds(120), INDEX_NAME);
+
+        Map<String, String> all = new HashMap<>(batch1);
+        all.putAll(batch2);
+        verifyDocumentContent(INDEX_NAME, all);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /**
+     * Index {@code count} documents with known IDs and field values.
+     * Returns a map of docId → fieldValue for later content verification.
+     * Uses IMMEDIATE refresh so docs are searchable immediately (no flush needed for count checks).
+     */
+    private Map<String, String> indexKnownDocs(String indexName, int count) {
+        Map<String, String> docs = new HashMap<>();
+        for (int i = 0; i < count; i++) {
+            String id = UUIDs.randomBase64UUID();
+            String value = randomAlphaOfLength(12);
+            client().index(new IndexRequest(indexName).id(id).source("value", value)).actionGet();
+            docs.put(id, value);
+        }
+        return docs;
+    }
+
+    /**
+     * Verify every doc in {@code expected} exists with the correct field value.
+     * Uses assertBusy to tolerate brief post-restore refresh lag.
+     */
+    private void verifyDocumentContent(String indexName, Map<String, String> expected) throws Exception {
+        // Refresh to make all restored docs visible.
+        client().admin().indices().prepareRefresh(indexName).get();
+        // Verify count first — fast fail if obviously wrong.
+        assertBusy(() -> assertHitCount(client().prepareSearch(indexName).setSize(0).get(), expected.size()), 30, TimeUnit.SECONDS);
+        // Verify each doc's content by ID — catches wrong-doc or missing-doc bugs.
+        for (Map.Entry<String, String> e : expected.entrySet()) {
+            GetResponse get = client().prepareGet(indexName, e.getKey()).get();
+            assertTrue("Doc " + e.getKey() + " must exist after restore", get.isExists());
+            assertEquals("Field value mismatch for doc " + e.getKey(), e.getValue(), get.getSourceAsMap().get("value"));
+        }
+    }
+
+    /**
      * Wait until at least one translog archive ZIP appears in the translog repo and has been
      * present for at least 1 second, so the collector has time to include the latest ops.
      * Checks path translog/data/{hashPrefix}/{genBucket}/*.zip.
      */
-    private volatile long firstArchiveSeenTimeNanos = 0L;
-
     private void waitForTranslogArchiveUpload() throws Exception {
-        firstArchiveSeenTimeNanos = 0L;
-        boolean ok = waitUntil(() -> {
-            if (hasArchiveZipUnderRepo(translogRepoPath) == false) {
-                firstArchiveSeenTimeNanos = 0L;
-                return false;
-            }
-            long now = System.nanoTime();
-            if (firstArchiveSeenTimeNanos == 0L) {
-                firstArchiveSeenTimeNanos = now;
-                return false;
-            }
-            return (now - firstArchiveSeenTimeNanos) >= TimeUnit.SECONDS.toNanos(1);
-        }, 30, TimeUnit.SECONDS);
-        assertTrue("expected at least one archive ZIP under translog repo " + translogRepoPath + " (stable for 1s)", ok);
+        // assertBusy polls until at least one ZIP appears — no artificial 1s stability window needed.
+        assertBusy(
+            () -> assertTrue(
+                "expected at least one archive ZIP under translog repo " + translogRepoPath,
+                hasArchiveZipUnderRepo(translogRepoPath)
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
     }
 
     private static boolean hasArchiveZipUnderRepo(Path repoRoot) {
