@@ -117,6 +117,14 @@ public class RemoteFsTimestampAwareTranslog extends RemoteFsTranslog {
             super.trimUnreferencedReaders();
         }
 
+        // When archive upload is enabled, individual translog metadata files are NOT uploaded via
+        // transferSnapshot() — the collector uploads per-shard metadata with archiveBlobPath pointers.
+        // Archive-level retention (ZIP deletion) is handled by TranslogArchiveCollector separately.
+        // Listing and deleting per-shard metadata blobs here is wasteful (1 LIST + N DELETEs per GC cycle).
+        if (indexSettings().isTranslogArchiveUploadEnabled()) {
+            return;
+        }
+
         // Update file tracker to reflect local translog state
         Optional<Long> minLiveGeneration = readers.stream().map(BaseTranslogReader::getGeneration).min(Long::compareTo);
         if (minLiveGeneration.isPresent()) {
@@ -473,6 +481,11 @@ public class RemoteFsTimestampAwareTranslog extends RemoteFsTranslog {
     }
 
     public static void cleanup(TranslogTransferManager translogTransferManager) throws IOException {
+        // Archive upload mode: no per-shard metadata files to clean up.
+        // Archive-level ZIP retention is handled by TranslogArchiveCollector.
+        if (translogTransferManager.isTranslogArchiveUploadEnabled()) {
+            return;
+        }
         ActionListener<List<BlobMetadata>> listMetadataFilesListener = new ActionListener<>() {
             @Override
             public void onResponse(List<BlobMetadata> blobMetadata) {
