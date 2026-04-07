@@ -418,7 +418,13 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             if (blobs == null || blobs.isEmpty()) {
                 break;
             }
-            Instant retentionCutoff = Instant.now().minus(Duration.ofMinutes(RETENTION_SKIP_ZIPS_NEWER_THAN_MINUTES));
+            // Use the minimum effective retention across all shards so we respect the most conservative setting.
+            // This ensures a ZIP is not deleted until ALL shards' configured retention ages have elapsed.
+            long effectiveRetentionMinutes = retentionByShard.values().stream()
+                .mapToLong(ArchiveDeletionHelper.RetentionBounds::getEffectiveRetentionMinutes)
+                .min()
+                .orElse(RETENTION_SKIP_ZIPS_NEWER_THAN_MINUTES);
+            Instant retentionCutoff = Instant.now().minus(Duration.ofMinutes(effectiveRetentionMinutes));
             List<String> toDelete = new ArrayList<>();
             for (BlobMetadata blob : blobs) {
                 String name = blob.name();

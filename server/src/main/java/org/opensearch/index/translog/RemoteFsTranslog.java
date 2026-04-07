@@ -792,7 +792,11 @@ public class RemoteFsTranslog extends Translog {
         if (minGen < 0) {
             minGen = 0;
         }
-        return Optional.of(new ArchiveDeletionHelper.RetentionBounds(minPrimaryTermToKeep, minGen));
+        // Convert configured translog retention age to minutes for archive ZIP time-gate.
+        // If retention age is -1 (disabled/unlimited), pass -1 to use the 60-min legacy default.
+        long retentionAgeMillis = indexSettings().getTranslogRetentionAge().millis();
+        long retentionMinutes = retentionAgeMillis > 0 ? retentionAgeMillis / 60_000L : -1L;
+        return Optional.of(new ArchiveDeletionHelper.RetentionBounds(minPrimaryTermToKeep, minGen, retentionMinutes));
     }
 
     // Visible for testing

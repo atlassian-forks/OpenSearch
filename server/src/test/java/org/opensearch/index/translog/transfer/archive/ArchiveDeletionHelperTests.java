@@ -97,4 +97,43 @@ public class ArchiveDeletionHelperTests extends OpenSearchTestCase {
         assertThat(b.getMinPrimaryTermToKeep(), equalTo(2L));
         assertThat(b.getMinGenerationToKeep(), equalTo(5L));
     }
+
+    // ---- Retention time-gate tests ----
+
+    public void testEffectiveRetentionMinutesDefaultWhenNegative() {
+        // retentionMinutes = -1 (not configured) → legacy default of 60 min
+        ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, -1L);
+        assertThat(b.getEffectiveRetentionMinutes(), equalTo(60L));
+    }
+
+    public void testEffectiveRetentionMinutesUsesConfiguredValue() {
+        // retentionMinutes = 120 → use 120 (above safety floor)
+        ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, 120L);
+        assertThat(b.getEffectiveRetentionMinutes(), equalTo(120L));
+    }
+
+    public void testEffectiveRetentionMinutesEnforcesSafetyFloor() {
+        // retentionMinutes = 1 → below MIN_RETENTION_SAFETY_BUFFER_MINUTES (5), clamped to 5
+        ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, 1L);
+        assertThat(b.getEffectiveRetentionMinutes(), equalTo(ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES));
+    }
+
+    public void testEffectiveRetentionMinutesAtExactSafetyFloor() {
+        // retentionMinutes == MIN_RETENTION_SAFETY_BUFFER_MINUTES → exactly the floor
+        long floor = ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES;
+        ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, floor);
+        assertThat(b.getEffectiveRetentionMinutes(), equalTo(floor));
+    }
+
+    public void testEffectiveRetentionMinutesZeroUsesFloor() {
+        // retentionMinutes = 0 → below floor (0 would mean "delete immediately"), clamped to floor
+        ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, 0L);
+        assertThat(b.getEffectiveRetentionMinutes(), equalTo(ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES));
+    }
+
+    public void testDefaultConstructorUsesLegacyDefault() {
+        // Two-arg constructor (no retentionMinutes) → effective = 60 min legacy default
+        ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L);
+        assertThat(b.getEffectiveRetentionMinutes(), equalTo(60L));
+    }
 }

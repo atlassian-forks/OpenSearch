@@ -25,18 +25,29 @@ public final class ArchiveDeletionHelper {
 
     private ArchiveDeletionHelper() {}
 
+    /** Minimum safety buffer: never delete a ZIP newer than this, regardless of configured retention. */
+    public static final long MIN_RETENTION_SAFETY_BUFFER_MINUTES = 5L;
+
     /**
      * Retention bounds for a shard: do not delete generations >= minGenerationToKeep in this primary term,
      * and do not delete any files from primary terms >= minPrimaryTermToKeep.
+     * retentionMinutes is the configured index.translog.retention.age (in minutes, -1 = use default 60min).
      */
     @ExperimentalApi
     public static final class RetentionBounds {
         private final long minPrimaryTermToKeep;
         private final long minGenerationToKeep;
+        /** Configured retention age in minutes. -1 means use default (60 min). */
+        private final long retentionMinutes;
 
         public RetentionBounds(long minPrimaryTermToKeep, long minGenerationToKeep) {
+            this(minPrimaryTermToKeep, minGenerationToKeep, -1L);
+        }
+
+        public RetentionBounds(long minPrimaryTermToKeep, long minGenerationToKeep, long retentionMinutes) {
             this.minPrimaryTermToKeep = minPrimaryTermToKeep;
             this.minGenerationToKeep = minGenerationToKeep;
+            this.retentionMinutes = retentionMinutes;
         }
 
         public long getMinPrimaryTermToKeep() {
@@ -45,6 +56,17 @@ public final class ArchiveDeletionHelper {
 
         public long getMinGenerationToKeep() {
             return minGenerationToKeep;
+        }
+
+        /**
+         * Returns the effective retention cutoff in minutes: max(configuredRetentionAge, MIN_SAFETY_BUFFER).
+         * If retentionMinutes == -1 (not configured), falls back to 60 minutes.
+         */
+        public long getEffectiveRetentionMinutes() {
+            if (retentionMinutes < 0) {
+                return 60L; // legacy default
+            }
+            return Math.max(retentionMinutes, MIN_RETENTION_SAFETY_BUFFER_MINUTES);
         }
     }
 
