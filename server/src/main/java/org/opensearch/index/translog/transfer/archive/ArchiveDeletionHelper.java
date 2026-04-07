@@ -59,13 +59,11 @@ public final class ArchiveDeletionHelper {
         }
 
         /**
-         * Returns the effective retention cutoff in minutes: max(configuredRetentionAge, MIN_SAFETY_BUFFER).
-         * If retentionMinutes == -1 (not configured), falls back to 60 minutes.
+         * Returns the effective retention cutoff in minutes.
+         * The setting enforces a minimum of 5 minutes at the IndexSettings level, so this is always ≥ 5.
+         * The max() guard is a belt-and-suspenders safety in case retentionMinutes is set directly in tests.
          */
         public long getEffectiveRetentionMinutes() {
-            if (retentionMinutes < 0) {
-                return 60L; // legacy default
-            }
             return Math.max(retentionMinutes, MIN_RETENTION_SAFETY_BUFFER_MINUTES);
         }
     }

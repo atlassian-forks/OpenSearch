@@ -778,6 +778,20 @@ public final class IndexSettings {
     );
 
     /**
+     * Retention age for translog archive ZIPs. ZIPs older than this value are eligible for deletion by the
+     * archive collector GC, provided their generations are also past the shard's min-referenced generation.
+     * Default is 10 minutes — sufficient for the longest practical refresh interval (typically ≤ 1 minute).
+     * Minimum is 5 minutes (safety buffer to avoid deleting a ZIP while a reader is still downloading it).
+     */
+    public static final Setting<TimeValue> INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING = Setting.timeSetting(
+        "index.remote_store.translog.archive_retention",
+        TimeValue.timeValueMinutes(10),
+        TimeValue.timeValueMinutes(5),
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
+    /**
      * When true, segment upload uses per-node archive (ZIP) upload to reduce PUT count; when false, uses existing per-file upload.
      */
     public static final Setting<Boolean> INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING = Setting.boolSetting(
@@ -817,6 +831,7 @@ public final class IndexSettings {
     private volatile String remoteStoreRepository;
     private int remoteTranslogKeepExtraGen;
     private volatile boolean translogArchiveUploadEnabled;
+    private volatile TimeValue translogArchiveRetention;
     private volatile boolean segmentArchiveUploadEnabled;
     private Version extendedCompatibilitySnapshotVersion;
     // volatile fields are updated via #updateIndexMetadata(IndexMetadata) under lock
@@ -1025,6 +1040,7 @@ public final class IndexSettings {
         remoteStoreRepository = settings.get(IndexMetadata.SETTING_REMOTE_SEGMENT_STORE_REPOSITORY);
         this.remoteTranslogKeepExtraGen = INDEX_REMOTE_TRANSLOG_KEEP_EXTRA_GEN_SETTING.get(settings);
         this.translogArchiveUploadEnabled = INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.get(settings);
+        this.translogArchiveRetention = INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.get(settings);
         this.segmentArchiveUploadEnabled = INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING.get(settings);
 
         if (isRemoteSnapshot() && FeatureFlags.isEnabled(SEARCHABLE_SNAPSHOT_EXTENDED_COMPATIBILITY)) {
@@ -1211,6 +1227,10 @@ public final class IndexSettings {
         scopedSettings.addSettingsUpdateConsumer(
             INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING,
             this::setTranslogArchiveUploadEnabled
+        );
+        scopedSettings.addSettingsUpdateConsumer(
+            INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING,
+            this::setTranslogArchiveRetention
         );
         scopedSettings.addSettingsUpdateConsumer(
             INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING,
@@ -1549,6 +1569,14 @@ public final class IndexSettings {
 
     private void setTranslogArchiveUploadEnabled(boolean enabled) {
         this.translogArchiveUploadEnabled = enabled;
+    }
+
+    public TimeValue getTranslogArchiveRetention() {
+        return translogArchiveRetention;
+    }
+
+    private void setTranslogArchiveRetention(TimeValue retention) {
+        this.translogArchiveRetention = retention;
     }
 
     private void setSegmentArchiveUploadEnabled(boolean enabled) {
