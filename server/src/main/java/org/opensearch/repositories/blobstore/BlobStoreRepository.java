@@ -2301,7 +2301,8 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             remoteTranslogTransferTracker,
             remoteStorePathStrategy,
             remoteStoreSettings,
-            indexMetadataEnabled
+            indexMetadataEnabled,
+            false
         );
         try {
             RemoteFsTimestampAwareTranslog.cleanup(translogTransferManager);

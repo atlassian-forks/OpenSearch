@@ -73,6 +73,8 @@ public class TranslogTransferManager {
     private static final int METADATA_FILES_TO_FETCH = 10;
     // Flag to include checkpoint file data as translog file metadata during upload/download
     private final boolean isTranslogMetadataEnabled;
+    // Flag indicating archive upload mode — when true, metadata PUTs are skipped; recovery uses ZIP scan.
+    private final boolean isTranslogArchiveUploadEnabled;
     final static String CHECKPOINT_FILE_DATA_KEY = "ckp-data";
 
     private final Logger logger;
@@ -92,7 +94,8 @@ public class TranslogTransferManager {
         FileTransferTracker fileTransferTracker,
         RemoteTranslogTransferTracker remoteTranslogTransferTracker,
         RemoteStoreSettings remoteStoreSettings,
-        boolean isTranslogMetadataEnabled
+        boolean isTranslogMetadataEnabled,
+        boolean isTranslogArchiveUploadEnabled
     ) {
         this.shardId = shardId;
         this.transferService = transferService;
@@ -104,6 +107,11 @@ public class TranslogTransferManager {
         this.remoteTranslogTransferTracker = remoteTranslogTransferTracker;
         this.remoteStoreSettings = remoteStoreSettings;
         this.isTranslogMetadataEnabled = isTranslogMetadataEnabled;
+        this.isTranslogArchiveUploadEnabled = isTranslogArchiveUploadEnabled;
+    }
+
+    public boolean isTranslogArchiveUploadEnabled() {
+        return isTranslogArchiveUploadEnabled;
     }
 
     public TransferService getTransferService() {

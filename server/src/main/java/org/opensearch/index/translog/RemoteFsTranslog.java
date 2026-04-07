@@ -128,7 +128,8 @@ public class RemoteFsTranslog extends Translog {
             remoteTranslogTransferTracker,
             indexSettings().getRemoteStorePathStrategy(),
             remoteStoreSettings,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            indexSettings().isTranslogArchiveUploadEnabled()
         );
         try {
             if (config.downloadRemoteTranslogOnInit()) {
@@ -187,6 +188,7 @@ public class RemoteFsTranslog extends Translog {
         Logger logger,
         boolean seedRemote,
         boolean isTranslogMetadataEnabled,
+        boolean isTranslogArchiveUploadEnabled,
         long timestamp
     ) throws IOException {
         assert repository instanceof BlobStoreRepository : String.format(
@@ -207,7 +209,8 @@ public class RemoteFsTranslog extends Translog {
             remoteTranslogTransferTracker,
             pathStrategy,
             remoteStoreSettings,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            isTranslogArchiveUploadEnabled
         );
         RemoteFsTranslog.download(translogTransferManager, location, logger, seedRemote, timestamp);
         logger.trace(remoteTranslogTransferTracker.toString());
@@ -253,6 +256,7 @@ public class RemoteFsTranslog extends Translog {
         RemoteTranslogTransferTracker statsTracker = translogTransferManager.getRemoteTranslogTransferTracker();
         long prevDownloadBytesSucceeded = statsTracker.getDownloadBytesSucceeded();
         long prevDownloadTimeInMillis = statsTracker.getTotalDownloadTimeInMillis();
+
         TranslogTransferMetadata translogMetadata = translogTransferManager.readMetadata(timestamp);
         if (translogMetadata != null) {
             if (Files.notExists(location)) {
@@ -264,25 +268,39 @@ public class RemoteFsTranslog extends Translog {
                 Files.delete(file);
             }
 
-            // Check if metadata has archive info (new school-bus model) or legacy per-shard info
+            // Check if metadata has archive info (new school-bus model) or legacy per-shard info.
             String archiveBlobPath = translogMetadata.getArchiveBlobPath();
             Map<String, String> archiveEntryOffsets = translogMetadata.getArchiveEntryOffsets();
 
             if (archiveBlobPath != null && archiveEntryOffsets != null) {
-                // Archive mode with explicit offsets: range-read from ZIP using metadata offsets
+                // Archive mode with explicit offsets: range-read from ZIP using metadata offsets.
                 Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
-                for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
-                    String generation = Long.toString(i);
-                    translogTransferManager.downloadTranslog(
-                        generationToPrimaryTermMapper.get(generation),
-                        generation,
-                        location,
-                        archiveBlobPath,
-                        archiveEntryOffsets
+                try {
+                    for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
+                        String generation = Long.toString(i);
+                        translogTransferManager.downloadTranslog(
+                            generationToPrimaryTermMapper.get(generation),
+                            generation,
+                            location,
+                            archiveBlobPath,
+                            archiveEntryOffsets
+                        );
+                    }
+                } catch (FileNotFoundException | NoSuchFileException e) {
+                    // A generation's entry was not found in the metadata's ZIP — it may live in an
+                    // older ZIP (multi-cycle scenario). Fall back to 8-param ZIP scan with gen range.
+                    logger.info("Archive entry not found in metadata ZIP, falling back to ZIP scan gen=[{}-{}]",
+                        translogMetadata.getMinTranslogGeneration(), translogMetadata.getGeneration());
+                    IOUtils.rm(FileSystemUtils.files(location));
+                    String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
+                    recoverFromArchiveZipWithGenRange(
+                        translogTransferManager, indexUUID, location, logger,
+                        translogMetadata.getMinTranslogGeneration(), translogMetadata.getGeneration()
                     );
                 }
             } else {
-                // Try legacy per-shard download first; fall back to ZIP-based recovery if files not found
+                // No archive offsets — try per-shard download first.
+                // If archive mode is enabled but offsets are missing, fall back to ZIP scan on FileNotFoundException.
                 Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
                 try {
                     for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
@@ -290,19 +308,19 @@ public class RemoteFsTranslog extends Translog {
                         translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
                     }
                 } catch (FileNotFoundException | NoSuchFileException e) {
-                    // Individual translog files not found — likely coordinator (school bus) mode
-                    // where only ZIPs were uploaded. Fall back to archive recovery.
-                    logger.info("Per-shard translog files not found, falling back to archive ZIP recovery");
-                    TranslogArchiveRecovery.recover(
-                        translogTransferManager.getTransferService(),
-                        translogTransferManager.getArchiveBasePath(),
-                        translogTransferManager.getShardId().getIndex().getUUID(),
-                        translogTransferManager.getShardId().id(),
-                        translogMetadata.getMinTranslogGeneration(),
-                        translogMetadata.getGeneration(),
-                        location,
-                        org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-                    );
+                    if (translogTransferManager.isTranslogArchiveUploadEnabled()) {
+                        // Per-shard files not found — archive mode, fall back to ZIP range-read.
+                        logger.info("Per-shard files not found in archive mode, falling back to ZIP scan gen=[{}-{}]",
+                            translogMetadata.getMinTranslogGeneration(), translogMetadata.getGeneration());
+                        IOUtils.rm(FileSystemUtils.files(location));
+                        String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
+                        recoverFromArchiveZipWithGenRange(
+                            translogTransferManager, indexUUID, location, logger,
+                            translogMetadata.getMinTranslogGeneration(), translogMetadata.getGeneration()
+                        );
+                    } else {
+                        throw e;
+                    }
                 }
             }
 
@@ -314,64 +332,28 @@ public class RemoteFsTranslog extends Translog {
 
             statsTracker.recordDownloadStats(prevDownloadBytesSucceeded, prevDownloadTimeInMillis);
 
-            // We copy the latest generation .ckp file to translog.ckp so that flows that depend on
-            // existence of translog.ckp file work in the same way
-            Files.copy(
-                location.resolve(Translog.getCommitCheckpointFileName(translogMetadata.getGeneration())),
-                location.resolve(Translog.CHECKPOINT_FILE_NAME)
-            );
-        } else {
-            // No per-shard metadata found. Per the archive design (school bus model),
-            // metadata is embedded in ZIP comments — no separate metadata files are uploaded.
-            // Attempt archive recovery via binary search on ZIP blob names.
-            String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
-            TranslogArchiveBatchCoordinator coordinator = TranslogArchiveBatchCoordinator.get(indexUUID);
-            boolean archiveRecovered = false;
-            if (coordinator != null && seedRemote == false) {
-                logger.info("No per-shard metadata found, attempting archive ZIP recovery (coordinator mode)");
-                // Use a sibling temporary directory for archive recovery to avoid destroying local
-                // translog files if no archive ZIPs are found (fresh shard case).
-                // Must be a sibling (not child) of location to avoid interference with FileSystemUtils.files().
-                Path tempRecoveryDir = location.resolveSibling("translog_archive_recovery_tmp");
-                if (Files.exists(tempRecoveryDir)) {
-                    IOUtils.rm(tempRecoveryDir);
+            // Copy latest generation .ckp to translog.ckp for flows that depend on its existence.
+            // recoverFromArchiveZipWithGenRange copies it internally; for direct downloads, do it here.
+            Path commitCkpForCopy = location.resolve(Translog.getCommitCheckpointFileName(translogMetadata.getGeneration()));
+            if (Files.exists(commitCkpForCopy)) {
+                Path destCkp = location.resolve(Translog.CHECKPOINT_FILE_NAME);
+                if (Files.exists(destCkp)) {
+                    Files.delete(destCkp);
                 }
-                Files.createDirectories(tempRecoveryDir);
-                try {
-                    TranslogArchiveRecovery.recover(
-                        translogTransferManager.getTransferService(),
-                        translogTransferManager.getArchiveBasePath(),
-                        indexUUID,
-                        translogTransferManager.getShardId().id(),
-                        tempRecoveryDir,
-                        org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-                    );
-                    // If archive recovery found and downloaded files, translog.ckp will exist in temp dir.
-                    if (FileSystemUtils.exists(tempRecoveryDir.resolve(CHECKPOINT_FILE_NAME))) {
-                        // Archive ZIPs found and recovered — move files to actual location.
-                        if (Files.notExists(location)) {
-                            Files.createDirectories(location);
-                        }
-                        for (Path file : FileSystemUtils.files(location)) {
-                            Files.delete(file);
-                        }
-                        for (Path recoveredFile : FileSystemUtils.files(tempRecoveryDir)) {
-                            Files.move(recoveredFile, location.resolve(recoveredFile.getFileName().toString()));
-                        }
-                        archiveRecovered = true;
-                        statsTracker.recordDownloadStats(prevDownloadBytesSucceeded, prevDownloadTimeInMillis);
-                    } else {
-                        logger.info("No archive ZIPs found (fresh shard), falling through to legacy translog handling");
-                    }
-                } finally {
-                    IOUtils.rm(tempRecoveryDir);
-                }
+                Files.copy(commitCkpForCopy, destCkp);
             }
-            if (archiveRecovered == false) {
-                // Legacy: no translog files uploaded to remote store, or no coordinator active,
-                // or archive recovery found no ZIPs (fresh shard).
-                // If local filesystem contains empty translog or no translog, we don't do anything.
-                // If local filesystem contains non-empty translog, we clean up these files and create empty translog.
+        } else {
+            // No metadata found.
+            // Use the settings flag (not in-memory coordinator registry) to decide between
+            // archive ZIP scan and legacy local-cleanup. The flag is reliable at recovery time
+            // (before coordinator re-registers after node restart), unlike the registry.
+            if (translogTransferManager.isTranslogArchiveUploadEnabled() && seedRemote == false) {
+                logger.info("Archive enabled, no metadata found: attempting ZIP scan recovery");
+                String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
+                recoverFromArchiveZip(translogTransferManager, indexUUID, location, seedRemote, logger, statsTracker,
+                    prevDownloadBytesSucceeded, prevDownloadTimeInMillis);
+            } else {
+                // No metadata and archive disabled (or seedRemote): fresh/empty shard path.
                 logger.debug("No translog files found on remote, checking local filesystem for cleanup");
                 if (FileSystemUtils.exists(location.resolve(CHECKPOINT_FILE_NAME))) {
                     final Checkpoint checkpoint = readCheckpoint(location);
@@ -396,6 +378,101 @@ public class RemoteFsTranslog extends Translog {
             && checkpoint.numOps == 0;
     }
 
+    /**
+     * Archive ZIP recovery with explicit generation range (when metadata provides minGen/maxGen).
+     * Uses the 8-param {@link TranslogArchiveRecovery#recover} to avoid scanning all ZIPs.
+     * Writes files directly to {@code location} (not via temp dir).
+     */
+    private static void recoverFromArchiveZipWithGenRange(
+        TranslogTransferManager translogTransferManager,
+        String indexUUID,
+        Path location,
+        Logger logger,
+        long minGeneration,
+        long maxGeneration
+    ) throws IOException {
+        if (Files.notExists(location)) {
+            Files.createDirectories(location);
+        }
+        for (Path file : FileSystemUtils.files(location)) {
+            Files.delete(file);
+        }
+        TranslogArchiveRecovery.recover(
+            translogTransferManager.getTransferService(),
+            translogTransferManager.getArchiveBasePath(),
+            indexUUID,
+            translogTransferManager.getShardId().id(),
+            minGeneration,
+            maxGeneration,
+            location,
+            org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+        );
+        logger.info("ZIP gen-range recovery complete for shard {} gen=[{}-{}]",
+            translogTransferManager.getShardId(), minGeneration, maxGeneration);
+    }
+
+    /**
+     * Attempts recovery from archive ZIPs via {@link TranslogArchiveRecovery}.
+     * Uses a sibling temp directory to avoid destroying local translog files if no ZIPs are found (fresh shard).
+     * On success, moves recovered files into {@code location} and records download stats.
+     * On fresh shard (no ZIPs), falls through to local cleanup (create empty translog if needed).
+     */
+    private static void recoverFromArchiveZip(
+        TranslogTransferManager translogTransferManager,
+        String indexUUID,
+        Path location,
+        boolean seedRemote,
+        Logger logger,
+        RemoteTranslogTransferTracker statsTracker,
+        long prevDownloadBytesSucceeded,
+        long prevDownloadTimeInMillis
+    ) throws IOException {
+        Path tempRecoveryDir = location.resolveSibling("translog_archive_recovery_tmp");
+        if (Files.exists(tempRecoveryDir)) {
+            IOUtils.rm(tempRecoveryDir);
+        }
+        Files.createDirectories(tempRecoveryDir);
+        try {
+            TranslogArchiveRecovery.recover(
+                translogTransferManager.getTransferService(),
+                translogTransferManager.getArchiveBasePath(),
+                indexUUID,
+                translogTransferManager.getShardId().id(),
+                tempRecoveryDir,
+                org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+            );
+            if (FileSystemUtils.exists(tempRecoveryDir.resolve(CHECKPOINT_FILE_NAME))) {
+                if (Files.notExists(location)) {
+                    Files.createDirectories(location);
+                }
+                for (Path file : FileSystemUtils.files(location)) {
+                    Files.delete(file);
+                }
+                for (Path recoveredFile : FileSystemUtils.files(tempRecoveryDir)) {
+                    Files.move(recoveredFile, location.resolve(recoveredFile.getFileName().toString()));
+                }
+                statsTracker.recordDownloadStats(prevDownloadBytesSucceeded, prevDownloadTimeInMillis);
+                logger.info("ZIP-first recovery succeeded for shard {}", translogTransferManager.getShardId());
+            } else {
+                // No ZIPs found — fresh shard: apply local cleanup if needed (same as legacy no-metadata path)
+                logger.info("No archive ZIPs found (fresh shard), checking local filesystem for cleanup");
+                if (FileSystemUtils.exists(location.resolve(CHECKPOINT_FILE_NAME))) {
+                    final Checkpoint checkpoint = readCheckpoint(location);
+                    if (seedRemote) {
+                        logger.debug("Remote migration ongoing. Retaining the translog on local, skipping clean-up");
+                    } else if (isEmptyTranslog(checkpoint) == false) {
+                        logger.debug("Translog files exist on local without any remote archive, cleaning up these files");
+                        Translog.createEmptyTranslog(location, translogTransferManager.getShardId(), checkpoint);
+                    } else {
+                        logger.debug("Empty translog on local, skipping clean-up");
+                    }
+                }
+            }
+        } finally {
+            IOUtils.rm(tempRecoveryDir);
+        }
+    }
+
     public static TranslogTransferManager buildTranslogTransferManager(
         BlobStoreRepository blobStoreRepository,
         ThreadPool threadPool,
@@ -404,7 +481,8 @@ public class RemoteFsTranslog extends Translog {
         RemoteTranslogTransferTracker tracker,
         RemoteStorePathStrategy pathStrategy,
         RemoteStoreSettings remoteStoreSettings,
-        boolean isTranslogMetadataEnabled
+        boolean isTranslogMetadataEnabled,
+        boolean isTranslogArchiveUploadEnabled
     ) {
         assert Objects.nonNull(pathStrategy);
         String indexUUID = shardId.getIndex().getUUID();
@@ -437,7 +515,8 @@ public class RemoteFsTranslog extends Translog {
             fileTransferTracker,
             tracker,
             remoteStoreSettings,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            isTranslogArchiveUploadEnabled
         );
     }
 
@@ -742,8 +821,14 @@ public class RemoteFsTranslog extends Translog {
      */
     public boolean syncNeeded() {
         try (ReleasableLock lock = readLock.acquire()) {
-            return current.syncNeeded()
-                || (maxRemoteTranslogGenerationUploaded + 1 < this.currentFileGeneration() && current.totalOperations() == 0);
+            if (current.syncNeeded()) {
+                return true;
+            }
+            // In archive mode an empty generation has no translog data to ZIP — skip to avoid wasted PUT requests.
+            if (indexSettings().isTranslogArchiveUploadEnabled()) {
+                return false;
+            }
+            return maxRemoteTranslogGenerationUploaded + 1 < this.currentFileGeneration() && current.totalOperations() == 0;
         }
     }
 
@@ -913,7 +998,8 @@ public class RemoteFsTranslog extends Translog {
             remoteTranslogTransferTracker,
             pathStrategy,
             remoteStoreSettings,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            false
         );
         // clean up all remote translog files
         translogTransferManager.deleteTranslogFiles();

@@ -119,7 +119,8 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            false
         );
 
         delayForBlobDownload = 1;
@@ -187,7 +188,8 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             fileTransferTracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            false
         );
 
         assertTrue(translogTransferManager.transferSnapshot(createTransferSnapshot(), new TranslogTransferListener() {
@@ -241,7 +243,8 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             fileTransferTracker,
             remoteTranslogTransferTracker,
             remoteStoreSettings,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            false
         );
         SetOnce<Exception> exception = new SetOnce<>();
         translogTransferManager.transferSnapshot(createTransferSnapshot(), new TranslogTransferListener() {
@@ -286,7 +289,8 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             fileTransferTracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            false
         );
         SetOnce<Exception> exception = new SetOnce<>();
 
@@ -527,7 +531,8 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            false
         );
         String translogFile = "translog-19.tlog", checkpointFile = "translog-19.ckp";
         tracker.add(translogFile, true);
@@ -594,7 +599,8 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            false
         );
         String translogFile = "translog-19.tlog", checkpointFile = "translog-19.ckp";
         tracker.add(translogFile, true);
@@ -704,7 +710,8 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             fileTransferTracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            false
         );
 
         assertTrue(translogTransferManager.transferSnapshot(createTransferSnapshot(), new TranslogTransferListener() {
@@ -736,7 +743,8 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
-            isTranslogMetadataEnabled
+            isTranslogMetadataEnabled,
+            false
         );
         Path location = createTempDir();
         assertFalse(Files.exists(location.resolve("translog-23.tlog")));
@@ -919,7 +927,8 @@ public class TranslogTransferManagerTests extends OpenSearchTestCase {
             tracker,
             remoteTranslogTransferTracker,
             DefaultRemoteStoreSettings.INSTANCE,
-            true
+            true,
+            false
         );
 
         TranslogReader reader1 = mock(TranslogReader.class);

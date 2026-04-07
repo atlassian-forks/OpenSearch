@@ -5070,6 +5070,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         boolean isTranslogMetadataEnabled,
         long timestamp
     ) throws IOException {
+        boolean isTranslogArchiveUploadEnabled = indexSettings.isTranslogArchiveUploadEnabled();
         RemoteFsTranslog.download(
             repository,
             shardId,
@@ -5080,6 +5081,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             logger,
             shouldSeedRemoteStore(),
             isTranslogMetadataEnabled,
+            isTranslogArchiveUploadEnabled,
             timestamp
         );
     }
