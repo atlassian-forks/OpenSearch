@@ -523,7 +523,9 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      */
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
-        // Check if this file can be downloaded from an archive via range-read
+        // Check if this file can be downloaded from an archive via range-read.
+        // If the archive blob read fails (e.g. blob GC'd, transient error), fall through
+        // to the per-file download path rather than propagating the exception.
         if (currentArchiveBlobName != null && currentArchiveEntries != null && currentArchiveEntries.containsKey(name)) {
             SegmentArchiveEntry archiveEntry = currentArchiveEntries.get(name);
             logger.trace(
@@ -539,10 +541,22 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             ) {
                 byte[] fileBytes = archiveStream.readAllBytes();
                 return new ByteArrayIndexInput(name, fileBytes);
+            } catch (IOException e) {
+                // Archive read failed — fall back to per-file download.
+                // This can happen if the archive blob was GC'd while metadata still references it,
+                // or due to a transient remote store error.
+                logger.warn(
+                    "Failed to read {} from archive blob {} (offset={} length={}), falling back to per-file download: {}",
+                    name,
+                    currentArchiveBlobName,
+                    archiveEntry.getOffset(),
+                    archiveEntry.getLength(),
+                    e.getMessage()
+                );
             }
         }
 
-        // Fall back to per-file download
+        // Per-file download path (also serves as fallback from failed archive read).
         String remoteFilename = getExistingRemoteFilename(name);
         long fileLength = fileLength(name);
         if (remoteFilename != null) {

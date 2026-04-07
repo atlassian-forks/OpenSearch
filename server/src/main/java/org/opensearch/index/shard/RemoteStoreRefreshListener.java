@@ -432,6 +432,13 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         } else {
             long translogFileGeneration = translogGeneration.translogFileGeneration;
             if (indexShard.indexSettings().isSegmentArchiveUploadEnabled() && lastArchiveBlobName != null && lastArchiveEntries != null) {
+                // Snapshot archive state before upload — clear it unconditionally (success OR failure)
+                // to prevent stale archive references on the next refresh cycle.
+                // If metadata upload fails here, the next refresh will re-upload segments as a new archive.
+                String archiveBlobName = this.lastArchiveBlobName;
+                Map<String, SegmentArchiveEntry> archiveEntries = this.lastArchiveEntries;
+                this.lastArchiveBlobName = null;
+                this.lastArchiveEntries = null;
                 // Upload metadata with archive fields
                 remoteDirectory.uploadMetadata(
                     localSegmentsPostRefresh,
@@ -440,12 +447,9 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                     translogFileGeneration,
                     replicationCheckpoint,
                     indexShard.getNodeId(),
-                    lastArchiveBlobName,
-                    lastArchiveEntries
+                    archiveBlobName,
+                    archiveEntries
                 );
-                // Clear archive state after metadata upload
-                this.lastArchiveBlobName = null;
-                this.lastArchiveEntries = null;
             } else {
                 remoteDirectory.uploadMetadata(
                     localSegmentsPostRefresh,
