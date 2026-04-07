@@ -1228,10 +1228,7 @@ public final class IndexSettings {
             INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING,
             this::setTranslogArchiveUploadEnabled
         );
-        scopedSettings.addSettingsUpdateConsumer(
-            INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING,
-            this::setTranslogArchiveRetention
-        );
+        scopedSettings.addSettingsUpdateConsumer(INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING, this::setTranslogArchiveRetention);
         scopedSettings.addSettingsUpdateConsumer(
             INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING,
             this::setSegmentArchiveUploadEnabled

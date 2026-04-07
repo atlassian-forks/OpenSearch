@@ -8,12 +8,9 @@
 
 package org.opensearch.index.store.remote.segment.archive;
 
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.opensearch.common.blobstore.BlobContainer;
-import org.opensearch.common.blobstore.BlobMetadata;
-import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.common.blobstore.BlobStore;
+import org.apache.lucene.store.IndexOutput;
 import org.opensearch.index.store.remote.metadata.SegmentArchiveEntry;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.Before;
@@ -23,14 +20,12 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
-
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.greaterThan;
 
 /**
  * Component integration test for segment archive upload/download:
@@ -53,7 +48,7 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
     private static final Map<String, byte[]> SEGMENT_FILES = new HashMap<>();
 
     static {
-        SEGMENT_FILES.put("_0.si",  "segment info content for _0".getBytes(StandardCharsets.UTF_8));
+        SEGMENT_FILES.put("_0.si", "segment info content for _0".getBytes(StandardCharsets.UTF_8));
         SEGMENT_FILES.put("_0.cfs", "compound file set content".getBytes(StandardCharsets.UTF_8));
         SEGMENT_FILES.put("_0.cfe", "compound file entries content".getBytes(StandardCharsets.UTF_8));
         SEGMENT_FILES.put("segments_1", "segments file content".getBytes(StandardCharsets.UTF_8));
@@ -79,7 +74,8 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
      */
     public void testArchiveBuildAndRangeReadRoundTrip() throws IOException {
         // Build archive entries.
-        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet().stream()
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet()
+            .stream()
             .map(e -> SegmentArchiveBuilder.fromBytes(e.getKey(), e.getValue()))
             .collect(java.util.stream.Collectors.toList());
 
@@ -92,12 +88,16 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
         blobContainer.writeBlob(archiveBlobName, new ByteArrayInputStream(archiveBytes), archiveBytes.length, true);
 
         assertEquals("Archive upload: exactly 1 PUT", 1, blobContainer.putCount());
-        assertEquals("Archive upload: 0 LISTs",       0, blobContainer.listCount());
-        assertEquals("Archive upload: 0 DELETEs",     0, blobContainer.deleteCount());
+        assertEquals("Archive upload: 0 LISTs", 0, blobContainer.listCount());
+        assertEquals("Archive upload: 0 DELETEs", 0, blobContainer.deleteCount());
 
-        logger.info("Archive-ON upload — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
-            blobContainer.putCount(), blobContainer.getCount(),
-            blobContainer.listCount(), blobContainer.deleteCount());
+        logger.info(
+            "Archive-ON upload — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
+            blobContainer.putCount(),
+            blobContainer.getCount(),
+            blobContainer.listCount(),
+            blobContainer.deleteCount()
+        );
 
         blobContainer.reset();
 
@@ -110,26 +110,25 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
             assertNotNull("Archive entry must exist for " + name, entry);
 
             // Simulate openInput() range-read: readBlob(archiveBlobName, offset, length)
-            try (InputStream rangeStream = blobContainer.readBlob(
-                archiveBlobName, entry.getOffset(), entry.getLength())) {
+            try (InputStream rangeStream = blobContainer.readBlob(archiveBlobName, entry.getOffset(), entry.getLength())) {
                 byte[] recovered = rangeStream.readAllBytes();
-                assertArrayEquals(
-                    "Range-read content mismatch for " + name,
-                    expectedContent, recovered
-                );
+                assertArrayEquals("Range-read content mismatch for " + name, expectedContent, recovered);
             }
         }
 
         // Each file: 1 range GET — total N GETs for N files.
-        assertEquals("Recovery: 1 GET per file = " + SEGMENT_FILES.size() + " GETs",
-            SEGMENT_FILES.size(), blobContainer.getCount());
-        assertEquals("Recovery: 0 PUTs",   0, blobContainer.putCount());
-        assertEquals("Recovery: 0 LISTs",  0, blobContainer.listCount());
-        assertEquals("Recovery: 0 DELETEs",0, blobContainer.deleteCount());
+        assertEquals("Recovery: 1 GET per file = " + SEGMENT_FILES.size() + " GETs", SEGMENT_FILES.size(), blobContainer.getCount());
+        assertEquals("Recovery: 0 PUTs", 0, blobContainer.putCount());
+        assertEquals("Recovery: 0 LISTs", 0, blobContainer.listCount());
+        assertEquals("Recovery: 0 DELETEs", 0, blobContainer.deleteCount());
 
-        logger.info("Archive-ON recovery — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
-            blobContainer.putCount(), blobContainer.getCount(),
-            blobContainer.listCount(), blobContainer.deleteCount());
+        logger.info(
+            "Archive-ON recovery — PUTs={}, GETs={}, LISTs={}, DELETEs={}",
+            blobContainer.putCount(),
+            blobContainer.getCount(),
+            blobContainer.listCount(),
+            blobContainer.deleteCount()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -144,7 +143,8 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
         int fileCount = SEGMENT_FILES.size();
 
         // --- Archive-ON: build ZIP, 1 PUT ---
-        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet().stream()
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet()
+            .stream()
             .map(e -> SegmentArchiveBuilder.fromBytes(e.getKey(), e.getValue()))
             .collect(java.util.stream.Collectors.toList());
         ByteArrayOutputStream archiveOut = new ByteArrayOutputStream();
@@ -169,10 +169,8 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
 
         logger.info("Archive-OFF upload ({} files) — PUTs={}", fileCount, archiveOffPuts);
 
-        assertTrue("Archive-ON PUTs (" + archiveOnPuts + ") < archive-OFF PUTs (" + archiveOffPuts + ")",
-            archiveOnPuts < archiveOffPuts);
-        assertEquals("Archive-ON saves " + (fileCount - 1) + " PUTs vs archive-OFF",
-            fileCount - 1, archiveOffPuts - archiveOnPuts);
+        assertTrue("Archive-ON PUTs (" + archiveOnPuts + ") < archive-OFF PUTs (" + archiveOffPuts + ")", archiveOnPuts < archiveOffPuts);
+        assertEquals("Archive-ON saves " + (fileCount - 1) + " PUTs vs archive-OFF", fileCount - 1, archiveOffPuts - archiveOnPuts);
     }
 
     // -----------------------------------------------------------------------
@@ -189,7 +187,8 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
         int fileCount = SEGMENT_FILES.size();
 
         // --- Archive-ON: build ZIP ---
-        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet().stream()
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet()
+            .stream()
             .map(e -> SegmentArchiveBuilder.fromBytes(e.getKey(), e.getValue()))
             .collect(java.util.stream.Collectors.toList());
         ByteArrayOutputStream archiveOut = new ByteArrayOutputStream();
@@ -232,7 +231,7 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
 
     // -----------------------------------------------------------------------
     // 4. openInput() fallback: archive blob read fails → per-file fallback
-    //    (verifies Bug 1 fix: IOException from readBlob falls through to per-file path)
+    // (verifies Bug 1 fix: IOException from readBlob falls through to per-file path)
     // -----------------------------------------------------------------------
 
     /**
@@ -282,8 +281,7 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
         String perFileBlobName
     ) throws IOException {
         // Try archive range-read first.
-        try (InputStream archiveStream = container.readBlob(archiveBlobName,
-            archiveEntry.getOffset(), archiveEntry.getLength())) {
+        try (InputStream archiveStream = container.readBlob(archiveBlobName, archiveEntry.getOffset(), archiveEntry.getLength())) {
             return archiveStream.readAllBytes();
         } catch (IOException e) {
             logger.warn("Archive read failed for {}, falling back to per-file: {}", name, e.getMessage());
@@ -304,7 +302,8 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
      * produce exactly the original file bytes when used for byte-range reads on the raw archive.
      */
     public void testOffsetAccuracyForEachFile() throws IOException {
-        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet().stream()
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet()
+            .stream()
             .map(e -> SegmentArchiveBuilder.fromBytes(e.getKey(), e.getValue()))
             .collect(java.util.stream.Collectors.toList());
 
@@ -320,16 +319,16 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
 
             // Direct byte-range extraction from raw ZIP bytes.
             int start = (int) entry.getOffset();
-            int end   = start + (int) entry.getLength();
-            assertTrue("Offset " + start + " must be within archive (" + archiveBytes.length + " bytes)",
-                start >= 0 && end <= archiveBytes.length);
+            int end = start + (int) entry.getLength();
+            assertTrue(
+                "Offset " + start + " must be within archive (" + archiveBytes.length + " bytes)",
+                start >= 0 && end <= archiveBytes.length
+            );
 
             byte[] rangeBytes = Arrays.copyOfRange(archiveBytes, start, end);
-            assertArrayEquals("Offset-based extraction must match original for " + name,
-                expectedContent, rangeBytes);
+            assertArrayEquals("Offset-based extraction must match original for " + name, expectedContent, rangeBytes);
 
-            assertEquals("Recorded length must equal actual content length for " + name,
-                expectedContent.length, (int) entry.getLength());
+            assertEquals("Recorded length must equal actual content length for " + name, expectedContent.length, (int) entry.getLength());
         }
     }
 
@@ -347,7 +346,8 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
         int fileCount = SEGMENT_FILES.size(); // 4 files
 
         // --- Archive-ON: 1 ZIP upload + N range-read recoveries ---
-        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet().stream()
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet()
+            .stream()
             .map(e -> SegmentArchiveBuilder.fromBytes(e.getKey(), e.getValue()))
             .collect(java.util.stream.Collectors.toList());
         ByteArrayOutputStream archiveOut = new ByteArrayOutputStream();
@@ -360,12 +360,17 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
                 is.readAllBytes();
             }
         }
-        int archiveOnTotal = blobContainer.putCount() + blobContainer.getCount()
-            + blobContainer.listCount() + blobContainer.deleteCount();
+        int archiveOnTotal = blobContainer.putCount() + blobContainer.getCount() + blobContainer.listCount() + blobContainer.deleteCount();
 
-        logger.info("Archive-ON ({} files) — PUTs={}, GETs={}, LISTs={}, DELETEs={}, TOTAL={}",
-            fileCount, blobContainer.putCount(), blobContainer.getCount(),
-            blobContainer.listCount(), blobContainer.deleteCount(), archiveOnTotal);
+        logger.info(
+            "Archive-ON ({} files) — PUTs={}, GETs={}, LISTs={}, DELETEs={}, TOTAL={}",
+            fileCount,
+            blobContainer.putCount(),
+            blobContainer.getCount(),
+            blobContainer.listCount(),
+            blobContainer.deleteCount(),
+            archiveOnTotal
+        );
 
         assertEquals("Archive-ON PUTs: 1 (the ZIP)", 1, blobContainer.putCount());
         assertEquals("Archive-ON GETs: " + fileCount + " (range-reads)", fileCount, blobContainer.getCount());
@@ -383,21 +388,27 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
                 is.readAllBytes();
             }
         }
-        int archiveOffTotal = blobContainer.putCount() + blobContainer.getCount()
-            + blobContainer.listCount() + blobContainer.deleteCount();
+        int archiveOffTotal = blobContainer.putCount() + blobContainer.getCount() + blobContainer.listCount() + blobContainer.deleteCount();
 
-        logger.info("Archive-OFF ({} files) — PUTs={}, GETs={}, LISTs={}, DELETEs={}, TOTAL={}",
-            fileCount, blobContainer.putCount(), blobContainer.getCount(),
-            blobContainer.listCount(), blobContainer.deleteCount(), archiveOffTotal);
+        logger.info(
+            "Archive-OFF ({} files) — PUTs={}, GETs={}, LISTs={}, DELETEs={}, TOTAL={}",
+            fileCount,
+            blobContainer.putCount(),
+            blobContainer.getCount(),
+            blobContainer.listCount(),
+            blobContainer.deleteCount(),
+            archiveOffTotal
+        );
 
         assertEquals("Archive-OFF PUTs: " + fileCount, fileCount, blobContainer.putCount());
         assertEquals("Archive-OFF GETs: " + fileCount, fileCount, blobContainer.getCount());
         assertEquals("Archive-OFF total: " + (fileCount * 2), fileCount * 2, archiveOffTotal);
 
-        assertTrue("Archive-ON total ops (" + archiveOnTotal + ") < archive-OFF (" + archiveOffTotal + ")",
-            archiveOnTotal < archiveOffTotal);
-        assertEquals("Archive-ON saves " + (fileCount - 1) + " blob ops vs archive-OFF",
-            fileCount - 1, archiveOffTotal - archiveOnTotal);
+        assertTrue(
+            "Archive-ON total ops (" + archiveOnTotal + ") < archive-OFF (" + archiveOffTotal + ")",
+            archiveOnTotal < archiveOffTotal
+        );
+        assertEquals("Archive-ON saves " + (fileCount - 1) + " blob ops vs archive-OFF", fileCount - 1, archiveOffTotal - archiveOnTotal);
     }
 
     // -----------------------------------------------------------------------
@@ -419,9 +430,7 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
         String fileName = "_0.si";
 
         // ZIP_B: current valid archive on remote
-        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = List.of(
-            SegmentArchiveBuilder.fromBytes(fileName, content)
-        );
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = List.of(SegmentArchiveBuilder.fromBytes(fileName, content));
         ByteArrayOutputStream archiveOut = new ByteArrayOutputStream();
         Map<String, SegmentArchiveEntry> freshEntries = SegmentArchiveBuilder.buildAndExtractOffsets(archiveOut, entries);
         byte[] freshArchiveBytes = archiveOut.toByteArray();
@@ -429,17 +438,13 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
 
         // Simulate: stale archive read fails, fresh archive read succeeds.
         // Verify: content from ZIP_B is returned correctly.
-        StaleArchiveBlobContainer container = new StaleArchiveBlobContainer(
-            freshArchiveName, freshArchiveBytes
-        );
+        StaleArchiveBlobContainer container = new StaleArchiveBlobContainer(freshArchiveName, freshArchiveBytes);
 
         // Simulate openInput() with metadata-refresh logic (as fixed in RemoteSegmentStoreDirectory):
         String staleArchiveName = "segment_archive_old_zip_a.zip";
         SegmentArchiveEntry staleEntry = new SegmentArchiveEntry(fileName, 30L, content.length, 0L);
 
-        byte[] recovered = openInputWithMetadataRefresh(
-            container, fileName, staleArchiveName, staleEntry, freshArchiveName, freshEntries
-        );
+        byte[] recovered = openInputWithMetadataRefresh(container, fileName, staleArchiveName, staleEntry, freshArchiveName, freshEntries);
 
         assertArrayEquals("Metadata-refresh: content from fresh ZIP_B must match original", content, recovered);
         assertTrue("Stale archive read was attempted", container.staleReadAttempted());
@@ -478,7 +483,8 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
      */
     public void testInitializeToSpecificCommitSetsArchiveFields() throws IOException {
         // Build an archive and its entries (simulates what was uploaded at a specific commit).
-        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet().stream()
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> entries = SEGMENT_FILES.entrySet()
+            .stream()
             .map(e -> SegmentArchiveBuilder.fromBytes(e.getKey(), e.getValue()))
             .collect(java.util.stream.Collectors.toList());
         ByteArrayOutputStream archiveOut = new ByteArrayOutputStream();
@@ -504,19 +510,20 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
             // This is what openInput() does with correctly-set currentArchiveBlobName:
             assertTrue("File must be in archive entries", simulatedCurrentArchiveEntries.containsKey(name));
             SegmentArchiveEntry entry = simulatedCurrentArchiveEntries.get(name);
-            try (InputStream rangeStream = blobContainer.readBlob(
-                    simulatedCurrentArchiveBlobName, entry.getOffset(), entry.getLength())) {
+            try (InputStream rangeStream = blobContainer.readBlob(simulatedCurrentArchiveBlobName, entry.getOffset(), entry.getLength())) {
                 byte[] recovered = rangeStream.readAllBytes();
-                assertArrayEquals("initializeToSpecificCommit: range-read must return correct content for " + name,
-                    expectedContent, recovered);
+                assertArrayEquals(
+                    "initializeToSpecificCommit: range-read must return correct content for " + name,
+                    expectedContent,
+                    recovered
+                );
             }
         }
 
         // All reads are range-reads (not full ZIP reads).
         assertEquals("All reads are range GETs: " + SEGMENT_FILES.size(), SEGMENT_FILES.size(), blobContainer.getCount());
 
-        logger.info("initializeToSpecificCommit archive field population verified: {} files, all via range-read",
-            SEGMENT_FILES.size());
+        logger.info("initializeToSpecificCommit archive field population verified: {} files, all via range-read", SEGMENT_FILES.size());
     }
 
     // Helpers for metadata-refresh and flag-toggle tests
@@ -545,11 +552,8 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
         throw new java.io.FileNotFoundException(name + " not in fresh archive");
     }
 
-    private byte[] openInputWithFlagToggleFallback(
-        FlagToggledBlobContainer container,
-        String name,
-        String perFileBlobName
-    ) throws IOException {
+    private byte[] openInputWithFlagToggleFallback(FlagToggledBlobContainer container, String name, String perFileBlobName)
+        throws IOException {
         // Step 1: Try archive read (stale reference, flag now OFF).
         try (InputStream s = container.readBlob("segment_archive_old.zip", 30L, 100L)) {
             return s.readAllBytes();
@@ -563,6 +567,87 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
     }
 
     // -----------------------------------------------------------------------
+    // Streaming upload: fromDirectory + PipedOutputStream round-trip
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that the streaming upload path (Issue 5 fix) produces a ZIP with correct
+     * offsets and recoverable content identical to the old ByteArrayOutputStream path.
+     * Uses {@link SegmentArchiveBuilder#fromDirectory} + {@link SegmentArchiveBuilder#computeSize}
+     * + PipedOutputStream to stream without any full in-memory buffer.
+     */
+    public void testFromDirectoryStreamingProducesCorrectZip() throws IOException {
+        ByteBuffersDirectory dir = new ByteBuffersDirectory();
+        for (Map.Entry<String, byte[]> e : SEGMENT_FILES.entrySet()) {
+            try (IndexOutput out = dir.createOutput(e.getKey(), IOContext.DEFAULT)) {
+                out.writeBytes(e.getValue(), e.getValue().length);
+            }
+        }
+
+        // Build entries via fromDirectory (2-pass streaming, no readAllBytes).
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> dirEntries = new ArrayList<>();
+        for (String name : SEGMENT_FILES.keySet()) {
+            dirEntries.add(SegmentArchiveBuilder.fromDirectory(name, dir));
+        }
+
+        // Compute exact ZIP size — required for writeBlob content-length.
+        long expectedSize = SegmentArchiveBuilder.computeSize(dirEntries);
+        assertTrue("ZIP size must be > 0", expectedSize > 0);
+
+        // Stream ZIP via PipedOutputStream → capture output.
+        java.io.ByteArrayOutputStream captured = new java.io.ByteArrayOutputStream();
+        java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
+        java.io.PipedInputStream pis = new java.io.PipedInputStream(pos, 256 * 1024);
+        java.util.concurrent.atomic.AtomicReference<Map<String, SegmentArchiveEntry>> offsets =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<Exception> err = new java.util.concurrent.atomic.AtomicReference<>();
+
+        Thread builder = new Thread(() -> {
+            try {
+                offsets.set(SegmentArchiveBuilder.buildAndExtractOffsets(pos, dirEntries));
+                pos.close();
+            } catch (Exception e) {
+                err.set(e);
+                try {
+                    pos.close();
+                } catch (IOException ignored) {}
+            }
+        });
+        builder.setDaemon(true);
+        builder.start();
+
+        byte[] buf = new byte[4096];
+        int r;
+        while ((r = pis.read(buf)) != -1) {
+            captured.write(buf, 0, r);
+        }
+        try {
+            builder.join(5000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        pis.close();
+
+        assertNull("Builder must not throw: " + err.get(), err.get());
+        byte[] zipBytes = captured.toByteArray();
+        assertEquals("Streamed ZIP must match computeSize()", expectedSize, zipBytes.length);
+
+        // Verify each file's content via range-read.
+        Map<String, SegmentArchiveEntry> archiveEntries = offsets.get();
+        assertNotNull(archiveEntries);
+        assertEquals(SEGMENT_FILES.size(), archiveEntries.size());
+
+        for (Map.Entry<String, byte[]> e : SEGMENT_FILES.entrySet()) {
+            SegmentArchiveEntry entry = archiveEntries.get(e.getKey());
+            assertNotNull("Offset must exist for " + e.getKey(), entry);
+            byte[] recovered = Arrays.copyOfRange(zipBytes, (int) entry.getOffset(), (int) (entry.getOffset() + entry.getLength()));
+            assertArrayEquals("Content must match for " + e.getKey(), e.getValue(), recovered);
+        }
+
+        dir.close();
+    }
+
+    // -----------------------------------------------------------------------
     // In-memory CountingBlobContainer
     // -----------------------------------------------------------------------
 
@@ -572,10 +657,10 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
      */
     static final class CountingBlobContainer {
         private final Map<String, byte[]> blobs = new HashMap<>();
-        private final AtomicInteger puts    = new AtomicInteger();
-        private final AtomicInteger gets    = new AtomicInteger();
+        private final AtomicInteger puts = new AtomicInteger();
+        private final AtomicInteger gets = new AtomicInteger();
         private final AtomicInteger deletes = new AtomicInteger();
-        private final AtomicInteger lists   = new AtomicInteger();
+        private final AtomicInteger lists = new AtomicInteger();
 
         void writeBlob(String name, InputStream content, long size, boolean failIfExists) throws IOException {
             puts.incrementAndGet();
@@ -606,12 +691,28 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
             return List.copyOf(blobs.keySet());
         }
 
-        int putCount()    { return puts.get(); }
-        int getCount()    { return gets.get(); }
-        int deleteCount() { return deletes.get(); }
-        int listCount()   { return lists.get(); }
+        int putCount() {
+            return puts.get();
+        }
 
-        void reset() { puts.set(0); gets.set(0); deletes.set(0); lists.set(0); }
+        int getCount() {
+            return gets.get();
+        }
+
+        int deleteCount() {
+            return deletes.get();
+        }
+
+        int listCount() {
+            return lists.get();
+        }
+
+        void reset() {
+            puts.set(0);
+            gets.set(0);
+            deletes.set(0);
+            lists.set(0);
+        }
     }
 
     /**
@@ -641,8 +742,13 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
             throw new IOException("Simulated archive blob read failure for: " + name);
         }
 
-        boolean archiveReadAttempted() { return archiveReadAttempted; }
-        boolean perFileReadUsed()      { return perFileReadUsed; }
+        boolean archiveReadAttempted() {
+            return archiveReadAttempted;
+        }
+
+        boolean perFileReadUsed() {
+            return perFileReadUsed;
+        }
     }
 
     /**
@@ -671,8 +777,13 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
             throw new IOException("Blob not found (GC'd): " + name);
         }
 
-        boolean staleReadAttempted() { return staleReadAttempted; }
-        boolean freshReadUsed()      { return freshReadUsed; }
+        boolean staleReadAttempted() {
+            return staleReadAttempted;
+        }
+
+        boolean freshReadUsed() {
+            return freshReadUsed;
+        }
     }
 
     /**
@@ -704,7 +815,12 @@ public class SegmentArchiveUploadComponentTests extends OpenSearchTestCase {
             throw new IOException("Archive disabled or GC'd: " + name);
         }
 
-        boolean archiveReadAttempted() { return archiveReadAttempted; }
-        boolean perFileReadUsed()      { return perFileReadUsed; }
+        boolean archiveReadAttempted() {
+            return archiveReadAttempted;
+        }
+
+        boolean perFileReadUsed() {
+            return perFileReadUsed;
+        }
     }
 }

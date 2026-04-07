@@ -48,6 +48,7 @@ import java.io.IOException;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -543,6 +544,18 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
 
     public void testCleanupAsync() throws Exception {
         populateMetadata();
+        // deleteStaleSegments calls fetchLockedMetadataFiles — return empty set so deletion proceeds.
+        when(mdLockManager.fetchLockedMetadataFiles(any())).thenReturn(Collections.emptySet());
+        // deleteStaleSegments calls remoteDataDirectory.listAll() for archive blob GC — return empty array.
+        when(remoteDataDirectory.listAll()).thenReturn(new String[0]);
+        // deleteIfEmpty calls remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(METADATA_PREFIX, 1)
+        // We need it to return empty so deleteIfEmpty proceeds to delete.
+        when(
+            remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
+                RemoteSegmentStoreDirectory.MetadataFilenameUtils.METADATA_PREFIX,
+                1
+            )
+        ).thenReturn(Collections.emptyList());
         RemoteSegmentStoreDirectoryFactory remoteSegmentStoreDirectoryFactory = mock(RemoteSegmentStoreDirectoryFactory.class);
         RemoteSegmentStoreDirectory remoteSegmentDirectory = new RemoteSegmentStoreDirectory(
             remoteDataDirectory,

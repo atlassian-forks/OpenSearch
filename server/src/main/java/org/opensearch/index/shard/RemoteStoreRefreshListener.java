@@ -44,8 +44,6 @@ import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 import org.opensearch.indices.replication.checkpoint.SegmentReplicationCheckpointPublisher;
 import org.opensearch.threadpool.ThreadPool;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -496,6 +494,8 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
      * Archive upload: bundles all new segment files into a single ZIP blob.
      * One S3 PUT instead of N individual PUTs. Retries on transient failure.
      */
+    private static final int SEGMENT_ARCHIVE_PIPE_BUFFER_BYTES = 256 * 1024;
+
     private void uploadNewSegmentsAsArchive(
         Collection<String> filteredFiles,
         Map<String, Long> localSegmentsSizeMap,
@@ -504,44 +504,82 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         try {
             logger.debug("Uploading {} segment files as archive ZIP", filteredFiles.size());
 
-            // Build archive entries from local segment files with size guard
-            List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> buildEntries = new ArrayList<>();
             Directory directory = ((FilterDirectory) (((FilterDirectory) storeDirectory).getDelegate())).getDelegate();
+
+            // Build file-backed entries (no readAllBytes — 2-pass streaming in SegmentArchiveBuilder).
+            // Check total size limit first to decide whether to fall back to per-file upload.
+            List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> buildEntries = new ArrayList<>();
             long totalArchiveBytes = 0;
             for (String src : filteredFiles) {
-                try (IndexInput input = storeDirectory.openInput(src, IOContext.DEFAULT)) {
-                    long fileLen = input.length();
-                    totalArchiveBytes += fileLen;
-                    if (totalArchiveBytes > MAX_SEGMENT_ARCHIVE_BYTES) {
-                        logger.warn(
-                            "Segment archive size {} exceeds limit {}, falling back to per-file upload",
-                            totalArchiveBytes,
-                            MAX_SEGMENT_ARCHIVE_BYTES
-                        );
-                        uploadNewSegmentsPerFile(filteredFiles, localSegmentsSizeMap, listener);
-                        return;
-                    }
-                    byte[] content = new byte[(int) fileLen];
-                    input.readBytes(content, 0, content.length);
-                    buildEntries.add(SegmentArchiveBuilder.fromBytes(src, content));
+                long fileLen = storeDirectory.fileLength(src);
+                totalArchiveBytes += fileLen;
+                if (totalArchiveBytes > MAX_SEGMENT_ARCHIVE_BYTES) {
+                    logger.warn(
+                        "Segment archive size {} exceeds limit {}, falling back to per-file upload",
+                        totalArchiveBytes,
+                        MAX_SEGMENT_ARCHIVE_BYTES
+                    );
+                    uploadNewSegmentsPerFile(filteredFiles, localSegmentsSizeMap, listener);
+                    return;
                 }
+                buildEntries.add(SegmentArchiveBuilder.fromDirectory(src, storeDirectory));
             }
 
-            // Build ZIP and extract offsets
-            ByteArrayOutputStream archiveOut = new ByteArrayOutputStream();
-            Map<String, SegmentArchiveEntry> archiveEntries = SegmentArchiveBuilder.buildAndExtractOffsets(archiveOut, buildEntries);
-            byte[] archiveBytes = archiveOut.toByteArray();
+            // Dry-run pass to get exact ZIP size (needed for writeBlob content-length).
+            // SegmentArchiveBuilder.computeSize does pass-1 (CRC) for each file-backed entry.
+            long archiveSize = SegmentArchiveBuilder.computeSize(buildEntries);
 
-            // Upload single archive blob to remote data directory with retry
+            // Stream ZIP directly to S3 via Pipe — no ByteArrayOutputStream, no archiveBytes copy.
             BlobContainer blobContainer = ((RemoteDirectory) remoteDirectory.getDelegate()).getBlobContainer();
             String archiveBlobName = null;
+            Map<String, SegmentArchiveEntry> archiveEntries = null;
             IOException lastFailure = null;
+
             for (int attempt = 0; attempt < SEGMENT_ARCHIVE_UPLOAD_MAX_ATTEMPTS; attempt++) {
                 archiveBlobName = "segment_archive_" + System.currentTimeMillis() + "_" + UUIDs.base64UUID() + ".zip";
-                try {
-                    blobContainer.writeBlob(archiveBlobName, new ByteArrayInputStream(archiveBytes), archiveBytes.length, true);
+                try (
+                    java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
+                    java.io.PipedInputStream pis = new java.io.PipedInputStream(pos, SEGMENT_ARCHIVE_PIPE_BUFFER_BYTES)
+                ) {
+                    final java.util.concurrent.atomic.AtomicReference<Exception> buildError =
+                        new java.util.concurrent.atomic.AtomicReference<>();
+                    final java.util.concurrent.atomic.AtomicReference<Map<String, SegmentArchiveEntry>> builtEntries =
+                        new java.util.concurrent.atomic.AtomicReference<>();
+                    final java.util.concurrent.CountDownLatch buildLatch = new java.util.concurrent.CountDownLatch(1);
+
+                    // Builder thread: pass-2 (write) streams into the pipe.
+                    Thread builderThread = new Thread(() -> {
+                        try {
+                            builtEntries.set(SegmentArchiveBuilder.buildAndExtractOffsets(pos, buildEntries));
+                            pos.close();
+                        } catch (Exception e) {
+                            buildError.set(e);
+                            try {
+                                pos.close();
+                            } catch (IOException ignored) {}
+                        } finally {
+                            buildLatch.countDown();
+                        }
+                    }, "segment-archive-builder-" + indexShard.shardId());
+                    builderThread.setDaemon(true);
+                    builderThread.start();
+
+                    // Upload thread (current): reads from pipe, uploads to S3.
+                    try {
+                        blobContainer.writeBlob(archiveBlobName, pis, archiveSize, true);
+                    } finally {
+                        buildLatch.await();
+                    }
+
+                    if (buildError.get() != null) {
+                        throw new IOException("Segment archive build failed", buildError.get());
+                    }
+                    archiveEntries = builtEntries.get();
                     lastFailure = null;
                     break;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted during segment archive upload", e);
                 } catch (IOException e) {
                     lastFailure = e;
                     logger.warn("Segment archive upload attempt {} failed: {}", attempt + 1, e.getMessage());
@@ -573,7 +611,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                 }
             }
 
-            logger.debug("Archive upload successful: {} ({} bytes, {} files)", archiveBlobName, archiveBytes.length, filteredFiles.size());
+            logger.debug("Archive upload successful: {} ({} bytes, {} files)", archiveBlobName, archiveSize, filteredFiles.size());
             listener.onResponse(null);
         } catch (Exception e) {
             logger.warn("Exception while uploading segment archive", e);

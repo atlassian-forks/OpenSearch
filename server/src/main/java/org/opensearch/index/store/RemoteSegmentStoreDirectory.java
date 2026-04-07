@@ -177,8 +177,11 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             if (remoteSegmentMetadata.isArchiveEnabled()) {
                 ArchiveState state = new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries());
                 archiveStateRef.set(state);
-                logger.debug("Archive metadata loaded: blob={}, entries={}", state.blobName,
-                    state.entries != null ? state.entries.size() : 0);
+                logger.debug(
+                    "Archive metadata loaded: blob={}, entries={}",
+                    state.blobName,
+                    state.entries != null ? state.entries.size() : 0
+                );
             } else {
                 archiveStateRef.set(null);
             }
@@ -204,9 +207,11 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         RemoteSegmentMetadata remoteSegmentMetadata = readMetadataFile(metadataFile);
         if (remoteSegmentMetadata != null) {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>(remoteSegmentMetadata.getMetadata());
-            archiveStateRef.set(remoteSegmentMetadata.isArchiveEnabled()
-                ? new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries())
-                : null);
+            archiveStateRef.set(
+                remoteSegmentMetadata.isArchiveEnabled()
+                    ? new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries())
+                    : null
+            );
         } else {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>();
             archiveStateRef.set(null);
@@ -245,9 +250,11 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         RemoteSegmentMetadata remoteSegmentMetadata = readMetadataFile(metadataFile);
         if (remoteSegmentMetadata != null) {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>(remoteSegmentMetadata.getMetadata());
-            archiveStateRef.set(remoteSegmentMetadata.isArchiveEnabled()
-                ? new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries())
-                : null);
+            archiveStateRef.set(
+                remoteSegmentMetadata.isArchiveEnabled()
+                    ? new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries())
+                    : null
+            );
         } else {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>();
             archiveStateRef.set(null);
@@ -541,16 +548,29 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         ArchiveState archiveState = archiveStateRef.get();
         if (archiveState != null && archiveState.entries != null && archiveState.entries.containsKey(name)) {
             SegmentArchiveEntry archiveEntry = archiveState.entries.get(name);
-            logger.trace("Opening {} from archive {} at offset={} length={}",
-                name, archiveState.blobName, archiveEntry.getOffset(), archiveEntry.getLength());
-            try (InputStream archiveStream = remoteDataDirectory.getBlobContainer()
-                    .readBlob(archiveState.blobName, archiveEntry.getOffset(), archiveEntry.getLength())) {
+            logger.trace(
+                "Opening {} from archive {} at offset={} length={}",
+                name,
+                archiveState.blobName,
+                archiveEntry.getOffset(),
+                archiveEntry.getLength()
+            );
+            try (
+                InputStream archiveStream = remoteDataDirectory.getBlobContainer()
+                    .readBlob(archiveState.blobName, archiveEntry.getOffset(), archiveEntry.getLength())
+            ) {
                 return new ByteArrayIndexInput(name, archiveStream.readAllBytes());
             } catch (IOException archiveEx) {
                 // Archive read failed (blob GC'd while in-memory state was stale, or transient error).
                 // Re-read latest metadata to get fresh archive reference and retry atomically.
-                logger.warn("Archive read failed for {} from blob {} (offset={} length={}), refreshing metadata: {}",
-                    name, archiveState.blobName, archiveEntry.getOffset(), archiveEntry.getLength(), archiveEx.getMessage());
+                logger.warn(
+                    "Archive read failed for {} from blob {} (offset={} length={}), refreshing metadata: {}",
+                    name,
+                    archiveState.blobName,
+                    archiveEntry.getOffset(),
+                    archiveEntry.getLength(),
+                    archiveEx.getMessage()
+                );
                 try {
                     RemoteSegmentMetadata fresh = readLatestMetadataFile();
                     if (fresh != null && fresh.isArchiveEnabled()) {
@@ -559,8 +579,10 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                         SegmentArchiveEntry freshEntry = freshState.entries != null ? freshState.entries.get(name) : null;
                         if (freshEntry != null) {
                             logger.debug("Retrying {} from refreshed archive blob {}", name, freshState.blobName);
-                            try (InputStream retryStream = remoteDataDirectory.getBlobContainer()
-                                    .readBlob(freshState.blobName, freshEntry.getOffset(), freshEntry.getLength())) {
+                            try (
+                                InputStream retryStream = remoteDataDirectory.getBlobContainer()
+                                    .readBlob(freshState.blobName, freshEntry.getOffset(), freshEntry.getLength())
+                            ) {
                                 return new ByteArrayIndexInput(name, retryStream.readAllBytes());
                             }
                         }

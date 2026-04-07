@@ -8,6 +8,9 @@
 
 package org.opensearch.index.store.remote.segment.archive;
 
+import org.apache.lucene.store.ByteBuffersDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexOutput;
 import org.opensearch.index.store.remote.metadata.SegmentArchiveEntry;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -360,6 +363,66 @@ public class SegmentArchiveBuilderTests extends OpenSearchTestCase {
     /**
      * Test: Mid-stream failure during archive build - IOException from entry content stream.
      */
+    /**
+     * Verifies that {@link SegmentArchiveBuilder#fromDirectory} (2-pass streaming path) produces
+     * byte-for-byte identical ZIP output to {@link SegmentArchiveBuilder#fromBytes} (byte[]-backed path).
+     * Both should produce the same offsets and the same recoverable content.
+     */
+    public void testFromDirectoryProducesSameZipAsFromBytes() throws IOException {
+        String path1 = "_0.si";
+        String path2 = "_0.cfs";
+        byte[] content1 = "segment info content".getBytes(StandardCharsets.UTF_8);
+        byte[] content2 = "compound file content goes here".getBytes(StandardCharsets.UTF_8);
+
+        // Write files into an in-memory Lucene directory.
+        ByteBuffersDirectory dir = new ByteBuffersDirectory();
+        try (IndexOutput out = dir.createOutput(path1, IOContext.DEFAULT)) {
+            out.writeBytes(content1, content1.length);
+        }
+        try (IndexOutput out = dir.createOutput(path2, IOContext.DEFAULT)) {
+            out.writeBytes(content2, content2.length);
+        }
+
+        // Build ZIP via fromBytes (byte[]-backed path).
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> bytesEntries = Arrays.asList(
+            SegmentArchiveBuilder.fromBytes(path1, content1),
+            SegmentArchiveBuilder.fromBytes(path2, content2)
+        );
+        ByteArrayOutputStream bytesOut = new ByteArrayOutputStream();
+        Map<String, SegmentArchiveEntry> bytesOffsets = SegmentArchiveBuilder.buildAndExtractOffsets(bytesOut, bytesEntries);
+
+        // Build ZIP via fromDirectory (2-pass streaming path).
+        List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> dirEntries = Arrays.asList(
+            SegmentArchiveBuilder.fromDirectory(path1, dir),
+            SegmentArchiveBuilder.fromDirectory(path2, dir)
+        );
+        ByteArrayOutputStream dirOut = new ByteArrayOutputStream();
+        Map<String, SegmentArchiveEntry> dirOffsets = SegmentArchiveBuilder.buildAndExtractOffsets(dirOut, dirEntries);
+
+        // Offsets must match.
+        assertEquals("Offsets must match between fromBytes and fromDirectory", bytesOffsets.size(), dirOffsets.size());
+        for (String p : bytesOffsets.keySet()) {
+            SegmentArchiveEntry be = bytesOffsets.get(p);
+            SegmentArchiveEntry de = dirOffsets.get(p);
+            assertNotNull("fromDirectory must have offset for " + p, de);
+            assertEquals("offset must match for " + p, be.getOffset(), de.getOffset());
+            assertEquals("length must match for " + p, be.getLength(), de.getLength());
+        }
+
+        // Both ZIPs must contain the same content when range-read.
+        byte[] bytesZip = bytesOut.toByteArray();
+        byte[] dirZip = dirOut.toByteArray();
+
+        for (Map.Entry<String, SegmentArchiveEntry> e : bytesOffsets.entrySet()) {
+            SegmentArchiveEntry entry = e.getValue();
+            byte[] fromBytesContent = Arrays.copyOfRange(bytesZip, (int) entry.getOffset(), (int) (entry.getOffset() + entry.getLength()));
+            byte[] fromDirContent = Arrays.copyOfRange(dirZip, (int) entry.getOffset(), (int) (entry.getOffset() + entry.getLength()));
+            assertArrayEquals("Content must match for " + e.getKey(), fromBytesContent, fromDirContent);
+        }
+
+        dir.close();
+    }
+
     public void testBuildFailsOnBrokenInputStream() {
         // Given: an entry whose InputStream throws mid-read
         SegmentArchiveBuilder.SegmentArchiveBuildEntry brokenEntry = new SegmentArchiveBuilder.SegmentArchiveBuildEntry() {
