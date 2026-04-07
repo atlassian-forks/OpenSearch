@@ -55,6 +55,14 @@ public final class TranslogArchivePathHelper {
     }
 
     /**
+     * Format an {@link Instant} to the blob timestamp string ({@code yyyyMMddHHmmssSSS}).
+     * Useful in tests to construct blob names with controlled timestamps.
+     */
+    public static String formatTimestamp(Instant instant) {
+        return BLOB_TIMESTAMP_FORMAT.format(instant);
+    }
+
+    /**
      * Parse blob name to timestamp for retention hint. Returns empty if name is not yyyyMMddHHmmssSSS.zip.
      */
     public static java.util.Optional<Instant> parseBlobNameTimestamp(String blobName) {

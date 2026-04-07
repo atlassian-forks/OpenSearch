@@ -63,7 +63,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Inside each ZIP, member paths are {@code indexUUID/shardId/primaryTerm/translog-<gen>.tlog} or {@code .ckp}.
  * See {@link org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper} for path parsing and retention.
  * <p>
- * <b>Retention</b>: {@link #deleteArchivesOlderThanRetentionNewPath} deletes an archive blob only when every member
+ * <b>Retention</b>: {@link #deleteArchivesOlderThanRetention} deletes archive ZIPs older than the configured retention age.
  * is past the shard's retention bounds (no partial delete).
  * <p>
  * <b>Memory</b>: Peak memory for an archive upload is proportional to the total size of all primary shards'
@@ -278,26 +278,14 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
         if (snapshots.isEmpty()) {
             return;
         }
-        long minGenerationInZip = Long.MAX_VALUE;
-        for (TransferSnapshot s : snapshots) {
-            long minGen = s.getTranslogTransferMetadata().getMinTranslogGeneration();
-            if (minGen >= 0 && minGen < minGenerationInZip) {
-                minGenerationInZip = minGen;
-            }
-        }
-        long genBucket = minGenerationInZip != Long.MAX_VALUE ? minGenerationInZip / GEN_BUCKET_SIZE : 0L;
-        String hashPrefix = RemoteStoreEnums.PathHashAlgorithm.hashForTranslogArchive(
-            pathHashAlgorithm,
-            TRANSLOG_ARCHIVE_FILE_TYPE,
-            indexUUID,
-            nodeId
-        );
+        String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
+        String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, pathHashAlgorithm);
         List<ArchiveBuilder.ArchiveBuildEntry> allEntries = new ArrayList<>();
         try {
             for (int i = 0; i < snapshots.size(); i++) {
                 allEntries.addAll(snapshotToEntries(snapshots.get(i), pathPrefixes.get(i)));
             }
-            uploadArchiveNewPathAndMetadata(transferService, basePath, hashPrefix, genBucket, snapshots, contributingShards, allEntries);
+            uploadArchiveNewPathAndMetadata(transferService, basePath, hashTypeIndex, hashNodeId, snapshots, contributingShards, allEntries);
         } catch (Exception ex) {
             logger.error(() -> new ParameterizedMessage("Failed to build or upload translog archive for index {}", indexUUID), ex);
             runFallbackIfEnabled(contributingShards, snapshots);
@@ -315,155 +303,97 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
         if (eligible.isEmpty()) {
             return;
         }
-        Map<String, ArchiveDeletionHelper.RetentionBounds> retentionByShard = new HashMap<>();
-        TranslogTransferManager transferManager = null;
+        // Collect one representative shard per index for retention bounds and transfer manager.
+        // Key: indexUUID → (retentionBounds, transferManager, nodeId)
+        Map<String, ArchiveDeletionHelper.RetentionBounds> retentionByIndex = new HashMap<>();
+        Map<String, TranslogTransferManager> transferManagerByIndex = new HashMap<>();
+        Map<String, String> nodeIdByIndex = new HashMap<>();
+
+        RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm = remoteStoreSettings != null
+            ? remoteStoreSettings.getPathHashAlgorithm()
+            : RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
+
         for (ShardId sid : eligible) {
             IndexService indexService = indicesService.indexService(sid.getIndex());
-            if (indexService == null) {
-                continue;
-            }
+            if (indexService == null) continue;
             IndexShard shard = indexService.getShardOrNull(sid.id());
-            if (shard == null) {
-                continue;
-            }
-            shard.getArchiveRetentionBounds()
-                .ifPresent(
-                    bounds -> retentionByShard.put(shard.indexSettings().getIndexMetadata().getIndexUUID() + "/" + sid.id(), bounds)
-                );
-            if (transferManager == null) {
-                Optional<TranslogTransferManager> opt = shard.getTranslogTransferManager();
-                if (opt.isPresent()) {
-                    transferManager = opt.get();
-                }
+            if (shard == null) continue;
+            String indexUUID = shard.indexSettings().getIndexMetadata().getIndexUUID();
+            shard.getArchiveRetentionBounds().ifPresent(bounds -> retentionByIndex.put(indexUUID, bounds));
+            if (!transferManagerByIndex.containsKey(indexUUID)) {
+                shard.getTranslogTransferManager().ifPresent(tm -> {
+                    transferManagerByIndex.put(indexUUID, tm);
+                    shard.getTranslogNodeId().ifPresent(nid -> nodeIdByIndex.put(indexUUID, nid));
+                });
             }
         }
-        if (retentionByShard.isEmpty() || transferManager == null) {
+        if (retentionByIndex.isEmpty()) {
             return;
         }
-        try {
-            BlobPath dataPath = transferManager.getArchiveBasePath().add("translog").add("data");
-            deleteArchivesOlderThanRetentionNewPath(transferManager.getTransferService(), dataPath, retentionByShard);
-        } catch (IOException e) {
-            logger.warn(() -> new ParameterizedMessage("Archive retention delete failed"), e);
+        for (Map.Entry<String, ArchiveDeletionHelper.RetentionBounds> e : retentionByIndex.entrySet()) {
+            String indexUUID = e.getKey();
+            ArchiveDeletionHelper.RetentionBounds bounds = e.getValue();
+            TranslogTransferManager tm = transferManagerByIndex.get(indexUUID);
+            String nodeId = nodeIdByIndex.get(indexUUID);
+            if (tm == null || nodeId == null) continue;
+            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
+            String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, pathHashAlgorithm);
+            BlobPath zipDir = tm.getArchiveBasePath()
+                .add("translog").add("data")
+                .add(hashTypeIndex).add(hashNodeId);
+            try {
+                deleteArchivesOlderThanRetention(tm.getTransferService(), zipDir, bounds);
+            } catch (IOException ex) {
+                logger.warn("Archive retention delete failed for index {}: {}", indexUUID, ex.getMessage());
+            }
         }
     }
 
     /**
-     * Deletes archive blobs under {@code translog/data/{hashPrefix}/{genBucket}/} when every member is past
-     * retention. Walks hashPrefix → genBucket → {@code *.zip}; range-reads each ZIP tail; uses comment when
-     * present else central directory parse to decide if the archive is deletable.
+     * Deletes archive ZIPs under {@code zipDir} that are older than the configured retention age.
+     * Uses timestamp-only deletion (parsed from blob name) — no range-reads or generation checks needed.
+     * The retention age minimum (5 min) ensures no live ZIP is deleted prematurely.
      *
-     * @param transferService  service to list, read, and delete
-     * @param dataBasePath     base path (e.g. remoteDataTransferPath.add("translog").add("data"))
-     * @param retentionByShard map from shard key (indexUUID/shardId) to retention bounds
-     * @return number of archive blobs deleted
+     * <p>Path: {@code translog/data/{hashTypeIndex}/{hashNodeId}/{yyyyMMddHHmmssSSS}.zip}
+     *
+     * @param transferService blob transfer service
+     * @param zipDir          direct path to the node's ZIP directory (no intermediate LISTs needed)
+     * @param bounds          retention bounds containing the effective retention age
+     * @return number of ZIPs deleted
      */
-    public static int deleteArchivesOlderThanRetentionNewPath(
+    static int deleteArchivesOlderThanRetention(
         TransferService transferService,
-        BlobPath dataBasePath,
-        Map<String, ArchiveDeletionHelper.RetentionBounds> retentionByShard
+        BlobPath zipDir,
+        ArchiveDeletionHelper.RetentionBounds bounds
     ) throws IOException {
-        if (retentionByShard == null || retentionByShard.isEmpty()) {
-            return 0;
-        }
-        Set<String> hashPrefixes;
-        try {
-            hashPrefixes = transferService.listFolders(dataBasePath);
-        } catch (IOException e) {
-            logger.trace("List translog/data failed: {}", e.getMessage());
-            return 0;
-        }
-        if (hashPrefixes == null || hashPrefixes.isEmpty()) {
-            return 0;
-        }
-        int deleted = 0;
-        for (String hashPrefix : hashPrefixes) {
-            BlobPath hashPath = dataBasePath.add(hashPrefix);
-            Set<String> genBuckets;
-            try {
-                genBuckets = transferService.listFolders(hashPath);
-            } catch (IOException e) {
-                logger.warn("List translog/data/{} failed during retention cleanup: {}", hashPrefix, e.getMessage());
-                continue;
-            }
-            if (genBuckets == null || genBuckets.isEmpty()) {
-                continue;
-            }
-            for (String genBucket : genBuckets) {
-                BlobPath genPath = hashPath.add(genBucket);
-                deleted += deleteArchivesInPathOlderThanRetention(transferService, genPath, retentionByShard);
-            }
-        }
-        return deleted;
-    }
-
-    /** Lists *.zip in nodePath, range-reads tail per ZIP, and deletes those whose entries are all past retention. */
-    private static int deleteArchivesInPathOlderThanRetention(
-        TransferService transferService,
-        BlobPath nodePath,
-        Map<String, ArchiveDeletionHelper.RetentionBounds> retentionByShard
-    ) throws IOException {
+        long effectiveRetentionMinutes = bounds.getEffectiveRetentionMinutes();
+        Instant retentionCutoff = Instant.now().minus(Duration.ofMinutes(effectiveRetentionMinutes));
         int deleted = 0;
         boolean morePages;
         do {
             List<BlobMetadata> blobs;
             try {
                 blobs = PlainActionFuture.<List<BlobMetadata>, IOException>get(
-                    f -> transferService.listAllInSortedOrder(nodePath, "", MAX_ARCHIVE_BLOBS_PER_NODE, f)
+                    f -> transferService.listAllInSortedOrder(zipDir, "", MAX_ARCHIVE_BLOBS_PER_NODE, f)
                 );
             } catch (IOException e) {
-                logger.trace("List blobs failed: {}", e.getMessage());
+                logger.warn("List archive ZIPs failed at {}: {}", zipDir.buildAsString(), e.getMessage());
                 break;
             }
             if (blobs == null || blobs.isEmpty()) {
                 break;
             }
-            // Use the minimum effective retention across all shards so we respect the most conservative setting.
-            // This ensures a ZIP is not deleted until ALL shards' configured retention ages have elapsed.
-            long effectiveRetentionMinutes = retentionByShard.values().stream()
-                .mapToLong(ArchiveDeletionHelper.RetentionBounds::getEffectiveRetentionMinutes)
-                .min()
-                .orElse(RETENTION_SKIP_ZIPS_NEWER_THAN_MINUTES);
-            Instant retentionCutoff = Instant.now().minus(Duration.ofMinutes(effectiveRetentionMinutes));
             List<String> toDelete = new ArrayList<>();
             for (BlobMetadata blob : blobs) {
                 String name = blob.name();
                 if (name == null || !name.endsWith(".zip")) {
                     continue;
                 }
-                if (TranslogArchivePathHelper.parseBlobNameTimestamp(name).filter(ts -> ts.isAfter(retentionCutoff)).isPresent()) {
-                    continue;
-                }
-                long size = blob.length();
-                if (size < 22) {
-                    continue;
-                }
-                int tailLen = (int) Math.min(size, ZipCentralDirectoryParser.MAX_ZIP_TAIL_BYTES);
-                long tailStartOffset = size - tailLen;
-                byte[] tail;
-                try (InputStream in = transferService.downloadBlob(nodePath, name, tailStartOffset, tailLen)) {
-                    tail = in.readAllBytes();
-                } catch (IOException e) {
-                    logger.trace("Range-read tail of archive {} failed: {}", name, e.getMessage());
-                    continue;
-                }
-                List<ArchiveEntry> entries = null;
-                try {
-                    String comment = ZipCentralDirectoryParser.getComment(tail);
-                    ArchiveCommentFormat.ParseResult parsed = ArchiveCommentFormat.parseWithIndex(comment);
-                    if (parsed.getIndexUUID() != null && !parsed.getEntries().isEmpty()) {
-                        entries = ArchiveCommentFormat.toArchiveEntriesForRetention(parsed.getIndexUUID(), parsed.getEntries());
-                    }
-                } catch (IOException ignored) {}
-                if (entries == null || entries.isEmpty()) {
-                    try {
-                        entries = ZipCentralDirectoryParser.parse(tail, tailStartOffset);
-                    } catch (IOException e) {
-                        logger.trace("Parse central directory of {} failed: {}", name, e.getMessage());
-                        continue;
-                    }
-                }
-                if (ArchiveDeletionHelper.isArchiveDeletable(entries, retentionByShard)) {
+                // Delete if blob timestamp < retentionCutoff (i.e. NOT after cutoff)
+                boolean withinRetention = TranslogArchivePathHelper.parseBlobNameTimestamp(name)
+                    .filter(ts -> ts.isAfter(retentionCutoff))
+                    .isPresent();
+                if (!withinRetention) {
                     toDelete.add(name);
                 }
             }
@@ -471,13 +401,13 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 int end = Math.min(i + RETENTION_DELETE_BATCH_SIZE, toDelete.size());
                 List<String> batch = toDelete.subList(i, end);
                 try {
-                    transferService.deleteBlobs(nodePath, new ArrayList<>(batch));
+                    transferService.deleteBlobs(zipDir, new ArrayList<>(batch));
                     deleted += batch.size();
-                    for (String name : batch) {
-                        logger.debug("Deleted archive {} (past retention)", name);
-                    }
+                    logger.debug("Deleted {} archive ZIPs older than {} minutes from {}", batch.size(),
+                        effectiveRetentionMinutes, zipDir.buildAsString());
                 } catch (IOException e) {
-                    logger.warn(() -> new ParameterizedMessage("Failed to delete archive batch ({} blobs)", batch.size()), e);
+                    logger.warn("Failed to delete archive batch ({} blobs) from {}: {}", batch.size(),
+                        zipDir.buildAsString(), e.getMessage());
                 }
             }
             morePages = blobs.size() >= MAX_ARCHIVE_BLOBS_PER_NODE;
@@ -519,13 +449,16 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     private void uploadArchiveNewPathAndMetadata(
         TransferService transferService,
         BlobPath basePath,
-        String hashPrefix,
-        long genBucket,
+        String hashTypeIndex,
+        String hashNodeId,
         List<TransferSnapshot> snapshots,
         List<IndexShard> contributingShards,
         List<ArchiveBuilder.ArchiveBuildEntry> allEntries
     ) throws IOException {
-        BlobPath archivePath = basePath.add("translog").add("data").add(hashPrefix).add(String.valueOf(genBucket));
+        // Path: translog/data/{hashTypeIndex}/{hashNodeId}/{timestamp}.zip
+        // hashTypeIndex = hash("translog_zip|{indexUUID}") — same for all nodes, used for per-index GC
+        // hashNodeId    = hash(nodeId) — unique per node, isolates writes for S3 partition safety
+        BlobPath archivePath = basePath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
         // Pre-compute size and capture per-entry offsets for archive-based recovery metadata.
         // Since the ZIP uses STORED (no compression), offsets are deterministic across builds.
@@ -594,10 +527,10 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 throw e;
             }
             logger.debug(
-                "Archive uploaded path={} hashPrefix={} genBucket={} blob={}",
+                "Archive uploaded path={} hashTypeIndex={} hashNodeId={} blob={}",
                 archivePath.buildAsString(),
-                hashPrefix,
-                genBucket,
+                hashTypeIndex,
+                hashNodeId,
                 blobName
             );
             uploadedBlobName.set(blobName);

@@ -81,22 +81,22 @@ public final class TranslogArchiveRecovery {
         logger.info("Recovering translog from archive (no metadata): index={} shard={}", indexUUID, shardId);
 
         String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
-        BlobPath dataPath = archiveBasePath.add("translog").add("data").add(hashTypeIndex);
-
-        // LIST genBuckets and collect all ZIPs
-        Set<String> genBuckets = transferService.listFolders(dataPath);
-        if (genBuckets == null || genBuckets.isEmpty()) {
-            logger.info("No archive genBuckets found at {}; nothing to recover", dataPath.buildAsString());
+        // nodeId is not available in the no-metadata scan path, so we must LIST {hashTypeIndex}/
+        // to find all hashNodeId dirs (one per node that uploaded for this index).
+        BlobPath indexPath = archiveBasePath.add("translog").add("data").add(hashTypeIndex);
+        Set<String> nodeDirs = transferService.listFolders(indexPath);
+        if (nodeDirs == null || nodeDirs.isEmpty()) {
+            logger.info("No archive node dirs found at {}; nothing to recover", indexPath.buildAsString());
             return;
         }
 
         List<ZipRef> allZips = new ArrayList<>();
-        for (String bucket : genBuckets) {
-            BlobPath bucketPath = dataPath.add(bucket);
-            List<BlobMetadata> blobs = listBlobsSorted(transferService, bucketPath, MAX_ZIPS_PER_BUCKET);
+        for (String nodeDir : nodeDirs) {
+            BlobPath nodePath = indexPath.add(nodeDir);
+            List<BlobMetadata> blobs = listBlobsSorted(transferService, nodePath, MAX_ZIPS_PER_BUCKET);
             for (BlobMetadata blob : blobs) {
                 if (blob.name().endsWith(".zip")) {
-                    allZips.add(new ZipRef(bucketPath, blob.name(), blob.length()));
+                    allZips.add(new ZipRef(nodePath, blob.name(), blob.length()));
                 }
             }
         }
@@ -168,28 +168,27 @@ public final class TranslogArchiveRecovery {
         logger.info("Recovering translog from archive: index={} shard={} gen=[{}-{}]", indexUUID, shardId, minGeneration, maxGeneration);
 
         String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
-        BlobPath dataPath = archiveBasePath.add("translog").add("data").add(hashTypeIndex);
-
-        // LIST genBuckets
-        Set<String> genBuckets = transferService.listFolders(dataPath);
-        if (genBuckets == null || genBuckets.isEmpty()) {
-            throw new IOException("No archive genBuckets found at " + dataPath.buildAsString());
+        // LIST {hashTypeIndex}/ to find all hashNodeId dirs (one per node that uploaded for this index).
+        BlobPath indexPath = archiveBasePath.add("translog").add("data").add(hashTypeIndex);
+        Set<String> nodeDirs = transferService.listFolders(indexPath);
+        if (nodeDirs == null || nodeDirs.isEmpty()) {
+            throw new IOException("No archive node dirs found at " + indexPath.buildAsString());
         }
 
-        // Collect all ZIP names across buckets (sorted by timestamp = sorted by name)
+        // Collect all ZIP names across node dirs (sorted by timestamp = sorted by name)
         List<ZipRef> allZips = new ArrayList<>();
-        for (String bucket : genBuckets) {
-            BlobPath bucketPath = dataPath.add(bucket);
-            List<BlobMetadata> blobs = listBlobsSorted(transferService, bucketPath, MAX_ZIPS_PER_BUCKET);
+        for (String nodeDir : nodeDirs) {
+            BlobPath nodePath = indexPath.add(nodeDir);
+            List<BlobMetadata> blobs = listBlobsSorted(transferService, nodePath, MAX_ZIPS_PER_BUCKET);
             for (BlobMetadata blob : blobs) {
                 if (blob.name().endsWith(".zip")) {
-                    allZips.add(new ZipRef(bucketPath, blob.name(), blob.length()));
+                    allZips.add(new ZipRef(nodePath, blob.name(), blob.length()));
                 }
             }
         }
 
         if (allZips.isEmpty()) {
-            throw new IOException("No archive ZIPs found under " + dataPath.buildAsString());
+            throw new IOException("No archive ZIPs found under " + indexPath.buildAsString());
         }
 
         // Sort by blob name (timestamp-based, lexicographic = chronological)
