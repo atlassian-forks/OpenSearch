@@ -198,8 +198,18 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         RemoteSegmentMetadata remoteSegmentMetadata = readMetadataFile(metadataFile);
         if (remoteSegmentMetadata != null) {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>(remoteSegmentMetadata.getMetadata());
+            // Populate archive fields so openInput() can use range-reads for archive-mode commits.
+            if (remoteSegmentMetadata.isArchiveEnabled()) {
+                this.currentArchiveBlobName = remoteSegmentMetadata.getArchiveBlob();
+                this.currentArchiveEntries = remoteSegmentMetadata.getArchiveEntries();
+            } else {
+                this.currentArchiveBlobName = null;
+                this.currentArchiveEntries = null;
+            }
         } else {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>();
+            this.currentArchiveBlobName = null;
+            this.currentArchiveEntries = null;
         }
         return remoteSegmentMetadata;
     }
@@ -235,8 +245,18 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         RemoteSegmentMetadata remoteSegmentMetadata = readMetadataFile(metadataFile);
         if (remoteSegmentMetadata != null) {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>(remoteSegmentMetadata.getMetadata());
+            // Populate archive fields so openInput() can use range-reads for archive-mode snapshots.
+            if (remoteSegmentMetadata.isArchiveEnabled()) {
+                this.currentArchiveBlobName = remoteSegmentMetadata.getArchiveBlob();
+                this.currentArchiveEntries = remoteSegmentMetadata.getArchiveEntries();
+            } else {
+                this.currentArchiveBlobName = null;
+                this.currentArchiveEntries = null;
+            }
         } else {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>();
+            this.currentArchiveBlobName = null;
+            this.currentArchiveEntries = null;
         }
         return remoteSegmentMetadata;
     }
@@ -524,8 +544,6 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
         // Check if this file can be downloaded from an archive via range-read.
-        // If the archive blob read fails (e.g. blob GC'd, transient error), fall through
-        // to the per-file download path rather than propagating the exception.
         if (currentArchiveBlobName != null && currentArchiveEntries != null && currentArchiveEntries.containsKey(name)) {
             SegmentArchiveEntry archiveEntry = currentArchiveEntries.get(name);
             logger.trace(
@@ -541,22 +559,57 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             ) {
                 byte[] fileBytes = archiveStream.readAllBytes();
                 return new ByteArrayIndexInput(name, fileBytes);
-            } catch (IOException e) {
-                // Archive read failed — fall back to per-file download.
-                // This can happen if the archive blob was GC'd while metadata still references it,
-                // or due to a transient remote store error.
+            } catch (IOException archiveEx) {
+                // Archive read failed (e.g. blob GC'd while in-memory metadata was stale,
+                // or transient remote store error). Re-read the latest metadata to get the
+                // current archive reference and retry. Do NOT fall through to per-file path:
+                // for archive-mode files, uploadedFilename in the cache is the ZIP blob name,
+                // not a per-file blob — using it as a per-file reference would read corrupt data.
                 logger.warn(
-                    "Failed to read {} from archive blob {} (offset={} length={}), falling back to per-file download: {}",
+                    "Archive read failed for {} from blob {} (offset={} length={}), refreshing metadata: {}",
                     name,
                     currentArchiveBlobName,
                     archiveEntry.getOffset(),
                     archiveEntry.getLength(),
-                    e.getMessage()
+                    archiveEx.getMessage()
                 );
+                try {
+                    RemoteSegmentMetadata fresh = readLatestMetadataFile();
+                    if (fresh != null && fresh.isArchiveEnabled()) {
+                        // Refresh in-memory archive state so subsequent openInput calls also benefit.
+                        this.currentArchiveBlobName = fresh.getArchiveBlob();
+                        this.currentArchiveEntries = fresh.getArchiveEntries();
+                        Map<String, SegmentArchiveEntry> freshEntries = fresh.getArchiveEntries();
+                        SegmentArchiveEntry freshEntry = freshEntries != null ? freshEntries.get(name) : null;
+                        if (freshEntry != null) {
+                            logger.debug("Retrying {} from refreshed archive blob {}", name, fresh.getArchiveBlob());
+                            try (InputStream retryStream = remoteDataDirectory.getBlobContainer()
+                                    .readBlob(fresh.getArchiveBlob(), freshEntry.getOffset(), freshEntry.getLength())) {
+                                return new ByteArrayIndexInput(name, retryStream.readAllBytes());
+                            }
+                        }
+                        // File not present in the latest archive (e.g. merged away) — fall through.
+                    } else if (fresh != null) {
+                        // Archive was disabled since we loaded metadata (flag toggled OFF).
+                        // Refresh in-memory state so future calls skip the archive path.
+                        this.currentArchiveBlobName = null;
+                        this.currentArchiveEntries = null;
+                        // The latest metadata now has per-file references — use them.
+                        UploadedSegmentMetadata perFile = fresh.getMetadata().get(name);
+                        if (perFile != null) {
+                            logger.debug("Archive disabled in latest metadata, reading {} as per-file blob {}", name, perFile.uploadedFilename);
+                            return remoteDataDirectory.openInput(perFile.uploadedFilename, perFile.getLength(), context);
+                        }
+                        // File not in latest metadata — fall through to NoSuchFileException.
+                    }
+                } catch (IOException metaEx) {
+                    logger.warn("Metadata refresh also failed for {}: {}", name, metaEx.getMessage());
+                }
+                throw new NoSuchFileException(name + " (archive unavailable and metadata refresh failed or file not found)");
             }
         }
 
-        // Per-file download path (also serves as fallback from failed archive read).
+        // Per-file download path for non-archive files.
         String remoteFilename = getExistingRemoteFilename(name);
         long fileLength = fileLength(name);
         if (remoteFilename != null) {
