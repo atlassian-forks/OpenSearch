@@ -9,6 +9,7 @@
 package org.opensearch.remotestore;
 
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
+import org.opensearch.action.admin.indices.stats.IndicesStatsResponse;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
@@ -20,6 +21,7 @@ import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
 
@@ -274,6 +276,15 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         indexDocuments(DOCS_PER_BATCH);
         client().admin().indices().prepareRefresh(INDEX_NAME).get();
         client().admin().indices().prepareFlush(INDEX_NAME).setForce(true).get();
+
+        // Wait for global checkpoint to catch up to max seq no before closing.
+        // NoOpEngine (used on index reopen) asserts maxSeqNo == globalCheckpoint — if GCP
+        // hasn't advanced yet the assertion fires as a flaky failure.
+        assertBusy(() -> {
+            IndicesStatsResponse stats = client().admin().indices().prepareStats(INDEX_NAME).get();
+            long globalCheckpoint = stats.getShards()[0].getSeqNoStats().getGlobalCheckpoint();
+            assertEquals("Global checkpoint must match max seq no before close", DOCS_PER_BATCH * 2 - 1, globalCheckpoint);
+        }, 30, TimeUnit.SECONDS);
 
         long docCountBefore = client().prepareSearch(INDEX_NAME).setSize(0).get().getHits().getTotalHits().value;
         assertEquals("Should have all documents before close", DOCS_PER_BATCH * 2, docCountBefore);
