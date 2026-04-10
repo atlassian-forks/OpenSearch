@@ -240,8 +240,8 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
      */
     public void testReplicaServesDataAfterPrimaryFailure() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
-        String primaryNode = internalCluster().startDataOnlyNode();
-        String replicaNode = internalCluster().startDataOnlyNode();
+        internalCluster().startDataOnlyNode();
+        internalCluster().startDataOnlyNode();
 
         Settings indexSettings = Settings.builder()
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
@@ -253,6 +253,10 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
 
         createIndex(INDEX_NAME, indexSettings);
         ensureGreen(INDEX_NAME);
+
+        // Determine actual primary and replica from routing table (allocation is non-deterministic)
+        String replicaNode = getReplicaNodeName(INDEX_NAME, 0);
+        String actualPrimaryNode = getPrimaryNodeName(INDEX_NAME, 0);
 
         // Index data and flush to ensure archived segments are uploaded
         indexDocuments(DOCS_PER_BATCH * 2);
@@ -270,8 +274,8 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
             assertHitCount(response, DOCS_PER_BATCH * 2);
         }, 30, TimeUnit.SECONDS);
 
-        // Stop original primary — replica should be promoted
-        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNode));
+        // Stop actual primary (determined from routing table) — replica should be promoted
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(actualPrimaryNode));
 
         // Wait for cluster to stabilize (at least yellow = promoted replica is primary)
         ensureYellow(INDEX_NAME);
@@ -471,7 +475,7 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
      */
     public void testPromotedReplicaDocumentContentAfterPrimaryFailure() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
-        String primaryNode = internalCluster().startDataOnlyNode();
+        internalCluster().startDataOnlyNode();
         internalCluster().startDataOnlyNode();
 
         Settings indexSettings = Settings.builder()
@@ -485,7 +489,9 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         createIndex(INDEX_NAME, indexSettings);
         ensureGreen(INDEX_NAME);
 
+        // Determine actual primary and replica from routing table (allocation is non-deterministic)
         String replicaNode = getReplicaNodeName(INDEX_NAME, 0);
+        String actualPrimaryNode = getPrimaryNodeName(INDEX_NAME, 0);
 
         // Index known docs, flush so replica recovers from archive
         Map<String, String> knownDocs = indexKnownDocs(30);
@@ -496,8 +502,8 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         // Verify replica has correct content before kill
         verifyReplicaDocumentContent(replicaNode, knownDocs);
 
-        // Kill primary — replica promoted
-        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNode));
+        // Kill actual primary (determined from routing table, not from start order) — replica promoted
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(actualPrimaryNode));
         ensureYellow(INDEX_NAME);
 
         assertBusy(() -> {
@@ -616,6 +622,18 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
             .findFirst()
             .orElseThrow(() -> new AssertionError("No started replica shard for " + indexName + "/" + shardId));
         return state.nodes().get(replicaShard.currentNodeId()).getName();
+    }
+
+    /**
+     * Returns the node name holding the primary shard for the given index/shardId.
+     * Allocation is non-deterministic — do not assume a specific node holds the primary.
+     */
+    private String getPrimaryNodeName(String indexName, int shardId) {
+        ClusterState state = client().admin().cluster().prepareState().get().getState();
+        ShardRouting primaryShard = state.routingTable().index(indexName).shard(shardId).primaryShard();
+        assertNotNull("No primary shard for " + indexName + "/" + shardId, primaryShard);
+        assertTrue("Primary shard not started for " + indexName + "/" + shardId, primaryShard.started());
+        return state.nodes().get(primaryShard.currentNodeId()).getName();
     }
 
     /**
