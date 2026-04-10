@@ -11,6 +11,7 @@ package org.opensearch.index.store;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.Before;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -58,25 +59,53 @@ public class RemoteIndexInputTests extends OpenSearchTestCase {
 
     public void testReadBytes() throws IOException {
         byte[] buffer = new byte[20];
-        when(inputStream.read(eq(buffer), anyInt(), anyInt())).thenReturn(10).thenReturn(3).thenReturn(6).thenReturn(-1);
+        // All 20 bytes read in one call
+        when(inputStream.read(eq(buffer), anyInt(), anyInt())).thenReturn(20);
         remoteIndexInput.readBytes(buffer, 0, 20);
 
         verify(inputStream).read(buffer, 0, 20);
-        verify(inputStream).read(buffer, 10, 10);
-        verify(inputStream).read(buffer, 13, 7);
-        verify(inputStream).read(buffer, 19, 1);
-        assertEquals(19, remoteIndexInput.getFilePointer());
+        assertEquals(20, remoteIndexInput.getFilePointer());
     }
 
     public void testReadBytesMultipleIterations() throws IOException {
         byte[] buffer = new byte[20];
-        when(inputStream.read(eq(buffer), anyInt(), anyInt())).thenReturn(10).thenReturn(3).thenReturn(6).thenReturn(-1);
+        // 10 + 5 + 5 = 20 bytes across three reads
+        when(inputStream.read(eq(buffer), anyInt(), anyInt())).thenReturn(10).thenReturn(5).thenReturn(5);
         remoteIndexInput.readBytes(buffer, 0, 20);
 
         verify(inputStream).read(buffer, 0, 20);
         verify(inputStream).read(buffer, 10, 10);
-        verify(inputStream).read(buffer, 13, 7);
-        verify(inputStream).read(buffer, 19, 1);
+        verify(inputStream).read(buffer, 15, 5);
+        assertEquals(20, remoteIndexInput.getFilePointer());
+    }
+
+    /**
+     * Regression test for segment replication failure:
+     * "Premature end of Content-Length delimited message body (expected: 175,650; received: 8,192)"
+     * Root cause: readBytes silently returned when stream hit premature EOF (-1) without reading
+     * all requested bytes. copyBytes then closed the stream with unread bytes, causing
+     * ConnectionClosedException in S3RetryingInputStream.close().
+     * Fix: throw EOFException so S3RetryingInputStream.read() retry logic fires.
+     */
+    public void testReadBytesPrematureEOFThrowsEOFException() throws IOException {
+        byte[] buffer = new byte[20];
+        // Stream returns only 8 bytes then EOF — simulates truncated S3 response
+        when(inputStream.read(eq(buffer), anyInt(), anyInt())).thenReturn(8).thenReturn(-1);
+
+        EOFException ex = assertThrows(EOFException.class, () -> remoteIndexInput.readBytes(buffer, 0, 20));
+        assertTrue(ex.getMessage().contains("Premature EOF"));
+        // filePointer should reflect partial read
+        assertEquals(8, remoteIndexInput.getFilePointer());
+    }
+
+    public void testReadBytesImmediateEOFThrowsEOFException() throws IOException {
+        byte[] buffer = new byte[20];
+        // Stream immediately returns EOF
+        when(inputStream.read(eq(buffer), anyInt(), anyInt())).thenReturn(-1);
+
+        EOFException ex = assertThrows(EOFException.class, () -> remoteIndexInput.readBytes(buffer, 0, 20));
+        assertTrue(ex.getMessage().contains("Premature EOF"));
+        assertEquals(0, remoteIndexInput.getFilePointer());
     }
 
     public void testReadBytesIOException() throws IOException {
