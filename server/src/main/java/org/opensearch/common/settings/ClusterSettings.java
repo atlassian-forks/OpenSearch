@@ -780,7 +780,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE,
-                RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES,
+                RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_SCHEDULER_INTERVAL,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_LOOKBACK_INTERVAL,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_ENABLED,

@@ -370,13 +370,8 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         assertThat(uploadedPath, org.hamcrest.Matchers.containsString("translog"));
         assertThat(uploadedPath, org.hamcrest.Matchers.containsString("data"));
 
-        verify(transferManager).uploadMetadata(mockSnapshot);
-
-        // Verify archive metadata fields are populated on the real metadata object
-        assertNotNull("archiveBlobPath should be set on metadata", realMeta.getArchiveBlobPath());
-        assertThat(realMeta.getArchiveBlobPath(), endsWith(".zip"));
-        assertThat(realMeta.getArchiveBlobPath(), org.hamcrest.Matchers.containsString("translog/data/"));
-        assertNotNull("archiveEntryOffsets should be set on metadata", realMeta.getArchiveEntryOffsets());
+        // No per-shard metadata upload — recovery uses ZIP comment (ArchiveCommentFormat) instead
+        verify(transferManager, org.mockito.Mockito.never()).uploadMetadata(any());
 
         // Verify NO individual per-shard translog upload happened
         verify(transferManager, org.mockito.Mockito.never()).transferSnapshot(any(), any());
@@ -487,23 +482,8 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             eq(WritePriority.HIGH),
             eq(null)
         );
-        org.mockito.ArgumentCaptor<TransferSnapshot> snapshotCaptor = org.mockito.ArgumentCaptor.forClass(TransferSnapshot.class);
-        verify(transferManager, org.mockito.Mockito.times(2)).uploadMetadata(snapshotCaptor.capture());
-        assertThat(snapshotCaptor.getAllValues(), hasSize(2));
-        assertThat(snapshotCaptor.getAllValues().get(0), equalTo(mockSnapshot0));
-        assertThat(snapshotCaptor.getAllValues().get(1), equalTo(mockSnapshot1));
-
-        // Verify archive metadata is populated on BOTH shards' metadata objects
-        assertNotNull("shard0 archiveBlobPath should be set", realMeta0.getArchiveBlobPath());
-        assertNotNull("shard1 archiveBlobPath should be set", realMeta1.getArchiveBlobPath());
-        assertThat(realMeta0.getArchiveBlobPath(), endsWith(".zip"));
-        assertThat(realMeta1.getArchiveBlobPath(), endsWith(".zip"));
-        // Both shards reference the same archive blob
-        assertEquals("both shards should reference same archive", realMeta0.getArchiveBlobPath(), realMeta1.getArchiveBlobPath());
-        assertNotNull("shard0 archiveEntryOffsets should be set", realMeta0.getArchiveEntryOffsets());
-        assertNotNull("shard1 archiveEntryOffsets should be set", realMeta1.getArchiveEntryOffsets());
-        // Both share the same offsets map (same ZIP)
-        assertEquals(realMeta0.getArchiveEntryOffsets(), realMeta1.getArchiveEntryOffsets());
+        // No per-shard metadata upload — recovery uses ZIP comment (ArchiveCommentFormat) instead
+        verify(transferManager, org.mockito.Mockito.never()).uploadMetadata(any());
 
         // Verify NO individual per-shard translog upload happened
         verify(transferManager, org.mockito.Mockito.never()).transferSnapshot(any(), any());
@@ -766,7 +746,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
     }
 
     /**
-     * runBatch runs runArchiveRetention first; when a shard provides retention bounds and an archive is past retention, it is deleted.
+     * runRetentionForTesting runs archive retention; when a shard provides retention bounds and an archive is past retention, it is deleted.
      */
     public void testRunBatchRunsArchiveRetentionAndDeletesPastRetention() throws IOException {
         IndexMetadata metadata = IndexMetadata.builder("test-index")
@@ -839,7 +819,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             when(remoteStoreSettings.getPathHashAlgorithm()).thenReturn(RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
 
             TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
-            collector.runBatchForTesting();
+            collector.runRetentionForTesting();
 
             Map<String, BlobMetadata> after = blobStore.blobContainer(zipDir).listBlobs();
             assertThat("archive past retention should be deleted by runArchiveRetention", zipBlobCount(after), equalTo(0L));
@@ -1201,5 +1181,91 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
 
         // buildSnapshotForArchive should NOT be called
         verify(shard, org.mockito.Mockito.never()).buildSnapshotForArchive(any());
+    }
+
+    /**
+     * Orphaned archive ZIPs (from deleted indices) are detected via S3 folder scan and deleted
+     * when runRetentionForTesting is called with a live index that shares the same repo.
+     * The GC lists translog/data/ folders, computes live hashTypeIndex set, and deletes ZIPs
+     * under any folder not in the live set.
+     */
+    public void testOrphanedIndexArchiveZipsAreCleanedUpViaScan() throws IOException {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            RemoteStoreEnums.PathHashAlgorithm hashAlgo = RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
+            String uniqueBase = "base-" + randomAlphaOfLength(12);
+            BlobPath basePath = new BlobPath().add(uniqueBase);
+
+            // Deleted index — upload ZIPs to its archive dir
+            String deletedIndexUUID = "deleted-" + randomAlphaOfLength(6);
+            String nodeId = "node-1";
+            String deletedHashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(deletedIndexUUID, hashAlgo);
+            String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, hashAlgo);
+            BlobPath deletedZipDir = basePath.add("translog").add("data").add(deletedHashTypeIndex).add(hashNodeId);
+            byte[] zipBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(Collections.emptyList());
+            String blob1 = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(2))) + ".zip";
+            String blob2 = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofMinutes(5))) + ".zip";
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blob1, zipBytes, 0L), deletedZipDir, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blob2, zipBytes, 0L), deletedZipDir, WritePriority.HIGH);
+            assertThat(zipBlobCount(blobStore.blobContainer(deletedZipDir).listBlobs()), equalTo(2L));
+
+            // Live index — needs a shard with TranslogTransferManager to provide transferService + basePath
+            IndexMetadata metadata = IndexMetadata.builder("live-index")
+                .settings(
+                    Settings.builder()
+                        .put(IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.CURRENT)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                        .put(IndexMetadata.SETTING_REMOTE_TRANSLOG_STORE_REPOSITORY, "repo")
+                        .put(
+                            IndexMetadata.SETTING_REPLICATION_TYPE,
+                            org.opensearch.indices.replication.common.ReplicationType.SEGMENT.toString()
+                        )
+                        .put(IndexMetadata.SETTING_REMOTE_STORE_ENABLED, true)
+                        .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+                        .build()
+                )
+                .build();
+            IndexSettings indexSettings = new IndexSettings(metadata, Settings.EMPTY);
+
+            TranslogTransferManager transferManager = mock(TranslogTransferManager.class);
+            when(transferManager.getTransferService()).thenReturn(transferService);
+            when(transferManager.getArchiveBasePath()).thenReturn(basePath);
+
+            IndexShard liveShard = mock(IndexShard.class);
+            when(liveShard.shardId()).thenReturn(new ShardId(metadata.getIndex(), 0));
+            when(liveShard.isRemoteTranslogEnabled()).thenReturn(true);
+            when(liveShard.indexSettings()).thenReturn(indexSettings);
+            when(liveShard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
+            when(liveShard.getTranslogNodeId()).thenReturn(Optional.of(nodeId));
+            when(liveShard.getArchiveRetentionBounds()).thenReturn(Optional.empty());
+
+            IndexService liveIndexService = mock(IndexService.class);
+            when(liveIndexService.getIndexSettings()).thenReturn(indexSettings);
+            when(liveIndexService.getShardOrNull(0)).thenReturn(liveShard);
+
+            IndicesService indicesService = mock(IndicesService.class);
+            when(indicesService.indexService(any())).thenReturn(liveIndexService);
+            when(indicesService.iterator()).thenAnswer(inv -> Collections.singleton(liveIndexService).iterator());
+
+            RemoteStoreSettings remoteStoreSettings = mock(RemoteStoreSettings.class);
+            when(remoteStoreSettings.getClusterRemoteTranslogBufferInterval()).thenReturn(TimeValue.timeValueMinutes(1));
+            when(remoteStoreSettings.getPathHashAlgorithm()).thenReturn(hashAlgo);
+            when(remoteStoreSettings.getTranslogArchiveGcInterval()).thenReturn(TimeValue.timeValueMinutes(1));
+
+            TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
+            collector.runRetentionForTesting();
+
+            // Orphaned ZIPs for the deleted index should all be gone
+            assertThat(
+                "Orphaned ZIPs for deleted index should be removed by S3 scan",
+                zipBlobCount(blobStore.blobContainer(deletedZipDir).listBlobs()),
+                equalTo(0L)
+            );
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
     }
 }

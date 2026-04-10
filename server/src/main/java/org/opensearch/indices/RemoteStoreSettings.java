@@ -134,21 +134,14 @@ public class RemoteStoreSettings {
     );
 
     /**
-     * Controls retention period (in minutes) for translog archives.
-     * Used for node recovery and durability. Translog archives older than this period are deleted.
-     * Default: 60 minutes (1 hour). Range: 30-10080 minutes (30 min to 7 days).
-     * Note: Effective retention is longer than configured value due to batching semantics.
+     * Controls how often the translog archive retention GC runs (i.e. how frequently stale ZIPs are deleted).
+     * This is the timer repeat interval — separate from the data retention age.
+     * Default: 1 minute. Minimum: 1 minute.
      */
-    public static final Setting<Integer> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES = Setting.intSetting(
-        "cluster.remote_store.translog.archive.retention_minutes",
-        60,
-        30,
-        10080,
-        v -> {
-            if (v < 30 || v > 10080) {
-                throw new IllegalArgumentException("Translog archive retention must be between 30 minutes and 7 days (10080 minutes)");
-            }
-        },
+    public static final Setting<TimeValue> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL = Setting.timeSetting(
+        "cluster.remote_store.translog.archive.gc_interval",
+        TimeValue.timeValueMinutes(1),
+        TimeValue.timeValueMinutes(1),
         Property.NodeScope,
         Property.Dynamic
     );
@@ -256,7 +249,7 @@ public class RemoteStoreSettings {
     private volatile boolean translogArchiveFallbackToPerShard;
     private volatile boolean clusterRemoteStoreSegmentArchiveEnabled;
     private volatile boolean clusterRemoteStoreSegmentArchiveFallbackToPerFile;
-    private volatile int translogArchiveRetentionMinutes;
+    private volatile TimeValue translogArchiveGcInterval;
     private static volatile boolean isPinnedTimestampsEnabled;
     private static volatile TimeValue pinnedTimestampsSchedulerInterval;
     private static volatile TimeValue pinnedTimestampsLookbackInterval;
@@ -306,6 +299,27 @@ public class RemoteStoreSettings {
 
         translogPathFixedPrefix = CLUSTER_REMOTE_STORE_TRANSLOG_PATH_PREFIX.get(settings);
         segmentsPathFixedPrefix = CLUSTER_REMOTE_STORE_SEGMENTS_PATH_PREFIX.get(settings);
+
+        translogArchiveFallbackToPerShard = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_FALLBACK_TO_PER_SHARD,
+            this::setTranslogArchiveFallbackToPerShard
+        );
+
+        clusterRemoteStoreSegmentArchiveEnabled = CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED,
+            this::setClusterRemoteStoreSegmentArchiveEnabled
+        );
+
+        clusterRemoteStoreSegmentArchiveFallbackToPerFile = CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_FALLBACK_TO_PER_FILE,
+            this::setClusterRemoteStoreSegmentArchiveFallbackToPerFile
+        );
+
+        translogArchiveGcInterval = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL, this::setTranslogArchiveGcInterval);
     }
 
     public TimeValue getClusterRemoteTranslogBufferInterval() {
@@ -415,7 +429,28 @@ public class RemoteStoreSettings {
         return clusterRemoteStoreSegmentArchiveFallbackToPerFile;
     }
 
-    public int getTranslogArchiveRetentionMinutes() {
-        return translogArchiveRetentionMinutes;
+    /**
+     * Returns the translog archive GC interval — how often the retention GC timer fires.
+     * Distinct from the data retention age ({@code index.remote_store.translog.archive_retention}).
+     */
+    public TimeValue getTranslogArchiveGcInterval() {
+        return translogArchiveGcInterval != null ? translogArchiveGcInterval : TimeValue.timeValueMinutes(1);
     }
+
+    private void setTranslogArchiveGcInterval(TimeValue translogArchiveGcInterval) {
+        this.translogArchiveGcInterval = translogArchiveGcInterval;
+    }
+
+    private void setTranslogArchiveFallbackToPerShard(boolean translogArchiveFallbackToPerShard) {
+        this.translogArchiveFallbackToPerShard = translogArchiveFallbackToPerShard;
+    }
+
+    private void setClusterRemoteStoreSegmentArchiveEnabled(boolean clusterRemoteStoreSegmentArchiveEnabled) {
+        this.clusterRemoteStoreSegmentArchiveEnabled = clusterRemoteStoreSegmentArchiveEnabled;
+    }
+
+    private void setClusterRemoteStoreSegmentArchiveFallbackToPerFile(boolean clusterRemoteStoreSegmentArchiveFallbackToPerFile) {
+        this.clusterRemoteStoreSegmentArchiveFallbackToPerFile = clusterRemoteStoreSegmentArchiveFallbackToPerFile;
+    }
+
 }

@@ -28,7 +28,6 @@ import org.opensearch.index.translog.transfer.TransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
-import org.opensearch.index.translog.transfer.archive.ArchiveCommentFormat;
 import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.IndicesService;
@@ -45,6 +44,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -93,6 +93,8 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     private final ThreadPool threadPool;
     private final RemoteStoreSettings remoteStoreSettings;
     private volatile Scheduler.Cancellable scheduledTask;
+    /** Separate scheduled task for archive retention GC — runs at retention interval, not buffer interval. */
+    private volatile Scheduler.Cancellable retentionScheduledTask;
     /** Set of index UUIDs that use coordinator-based (school bus) uploads. */
     private final Set<String> coordinatorEnabledIndices = ConcurrentHashMap.newKeySet();
 
@@ -188,8 +190,17 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     @Override
     protected void doStart() {
         if (threadPool != null && remoteStoreSettings != null) {
-            TimeValue interval = remoteStoreSettings.getClusterRemoteTranslogBufferInterval();
-            scheduledTask = threadPool.scheduleWithFixedDelay(this::runBatch, interval, ThreadPool.Names.TRANSLOG_TRANSFER);
+            TimeValue uploadInterval = remoteStoreSettings.getClusterRemoteTranslogBufferInterval();
+            scheduledTask = threadPool.scheduleWithFixedDelay(this::runBatch, uploadInterval, ThreadPool.Names.TRANSLOG_TRANSFER);
+            // Retention GC runs on a separate schedule (default 1 min, configurable via
+            // cluster.remote_store.translog.archive.gc_interval) to avoid expensive S3 LIST
+            // calls every buffer_interval (650ms).
+            TimeValue retentionInterval = remoteStoreSettings.getTranslogArchiveGcInterval();
+            retentionScheduledTask = threadPool.scheduleWithFixedDelay(
+                this::runArchiveRetention,
+                retentionInterval,
+                ThreadPool.Names.TRANSLOG_TRANSFER
+            );
         }
     }
 
@@ -199,13 +210,16 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             scheduledTask.cancel();
             scheduledTask = null;
         }
+        if (retentionScheduledTask != null) {
+            retentionScheduledTask.cancel();
+            retentionScheduledTask = null;
+        }
     }
 
     @Override
     protected void doClose() {}
 
     private void runBatch() {
-        runArchiveRetention();
         // When the school-bus batch coordinator is active, archive uploads are handled inline
         // with the translog sync flow (via TranslogArchiveBatchCoordinator). The collector only
         // performs retention cleanup. Skip the upload path to avoid double uploads.
@@ -301,23 +315,34 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     }
 
     /**
-     * Runs archive retention: collects retention bounds from eligible shards and deletes archive blobs
-     * that are fully past retention. Uses the same timer as runBatch (no separate schedule).
+     * Runs archive retention for live indices and orphan cleanup for deleted indices.
+     * <p>
+     * <b>Live index retention</b>: deletes ZIPs older than {@code index.remote_store.translog.archive_retention}
+     * for each live (indexUUID, nodeId) pair.
+     * <p>
+     * <b>Orphan detection</b> (2 LISTs per orphaned index):
+     * <ol>
+     *   <li>LIST 1: {@code listFolders("translog/data/")} → all {@code {hashTypeIndex}} dirs on S3</li>
+     *   <li>Compute live set: {@code hashTypeIndex} for each live index UUID</li>
+     *   <li>Orphaned = S3 dirs − live set</li>
+     *   <li>LIST 2: for each orphaned dir, {@code listFolders("{hashTypeIndex}/")} → node dirs →
+     *       LIST + DELETE ALL ZIPs unconditionally</li>
+     * </ol>
+     * Uses the transferService/basePath from any live shard (all indices share the same repo root).
      */
     private void runArchiveRetention() {
-        List<ShardId> eligible = getEligibleShardIds();
-        if (eligible.isEmpty()) {
-            return;
-        }
-        // Collect one representative shard per index for retention bounds and transfer manager.
-        // Key: indexUUID → (retentionBounds, transferManager, nodeId)
-        Map<String, ArchiveDeletionHelper.RetentionBounds> retentionByIndex = new HashMap<>();
-        Map<String, TranslogTransferManager> transferManagerByIndex = new HashMap<>();
-        Map<String, String> nodeIdByIndex = new HashMap<>();
-
         RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm = remoteStoreSettings != null
             ? remoteStoreSettings.getPathHashAlgorithm()
             : RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
+
+        List<ShardId> eligible = getEligibleShardIds();
+
+        // Collect per-index info from live shards
+        Map<String, ArchiveDeletionHelper.RetentionBounds> retentionByIndex = new HashMap<>();
+        Map<String, TranslogTransferManager> transferManagerByIndex = new HashMap<>();
+        Map<String, String> nodeIdByIndex = new HashMap<>();
+        TransferService anyTransferService = null;
+        BlobPath anyBasePath = null;
 
         for (ShardId sid : eligible) {
             IndexService indexService = indicesService.indexService(sid.getIndex());
@@ -327,15 +352,20 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             String indexUUID = shard.indexSettings().getIndexMetadata().getIndexUUID();
             shard.getArchiveRetentionBounds().ifPresent(bounds -> retentionByIndex.put(indexUUID, bounds));
             if (!transferManagerByIndex.containsKey(indexUUID)) {
-                shard.getTranslogTransferManager().ifPresent(tm -> {
+                Optional<TranslogTransferManager> tmOpt = shard.getTranslogTransferManager();
+                if (tmOpt.isPresent()) {
+                    TranslogTransferManager tm = tmOpt.get();
                     transferManagerByIndex.put(indexUUID, tm);
                     shard.getTranslogNodeId().ifPresent(nid -> nodeIdByIndex.put(indexUUID, nid));
-                });
+                    if (anyTransferService == null) {
+                        anyTransferService = tm.getTransferService();
+                        anyBasePath = tm.getArchiveBasePath();
+                    }
+                }
             }
         }
-        if (retentionByIndex.isEmpty()) {
-            return;
-        }
+
+        // --- Live index retention ---
         for (Map.Entry<String, ArchiveDeletionHelper.RetentionBounds> e : retentionByIndex.entrySet()) {
             String indexUUID = e.getKey();
             ArchiveDeletionHelper.RetentionBounds bounds = e.getValue();
@@ -351,6 +381,91 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 logger.warn("Archive retention delete failed for index {}: {}", indexUUID, ex.getMessage());
             }
         }
+
+        // --- Orphaned index cleanup ---
+        // Requires at least one live shard to provide transferService + basePath for S3 access.
+        if (anyTransferService == null || anyBasePath == null) {
+            return;
+        }
+        // Compute the set of hashTypeIndex values for all currently live archive-enabled indices
+        Set<String> liveHashTypeIndices = new HashSet<>();
+        for (String indexUUID : transferManagerByIndex.keySet()) {
+            liveHashTypeIndices.add(TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm));
+        }
+        // LIST 1: all hashTypeIndex directories under translog/data/
+        BlobPath archiveDataPath = anyBasePath.add("translog").add("data");
+        Set<String> s3HashTypeDirs;
+        try {
+            s3HashTypeDirs = anyTransferService.listFolders(archiveDataPath);
+        } catch (IOException e) {
+            logger.warn("Failed to list archive data dirs for orphan detection: {}", e.getMessage());
+            return;
+        }
+        for (String hashTypeDir : s3HashTypeDirs) {
+            if (liveHashTypeIndices.contains(hashTypeDir)) {
+                continue; // live index — skip
+            }
+            // Orphaned index directory — LIST 2: find node subdirs then delete all ZIPs
+            BlobPath hashTypePath = archiveDataPath.add(hashTypeDir);
+            Set<String> nodeDirs;
+            try {
+                nodeDirs = anyTransferService.listFolders(hashTypePath);
+            } catch (IOException e) {
+                logger.warn("Failed to list node dirs for orphaned index dir {}: {}", hashTypeDir, e.getMessage());
+                continue;
+            }
+            for (String nodeDir : nodeDirs) {
+                BlobPath zipDir = hashTypePath.add(nodeDir);
+                try {
+                    int deleted = deleteAllArchives(anyTransferService, zipDir);
+                    if (deleted > 0) {
+                        logger.info("Deleted {} orphaned archive ZIPs from {}", deleted, zipDir.buildAsString());
+                    }
+                } catch (IOException e) {
+                    logger.warn("Failed to delete orphaned archive ZIPs from {}: {}", zipDir.buildAsString(), e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * Deletes all archive ZIPs under {@code zipDir} unconditionally (used for deleted-index cleanup).
+     * Does up to 2 LIST calls (paginated) and batch-deletes all found ZIPs.
+     *
+     * @return total number of ZIPs deleted
+     */
+    static int deleteAllArchives(TransferService transferService, BlobPath zipDir) throws IOException {
+        int deleted = 0;
+        boolean morePages;
+        do {
+            List<BlobMetadata> blobs;
+            try {
+                blobs = PlainActionFuture.<List<BlobMetadata>, IOException>get(
+                    f -> transferService.listAllInSortedOrder(zipDir, "", MAX_ARCHIVE_BLOBS_PER_NODE, f)
+                );
+            } catch (IOException e) {
+                logger.warn("List archive ZIPs failed at {}: {}", zipDir.buildAsString(), e.getMessage());
+                throw e;
+            }
+            if (blobs == null || blobs.isEmpty()) {
+                break;
+            }
+            List<String> toDelete = new ArrayList<>();
+            for (BlobMetadata blob : blobs) {
+                String name = blob.name();
+                if (name != null && name.endsWith(".zip")) {
+                    toDelete.add(name);
+                }
+            }
+            for (int i = 0; i < toDelete.size(); i += RETENTION_DELETE_BATCH_SIZE) {
+                int end = Math.min(i + RETENTION_DELETE_BATCH_SIZE, toDelete.size());
+                List<String> batch = toDelete.subList(i, end);
+                transferService.deleteBlobs(zipDir, new ArrayList<>(batch));
+                deleted += batch.size();
+            }
+            morePages = blobs.size() >= MAX_ARCHIVE_BLOBS_PER_NODE;
+        } while (morePages);
+        return deleted;
     }
 
     /**
@@ -472,11 +587,9 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
         // hashNodeId = hash(nodeId) — unique per node, isolates writes for S3 partition safety
         BlobPath archivePath = basePath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
-        // Pre-compute size and capture per-entry offsets for archive-based recovery metadata.
-        // Since the ZIP uses STORED (no compression), offsets are deterministic across builds.
+        // Pre-compute ZIP size (deterministic since STORED compression) for streaming upload.
+        // Offsets are embedded in the ZIP comment by ArchiveBuilder.buildWithComment — no separate metadata needed.
         ArchiveBuilder.SizeAndOffsets sizeAndOffsets = ArchiveBuilder.computeSizeAndOffsetsWithComment(allEntries);
-        List<ArchiveCommentFormat.PathOffsetLength> entryOffsets = sizeAndOffsets.getOffsets();
-
         AtomicReference<String> uploadedBlobName = new AtomicReference<>();
         IOException lastFailure = null;
         for (int attempt = 0; attempt < UPLOAD_RETRY_MAX_ATTEMPTS; attempt++) {
@@ -548,46 +661,16 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             uploadedBlobName.set(blobName);
             break;
         }
-        // Build archive entry offsets map for recovery metadata: entryPath → "offset,length"
-        Map<String, String> archiveEntryOffsetsMap = new HashMap<>();
-        for (ArchiveCommentFormat.PathOffsetLength pol : entryOffsets) {
-            archiveEntryOffsetsMap.put(pol.getPath(), pol.getOffset() + "," + pol.getLength());
-        }
-        String fullArchiveBlobPath = archivePath.buildAsString() + uploadedBlobName.get();
-
-        int metadataSuccessCount = 0;
-        for (int i = 0; i < contributingShards.size(); i++) {
-            final int shardIndex = i;
-            Optional<TranslogTransferManager> managerOpt = contributingShards.get(i).getTranslogTransferManager();
-            if (managerOpt.isPresent()) {
-                try {
-                    // Populate archive location in metadata for archive-based recovery
-                    snapshots.get(i).getTranslogTransferMetadata().setArchiveBlobPath(fullArchiveBlobPath);
-                    snapshots.get(i).getTranslogTransferMetadata().setArchiveEntryOffsets(archiveEntryOffsetsMap);
-                    managerOpt.get().uploadMetadata(snapshots.get(i));
-                    metadataSuccessCount++;
-                } catch (IOException e) {
-                    logger.warn(
-                        () -> new ParameterizedMessage(
-                            "Failed to upload metadata for archive snapshot from shard {}",
-                            contributingShards.get(shardIndex).shardId()
-                        ),
-                        e
-                    );
-                }
-            }
-        }
-
-        // If no metadata was uploaded successfully, the ZIP blob is orphaned — attempt cleanup.
-        if (metadataSuccessCount == 0 && uploadedBlobName.get() != null) {
-            logger.warn("All metadata uploads failed; attempting to delete orphaned archive blob {}", uploadedBlobName.get());
-            try {
-                transferService.deleteBlobs(archivePath, java.util.Collections.singletonList(uploadedBlobName.get()));
-                logger.info("Deleted orphaned archive blob {}", uploadedBlobName.get());
-            } catch (IOException deleteEx) {
-                logger.warn("Failed to delete orphaned archive blob {}: {}", uploadedBlobName.get(), deleteEx.getMessage());
-            }
-        }
+        // No per-shard metadata upload: the ZIP comment already contains all offset/length info
+        // (ArchiveCommentFormat: shardId,primaryTerm,gen,tlogOffset,tlogLen,ckpOffset,ckpLen per line).
+        // Recovery uses TranslogArchiveRecovery which range-reads ZIP tails and binary-searches
+        // by generation — no per-shard metadata file needed, saving N PUTs per batch.
+        logger.debug(
+            "Archive batch uploaded: path={} blob={} shards={}",
+            archivePath.buildAsString(),
+            uploadedBlobName.get(),
+            contributingShards.size()
+        );
     }
 
     private void runFallbackIfEnabled(List<IndexShard> contributingShards, List<TransferSnapshot> snapshots) {
@@ -641,6 +724,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     /**
      * Register an index as using coordinator-based (school bus) upload.
      * When registered, the collector skips upload for that index — only retention runs.
+     * Orphaned archive ZIPs for deleted indices are detected via S3 folder scan in the GC.
      */
     public void registerCoordinatorIndex(String indexUUID) {
         coordinatorEnabledIndices.add(indexUUID);
@@ -648,6 +732,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
 
     /**
      * Unregister an index from coordinator-based upload (e.g. on index deletion).
+     * Orphaned ZIPs are detected and cleaned up by the GC via S3 folder scan.
      */
     public void unregisterCoordinatorIndex(String indexUUID) {
         coordinatorEnabledIndices.remove(indexUUID);
@@ -663,9 +748,16 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     }
 
     /**
-     * Runs one batch synchronously; for unit tests only.
+     * Runs one upload batch synchronously; for unit tests only.
      */
     void runBatchForTesting() {
         runBatch();
+    }
+
+    /**
+     * Runs archive retention GC synchronously; for unit tests only.
+     */
+    void runRetentionForTesting() {
+        runArchiveRetention();
     }
 }
