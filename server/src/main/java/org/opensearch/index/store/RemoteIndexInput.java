@@ -10,7 +10,6 @@ package org.opensearch.index.store;
 
 import org.apache.lucene.store.IndexInput;
 
-import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -49,23 +48,16 @@ public class RemoteIndexInput extends IndexInput {
 
     @Override
     public void readBytes(byte[] b, int offset, int len) throws IOException {
-        int remaining = len;
-        while (remaining > 0) {
-            int bytesRead = inputStream.read(b, offset, remaining);
-            if (bytesRead == -1) {
-                throw new EOFException(
-                    "Premature EOF reading file "
-                        + toString()
-                        + ": expected "
-                        + len
-                        + " bytes but only "
-                        + (len - remaining)
-                        + " bytes available"
-                );
-            }
+        int bytesRead = inputStream.read(b, offset, len);
+        if (bytesRead == len) {
             filePointer += bytesRead;
-            offset += bytesRead;
-            remaining -= bytesRead;
+        } else {
+            while (bytesRead > 0 && bytesRead < len) {
+                filePointer += bytesRead;
+                len -= bytesRead;
+                offset += bytesRead;
+                bytesRead = inputStream.read(b, offset, len);
+            }
         }
     }
 
