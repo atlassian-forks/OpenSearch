@@ -627,22 +627,36 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     }
 
     /**
-     * Extracts a single file from an archive ZIP blob by streaming the ZIP entries.
+     * Extracts a single file from an archive ZIP blob.
      * Used when the file's {@code uploadedFilename} references an archive blob that is
      * not the current {@link #archiveStateRef} (i.e., the file lives in an older archive
      * whose per-entry offsets are not in memory).
      *
+     * The entire archive blob is buffered into memory before ZIP parsing.  This is
+     * necessary because the underlying blob stream (e.g., S3 HTTP) declares a
+     * Content-Length for the full archive.  If we wrapped the stream directly
+     * in a {@link java.util.zip.ZipInputStream} and returned after finding the target
+     * entry, the try-with-resources close would shut down the HTTP stream with
+     * most bytes unconsumed, causing {@code ConnectionClosedException: Premature end
+     * of Content-Length delimited message body}.
+     * Buffering ensures the blob stream is fully consumed before close.
+     *
      * @param name            the local segment filename to extract (e.g., {@code _a_Lucene90_0.dvm})
-     * @param archiveBlobName the remote archive blob name (e.g., {@code segment_archive_<ts>_<uuid>.zip})
+     * @param archiveBlobName the remote archive blob name (e.g., {@code segment_archive_ts_uuid.zip})
      * @return an {@link IndexInput} backed by the extracted file bytes
      * @throws NoSuchFileException if the file is not found inside the archive
      * @throws IOException         on I/O failure reading the archive blob
      */
     private IndexInput readFileFromArchiveBlob(String name, String archiveBlobName) throws IOException {
-        try (
-            InputStream blobStream = remoteDataDirectory.getBlobContainer().readBlob(archiveBlobName);
-            java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(blobStream)
-        ) {
+        // Read the full archive blob into memory so the underlying S3/HTTP stream is
+        // fully consumed before close (avoids ConnectionClosedException).
+        final byte[] archiveBytes;
+        try (InputStream blobStream = remoteDataDirectory.getBlobContainer().readBlob(archiveBlobName)) {
+            archiveBytes = blobStream.readAllBytes();
+        }
+
+        // Parse the in-memory ZIP to find the target entry.
+        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(archiveBytes))) {
             java.util.zip.ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 if (name.equals(entry.getName())) {

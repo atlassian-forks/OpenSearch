@@ -31,7 +31,6 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
@@ -111,7 +110,13 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
             }
             logger.debug("Downloading segment files from remote store {}", filesToFetch);
 
-            if (remoteMetadataExists()) {
+            // Do NOT call remoteDirectory.init() here.  getCheckpointMetadata() already
+            // called init() which populated segmentsUploadedToRemoteStore and archiveStateRef
+            // from the same metadata version used to compute filesToFetch.  A second init()
+            // would read the LATEST metadata file, which may have advanced (e.g. due to a
+            // merge on the primary) and no longer contain entries for files in filesToFetch,
+            // causing NoSuchFileException during download.
+            if (!remoteDirectory.getSegmentsUploadedToRemoteStore().isEmpty()) {
                 final Directory storeDirectory = indexShard.store().directory();
                 final Collection<String> directoryFiles = List.of(storeDirectory.listAll());
                 final List<String> toDownloadSegmentNames = new ArrayList<>();
@@ -146,15 +151,6 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
         return "RemoteStoreReplicationSource";
     }
 
-    private boolean remoteMetadataExists() throws IOException {
-        final AtomicBoolean metadataExists = new AtomicBoolean(false);
-        // Use init() instead of readLatestMetadataFile() so that currentArchiveBlobName and
-        // currentArchiveEntries are refreshed before downloadAsync() calls openInput().
-        // readLatestMetadataFile() only reads metadata but does NOT update the archive state fields,
-        // which would cause archive range-reads in openInput() to use stale offsets → CorruptIndexException.
-        cancellableThreads.executeIO(() -> metadataExists.set(remoteDirectory.init() != null));
-        return metadataExists.get();
-    }
 
     private RemoteSegmentMetadata getRemoteSegmentMetadata() throws IOException {
         AtomicReference<RemoteSegmentMetadata> mdFile = new AtomicReference<>();

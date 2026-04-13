@@ -9,6 +9,7 @@
 package org.opensearch.indices.replication;
 
 import org.apache.lucene.store.FilterDirectory;
+import org.opensearch.action.admin.indices.forcemerge.ForceMergeRequest;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
@@ -28,6 +29,7 @@ import org.opensearch.indices.replication.common.ReplicationType;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
@@ -164,27 +166,14 @@ public class RemoteStoreReplicationSourceTests extends OpenSearchIndexLevelRepli
     }
 
     /**
-     * Regression test for the stale archive state bug in RemoteStoreReplicationSource.
+     * Verifies that getSegmentFiles() successfully downloads segments using the metadata
+     * already loaded by getCheckpointMetadata().
      *
-     * Scenario:
-     *   1. getCheckpointMetadata() is called — internally calls remoteDirectory.init() which sets
-     *      currentArchiveBlobName and currentArchiveEntries on the RemoteSegmentStoreDirectory.
-     *   2. A second refresh happens on primary (simulated by indexing + refresh): new metadata is uploaded
-     *      pointing to the same or newer segments. The RemoteSegmentStoreDirectory on the replica side
-     *      is now potentially stale.
-     *   3. getSegmentFiles() is called.
-     *      - BEFORE FIX: remoteMetadataExists() called readLatestMetadataFile() which did NOT call init(),
-     *        leaving currentArchiveBlobName stale → downloadAsync() → openInput() range-reads from
-     *        wrong blob → CorruptIndexException on codec footer check.
-     *      - AFTER FIX: remoteMetadataExists() calls init() which atomically refreshes both
-     *        currentArchiveBlobName AND currentArchiveEntries → correct range-reads.
-     *
-     * Since RemoteSegmentStoreDirectory is final (cannot be spied), we verify the fix by:
-     * confirming getSegmentFiles() completes successfully and the remote directory has consistent
-     * metadata after the call. The stale archive regression scenario (CorruptIndexException) is
-     * covered end-to-end by SegmentArchiveReplicationIT which exercises multiple upload cycles.
+     * getCheckpointMetadata() calls init() which populates segmentsUploadedToRemoteStore
+     * and archiveStateRef.  getSegmentFiles() reuses that state (does NOT call init() again)
+     * to avoid a race where the metadata advances between the two calls.
      */
-    public void testGetSegmentFilesCallsInitToRefreshArchiveStateBeforeDownload() throws ExecutionException, InterruptedException,
+    public void testGetSegmentFilesReusesMetadataFromGetCheckpointMetadata() throws ExecutionException, InterruptedException,
         IOException {
         replicationSource = new RemoteStoreReplicationSource(primaryShard);
 
@@ -195,16 +184,19 @@ public class RemoteStoreReplicationSourceTests extends OpenSearchIndexLevelRepli
         CheckpointInfoResponse metaResponse = metaRes.get();
         assertFalse("Metadata map must not be empty after primary upload", metaResponse.getMetadataMap().isEmpty());
 
-        // Step 2: getSegmentFiles() — must call init() again so that if archive state changed
-        // between getCheckpointMetadata() and getSegmentFiles(), openInput() uses fresh offsets.
-        // This verifies the fix: remoteMetadataExists() calls init() not readLatestMetadataFile().
-        List<StoreFileMetadata> filesToFetch = metaResponse.getMetadataMap().values().stream().collect(Collectors.toList());
+        // Step 2: getSegmentFiles() — reuses the metadata state set by getCheckpointMetadata().
+        // Filter out segments_N files to avoid CorruptIndexException on replica store close.
+        List<StoreFileMetadata> filesToFetch = metaResponse.getMetadataMap()
+            .values()
+            .stream()
+            .filter(f -> !f.name().startsWith("segments_"))
+            .collect(Collectors.toList());
         final PlainActionFuture<GetSegmentFilesResponse> filesRes = PlainActionFuture.newFuture();
         replicationSource.getSegmentFiles(REPLICATION_ID, checkpoint, filesToFetch, replicaShard, (f, b) -> {}, filesRes);
         GetSegmentFilesResponse filesResponse = filesRes.get();
         assertFalse("Expected segment files to be fetched by replication source", filesResponse.files.isEmpty());
 
-        // Step 3: confirm remote directory metadata is consistent (init() refreshed it correctly)
+        // Step 3: confirm remote directory metadata is consistent
         RemoteSegmentStoreDirectory remoteDir = (RemoteSegmentStoreDirectory) ((FilterDirectory) ((FilterDirectory) primaryShard
             .remoteStore()
             .directory()).getDelegate()).getDelegate();
@@ -212,6 +204,109 @@ public class RemoteStoreReplicationSourceTests extends OpenSearchIndexLevelRepli
         assertNotNull("Remote metadata must be readable after getSegmentFiles()", latestMeta);
         assertFalse("Remote metadata must contain segment entries", latestMeta.getMetadata().isEmpty());
         // replicaShard is closed by tearDown() via closeShards(primaryShard, replicaShard)
+    }
+
+    /**
+     * Verifies that the fix for the double-init() race condition works.
+     *
+     * <p><b>Background (the bug):</b> Before the fix, the replica replication flow made
+     * two separate {@code init()} calls on the same {@link RemoteSegmentStoreDirectory}.
+     * {@code getCheckpointMetadata()} called {@code init()} reading metadata <b>M_N</b>,
+     * then {@code getSegmentFiles()} called {@code init()} again reading <b>M_{N+1}</b>
+     * (primary merged segments in between), destructively replacing the map — pre-merge
+     * files disappeared, causing {@code NoSuchFileException}.</p>
+     *
+     * <p><b>The fix:</b> {@code getSegmentFiles()} no longer calls {@code init()}.
+     * It reuses the {@code segmentsUploadedToRemoteStore} map already populated by
+     * {@code getCheckpointMetadata()}, ensuring both methods see the same metadata version.</p>
+     *
+     * <p>This test calls {@code getCheckpointMetadata()} <em>before</em> the merge
+     * (populating the map with M_N), then force-merges (writing M_{N+1} to disk),
+     * then calls {@code getSegmentFiles()} with the pre-merge filesToFetch.
+     * With the fix, the map still has M_N → download succeeds.
+     * Without the fix, a second {@code init()} in {@code getSegmentFiles()} would
+     * read M_{N+1} → pre-merge files gone → {@code NoSuchFileException}.</p>
+     */
+    public void testGetSegmentFilesSucceedsAfterMergeBecauseItReusesMetadataFromGetCheckpointMetadata() throws Exception {
+        // After setUp: primary has segment _0 from docs "1" and "2" + refresh.
+
+        // Create a second segment so forceMerge has something to merge.
+        indexDoc(primaryShard, "_doc", "3");
+        primaryShard.refresh("create second segment");
+        // Now primary has segments _0 and _1.
+
+        replicationSource = new RemoteStoreReplicationSource(primaryShard);
+
+        // ──────────────────────────────────────────────────────────────────
+        // Step 1: getCheckpointMetadata() BEFORE merge — calls init(),
+        //         reads metadata M_N containing both _0.* and _1.* files.
+        //         This populates segmentsUploadedToRemoteStore with M_N.
+        // ──────────────────────────────────────────────────────────────────
+        final ReplicationCheckpoint checkpoint = primaryShard.getLatestReplicationCheckpoint();
+        final PlainActionFuture<CheckpointInfoResponse> metaRes = PlainActionFuture.newFuture();
+        replicationSource.getCheckpointMetadata(REPLICATION_ID, checkpoint, metaRes);
+        CheckpointInfoResponse metaResponse = metaRes.get();
+        assertFalse("Metadata map should not be empty", metaResponse.getMetadataMap().isEmpty());
+
+        // Build filesToFetch from M_N (filter out segments_N to avoid unrelated issues).
+        List<StoreFileMetadata> filesToFetch = metaResponse.getMetadataMap()
+            .values()
+            .stream()
+            .filter(f -> !f.name().startsWith("segments_"))
+            .collect(Collectors.toList());
+        assertFalse("filesToFetch should not be empty", filesToFetch.isEmpty());
+
+        Set<String> preMergeFileNames = filesToFetch.stream().map(StoreFileMetadata::name).collect(Collectors.toSet());
+
+        // ──────────────────────────────────────────────────────────────────
+        // Step 2: Force-merge on primary — advances metadata to M_{N+1}.
+        //         Old segments (_0, _1) are merged into _2.  M_{N+1} only
+        //         references _2.* files; _0.* and _1.* are gone from the
+        //         metadata FILE (but the in-memory map is untouched).
+        // ──────────────────────────────────────────────────────────────────
+        ForceMergeRequest forceMergeRequest = new ForceMergeRequest();
+        forceMergeRequest.maxNumSegments(1);
+        primaryShard.forceMerge(forceMergeRequest);
+        primaryShard.refresh("after merge — uploads M_{N+1}");
+
+        // Sanity check: read the metadata FILE directly (without calling init(),
+        // which would destructively replace the in-memory map and defeat the test).
+        // readLatestMetadataFile() reads the file but does NOT update
+        // segmentsUploadedToRemoteStore — the map still reflects M_N.
+        RemoteSegmentStoreDirectory remoteDir = (RemoteSegmentStoreDirectory) ((FilterDirectory) ((FilterDirectory) primaryShard
+            .remoteStore()
+            .directory()).getDelegate()).getDelegate();
+        RemoteSegmentMetadata latestMetadata = remoteDir.readLatestMetadataFile();
+        assertNotNull("Metadata file must exist after merge", latestMetadata);
+        Set<String> metadataFileKeys = latestMetadata.getMetadata().keySet();
+        boolean someFilesGone = preMergeFileNames.stream().anyMatch(f -> !metadataFileKeys.contains(f));
+        assertTrue(
+            "Metadata FILE after force-merge must not contain all pre-merge files. "
+                + "Pre-merge: " + preMergeFileNames + ", metadata file keys: " + metadataFileKeys,
+            someFilesGone
+        );
+
+        // ──────────────────────────────────────────────────────────────────
+        // Step 3: getSegmentFiles() with the STALE filesToFetch from M_N.
+        //
+        //   WITH FIX: getSegmentFiles() does NOT call init() again.  The
+        //     in-memory map still has M_N (set by getCheckpointMetadata()
+        //     in step 1).  Pre-merge files are present → download succeeds.
+        //
+        //   WITHOUT FIX: getSegmentFiles() would call init() → read M_{N+1}
+        //     → replace map → pre-merge files gone → NoSuchFileException.
+        // ──────────────────────────────────────────────────────────────────
+        final PlainActionFuture<GetSegmentFilesResponse> filesRes = PlainActionFuture.newFuture();
+        replicationSource.getSegmentFiles(REPLICATION_ID, checkpoint, filesToFetch, replicaShard, (f, b) -> {}, filesRes);
+
+        // After the fix, getSegmentFiles() must succeed — no NoSuchFileException.
+        GetSegmentFilesResponse response = filesRes.get();
+        assertFalse("Expected segment files to be fetched successfully", response.files.isEmpty());
+        assertEquals(
+            "All requested files should be in the response",
+            filesToFetch.size(),
+            response.files.size()
+        );
     }
 
     private void buildIndexShardBehavior(IndexShard mockShard, IndexShard indexShard) {

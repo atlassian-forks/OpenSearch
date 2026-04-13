@@ -575,6 +575,95 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
     }
 
     /**
+     * Regression test: a fresh replica joining after multiple archives have been created
+     * must successfully download files from <em>all</em> archive blobs — including older
+     * ones whose entries are not in the in-memory {@code archiveState}.
+     *
+     * <p><b>Scenario that triggers the bug:</b></p>
+     * <ol>
+     *   <li>Primary-only node creates archive A1 (Refresh 1) and A2 (Refresh 2).</li>
+     *   <li>Latest metadata M2 stores {@code archiveEntries} for A2 only.</li>
+     *   <li>A fresh replica joins and calls {@code init()} → {@code archiveState} covers A2.</li>
+     *   <li>Replica needs files from A1 → {@code archiveState.entries} miss →
+     *       falls to per-file path → {@code readFileFromArchiveBlob()} is called.</li>
+     *   <li>{@code readFileFromArchiveBlob()} opens a full-blob S3 stream for A1
+     *       (e.g., 2,893,322 bytes), wraps it in {@code ZipInputStream}, finds the
+     *       target entry early (after ~8,192 bytes), reads it, then the
+     *       {@code try-with-resources} closes the S3 stream with most bytes unconsumed.</li>
+     *   <li>S3 HTTP layer throws:
+     *       <pre>ConnectionClosedException: Premature end of Content-Length delimited
+     *       message body (expected: 2,893,322; received: 8,192)</pre></li>
+     * </ol>
+     *
+     * <p>This test creates that exact scenario deterministically: primary-only with 0
+     * replicas, two separate flush cycles to produce two archive blobs, then a fresh
+     * replica that must recover everything from remote store.  With local fs-repository
+     * the premature close doesn't throw, but the test still verifies the ZIP extraction
+     * logic returns correct bytes for files in older archives.</p>
+     */
+    public void testFreshReplicaDownloadsFilesFromMultipleArchiveBlobs() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+
+        // Start with 0 replicas so all archives are created before any replica exists.
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(IndexMetadata.SETTING_REPLICATION_TYPE, ReplicationType.SEGMENT)
+            .put(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey(), "1s")
+            .put("index.remote_store.segment.archive_upload_enabled", true)
+            .build();
+
+        createIndex(INDEX_NAME, indexSettings);
+        ensureGreen(INDEX_NAME);
+
+        // Refresh 1 → archive A1 with segment files for batch 1
+        indexDocuments(DOCS_PER_BATCH);
+        flushAndRefresh(INDEX_NAME);
+
+        assertBusy(() -> {
+            List<String> archives = listSegmentArchives();
+            assertTrue("At least one archive must exist after first flush", archives.size() >= 1);
+        }, 30, TimeUnit.SECONDS);
+
+        // Refresh 2 → archive A2 with segment files for batch 2.
+        // Metadata M2 will have archiveEntries for A2 only; files from A1 are only
+        // reachable via segmentsUploadedToRemoteStore → readFileFromArchiveBlob().
+        indexDocuments(DOCS_PER_BATCH);
+        flushAndRefresh(INDEX_NAME);
+
+        assertBusy(() -> {
+            List<String> archives = listSegmentArchives();
+            assertTrue(
+                "Expected at least 2 archive blobs but got " + archives.size(),
+                archives.size() >= 2
+            );
+        }, 30, TimeUnit.SECONDS);
+
+        // Now add a fresh replica node — it has no local segment cache, so it must
+        // download ALL files from remote store.  Files from A1 exercise the
+        // readFileFromArchiveBlob() path (the code path that caused the S3
+        // ConnectionClosedException due to premature stream close).
+        String newReplicaNode = internalCluster().startDataOnlyNode();
+        client().admin()
+            .indices()
+            .prepareUpdateSettings(INDEX_NAME)
+            .setSettings(Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1))
+            .get();
+        ensureGreen(INDEX_NAME);
+
+        // Verify the fresh replica serves ALL documents from both archives.
+        assertBusy(() -> {
+            SearchResponse response = client(newReplicaNode).prepareSearch(INDEX_NAME)
+                .setPreference("_only_local")
+                .setSize(0)
+                .setQuery(QueryBuilders.matchAllQuery())
+                .get();
+            assertHitCount(response, DOCS_PER_BATCH * 2);
+        }, 60, TimeUnit.SECONDS);
+    }
+
+    /**
      * After primary failure, promoted replica must serve correct document content — not just count.
      * Enhances testReplicaServesDataAfterPrimaryFailure with per-doc content check.
      */
