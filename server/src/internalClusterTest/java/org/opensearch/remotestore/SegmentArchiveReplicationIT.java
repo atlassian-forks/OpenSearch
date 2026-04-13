@@ -470,6 +470,111 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
     }
 
     /**
+     * Regression test: rapid indexing with 1s refresh_interval and segment archive upload
+     * must not produce CorruptIndexException on the replica.
+     *
+     * <p><b>Root cause:</b> Each metadata file stores one {@code archiveBlob} name and one set
+     * of {@code archiveEntries} — the entries of the <em>latest</em> archive only. After
+     * multiple flush+refresh cycles, segment files span <em>multiple</em> archive blobs
+     * (A1, A2, A3, …). When the replica calls {@code init()} on its
+     * {@code RemoteSegmentStoreDirectory}, the loaded {@code archiveState.entries} only
+     * contains entries for the latest archive (e.g., A3). Files that were uploaded in older
+     * archives (A1, A2) are <b>not</b> in {@code archiveState.entries}.</p>
+     *
+     * <p>For those files, {@code openInput()} falls through to the per-file download path
+     * ({@code RemoteSegmentStoreDirectory.java} line 604–611). That path calls
+     * {@code getExistingRemoteFilename(name)}, which returns the archive blob name
+     * (e.g., {@code segment_archive_<ts>_<uuid>.zip}) from
+     * {@code segmentsUploadedToRemoteStore}. It then calls
+     * {@code remoteDataDirectory.openInput(archiveBlobName, fileLength, context)} —
+     * <b>opening the entire archive ZIP blob as if it were a single segment file</b> and
+     * reading only {@code fileLength} bytes from the beginning.  Those bytes are ZIP
+     * container header data, not the individual segment file's content.</p>
+     *
+     * <p>The corrupt bytes are written to the replica's local store. On the next
+     * replication round, {@code SegmentReplicationTarget.validateLocalChecksum()} reads the
+     * Lucene codec footer at the end of the local file and finds garbage instead of the
+     * expected magic number {@code 0xC03FD350}:</p>
+     *
+     * <pre>
+     * CorruptIndexException: codec footer mismatch (file truncated?):
+     *     actual footer=0 vs expected footer=-1071082520
+     * </pre>
+     *
+     * <p><b>Why 1s refresh triggers it:</b> Rapid refreshes create many archives. The
+     * replica falls behind (can't finish replicating before the next checkpoint) and
+     * eventually must download files from older archives → hits the fallback bug.</p>
+     *
+     * <p><b>Why 60s refresh doesn't trigger it:</b> The replica finishes replicating each
+     * checkpoint within the long refresh window. All needed files are in the current
+     * archive's entries.</p>
+     *
+     * <p>This test indexes 20 batches of 10 docs with {@code flushAndRefresh()} between
+     * each — no wait for the replica to catch up.  This creates 20+ archive blobs in
+     * rapid succession.  The final assertion waits for the replica to converge on the
+     * correct document count.  If the bug is present the replica keeps failing
+     * {@code validateLocalChecksum} with {@code CorruptIndexException} and never
+     * converges, causing the assertion to time out.</p>
+     */
+    public void testRapidRefreshWithArchiveUploadDoesNotCorruptReplicaSegments() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+        internalCluster().startDataOnlyNode();
+
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
+            .put(IndexMetadata.SETTING_REPLICATION_TYPE, ReplicationType.SEGMENT)
+            .put(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey(), "1s")
+            .put("index.remote_store.segment.archive_upload_enabled", true)
+            .build();
+
+        createIndex(INDEX_NAME, indexSettings);
+        ensureGreen(INDEX_NAME);
+
+        String replicaNode = getReplicaNodeName(INDEX_NAME, 0);
+
+        // Rapidly index many small batches with explicit flush between each.
+        // Each flushAndRefresh creates a new Lucene commit + triggers archive upload.
+        // Crucially, we do NOT wait for the replica between batches, so multiple
+        // archive blobs accumulate before the replica finishes replicating any single
+        // checkpoint. This forces the replica to download files from older archives
+        // via the per-file fallback path — the code path that triggers the bug.
+        int totalDocs = 0;
+        int batches = 20;
+        int docsPerBatch = 10;
+        for (int i = 0; i < batches; i++) {
+            indexDocuments(docsPerBatch);
+            totalDocs += docsPerBatch;
+            flushAndRefresh(INDEX_NAME);
+            // No assertBusy — blast through as fast as possible
+        }
+
+        // Wait for at least 2 archive blobs to confirm files span multiple archives
+        assertBusy(() -> {
+            List<String> archives = listSegmentArchives();
+            assertTrue(
+                "Expected multiple archive blobs but got " + archives.size() + "; files from older archives won't hit fallback path",
+                archives.size() >= 2
+            );
+        }, 30, TimeUnit.SECONDS);
+
+        // Wait for the replica to converge on the correct document count.
+        // If the per-file fallback produces corrupt bytes, validateLocalChecksum()
+        // throws CorruptIndexException on each replication attempt and the replica
+        // never catches up — this assertion times out.
+        final int expectedTotal = totalDocs;
+        assertBusy(() -> {
+            SearchResponse response = client(replicaNode).prepareSearch(INDEX_NAME)
+                .setPreference("_only_local")
+                .setSize(0)
+                .setQuery(QueryBuilders.matchAllQuery())
+                .get();
+            assertHitCount(response, expectedTotal);
+        }, 120, TimeUnit.SECONDS);
+    }
+
+    /**
      * After primary failure, promoted replica must serve correct document content — not just count.
      * Enhances testReplicaServesDataAfterPrimaryFailure with per-doc content check.
      */

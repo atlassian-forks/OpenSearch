@@ -40,6 +40,7 @@ import org.opensearch.index.store.lockmanager.RemoteStoreMetadataLockManager;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandler;
 import org.opensearch.index.store.remote.metadata.SegmentArchiveEntry;
+import org.opensearch.index.store.remote.segment.archive.SegmentArchiveRetentionHelper;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 import org.opensearch.node.remotestore.RemoteStorePinnedTimestampService;
 import org.opensearch.threadpool.ThreadPool;
@@ -601,14 +602,58 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             }
         }
 
-        // Per-file download path for non-archive files.
+        // Per-file download path.
         String remoteFilename = getExistingRemoteFilename(name);
-        long fileLength = fileLength(name);
         if (remoteFilename != null) {
+            // Guard: if remoteFilename is an archive blob, the file lives inside a ZIP —
+            // we must NOT open the raw archive as a regular segment file (that would read
+            // ZIP container bytes instead of the individual file's content).
+            // This happens when archiveState.entries only covers the latest archive but the
+            // file was uploaded in an older archive blob.
+            if (SegmentArchiveRetentionHelper.isArchiveBlob(remoteFilename)) {
+                logger.debug(
+                    "File {} maps to archive blob {} but was not in current archiveState entries; "
+                        + "extracting from ZIP via streaming read",
+                    name,
+                    remoteFilename
+                );
+                return readFileFromArchiveBlob(name, remoteFilename);
+            }
+            long fileLength = fileLength(name);
             return remoteDataDirectory.openInput(remoteFilename, fileLength, context);
         } else {
             throw new NoSuchFileException(name);
         }
+    }
+
+    /**
+     * Extracts a single file from an archive ZIP blob by streaming the ZIP entries.
+     * Used when the file's {@code uploadedFilename} references an archive blob that is
+     * not the current {@link #archiveStateRef} (i.e., the file lives in an older archive
+     * whose per-entry offsets are not in memory).
+     *
+     * @param name            the local segment filename to extract (e.g., {@code _a_Lucene90_0.dvm})
+     * @param archiveBlobName the remote archive blob name (e.g., {@code segment_archive_<ts>_<uuid>.zip})
+     * @return an {@link IndexInput} backed by the extracted file bytes
+     * @throws NoSuchFileException if the file is not found inside the archive
+     * @throws IOException         on I/O failure reading the archive blob
+     */
+    private IndexInput readFileFromArchiveBlob(String name, String archiveBlobName) throws IOException {
+        try (
+            InputStream blobStream = remoteDataDirectory.getBlobContainer().readBlob(archiveBlobName);
+            java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(blobStream)
+        ) {
+            java.util.zip.ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (name.equals(entry.getName())) {
+                    byte[] content = zis.readAllBytes();
+                    return new ByteArrayIndexInput(name, content);
+                }
+            }
+        }
+        throw new NoSuchFileException(
+            name + " (not found inside archive blob " + archiveBlobName + ")"
+        );
     }
 
     /**

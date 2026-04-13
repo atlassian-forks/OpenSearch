@@ -15,6 +15,7 @@ import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.test.OpenSearchIntegTestCase;
@@ -40,7 +41,7 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         return Settings.builder()
             .put(super.nodeSettings(nodeOrdinal))
             .put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_ARCHIVE_ENABLED.getKey(), true)
-            .put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_MINUTES.getKey(), 30)
+            .put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.getKey(), TimeValue.timeValueMinutes(1))
             .build();
     }
 
