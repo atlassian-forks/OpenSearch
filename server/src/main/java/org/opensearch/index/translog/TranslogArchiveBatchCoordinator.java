@@ -184,16 +184,6 @@ public class TranslogArchiveBatchCoordinator {
 
         lock.lock();
         try {
-            // Wait if a dispatch is in progress — we belong to the next batch
-            while (dispatching) {
-                try {
-                    batchComplete.await(batchInterval.millis(), TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while waiting for batch dispatch", e);
-                }
-            }
-
             // Add to current batch
             pendingShards.put(shardData.getShardId(), shardData);
             long shardBytes = shardData.getEntries().stream().mapToLong(ArchiveBuilder.ArchiveBuildEntry::getSize).sum();
@@ -259,44 +249,51 @@ public class TranslogArchiveBatchCoordinator {
             if (pendingShards.isEmpty() || dispatching) {
                 return;
             }
-            try {
-                dispatchUnderLock(transferService);
-            } catch (IOException e) {
-                logger.warn(() -> new ParameterizedMessage("Timer-triggered archive dispatch failed for index {}", indexUUID), e);
-            }
+            dispatchUnderLock(transferService);
         } finally {
             lock.unlock();
         }
     }
 
     /**
-     * Must be called under lock. Builds the ZIP, uploads it, and releases all waiting threads.
+     * Must be called under lock. Hands the current batch off to a background upload thread and
+     * resets the coordinator state immediately so that the next batch can start accumulating
+     * without waiting for the upload to complete (pipelining).
+     * <p>
+     * Callers still wait for the upload to finish via {@code dispatchLatch.await()} in
+     * {@link #submitAndWait}, preserving {@code durability=REQUEST} correctness.
      */
-    private void dispatchUnderLock(TransferService transferService) throws IOException {
+    private void dispatchUnderLock(TransferService transferService) {
         dispatching = true;
         Map<Integer, ShardArchiveData> batch = new HashMap<>(pendingShards);
         CountDownLatch currentLatch = dispatchLatch;
 
-        // Reset for next batch
+        // Reset state for next batch immediately — callers can start accumulating while upload runs
         pendingShards.clear();
         pendingBatchBytes = 0;
         batchStartNanos = 0;
         dispatchError = null;
         dispatchLatch = new CountDownLatch(1);
+        dispatching = false;
+        batchComplete.signalAll();
 
-        lock.unlock();
-        try {
-            uploadBatch(batch, transferService);
-        } catch (IOException e) {
-            dispatchError = e;
-            throw e;
-        } finally {
-            // Release all waiting threads
-            currentLatch.countDown();
-            lock.lock();
-            dispatching = false;
-            batchComplete.signalAll();
-        }
+        // Hand off upload to a background thread — lock is NOT held during upload.
+        // dispatchError is set BEFORE countDown so submitAndWait() sees it after latch.await().
+        Thread uploadThread = new Thread(() -> {
+            IOException uploadException = null;
+            try {
+                uploadBatch(batch, transferService);
+            } catch (IOException e) {
+                uploadException = e;
+                logger.warn(() -> new ParameterizedMessage("Archive batch upload failed for index {}", indexUUID), e);
+            } finally {
+                // Set error before releasing latch so submitAndWait() sees it after await()
+                dispatchError = uploadException;
+                currentLatch.countDown();
+            }
+        }, "translog-archive-upload-" + indexUUID);
+        uploadThread.setDaemon(true);
+        uploadThread.start();
     }
 
     /**

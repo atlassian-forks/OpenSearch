@@ -394,6 +394,87 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     }
 
     /**
+     * Pipelining: while batch N is uploading, the coordinator should immediately accept
+     * submissions for batch N+1 — i.e. the collection window for batch N+1 starts as soon
+     * as batch N is handed off to the upload thread, NOT after the upload completes.
+     *
+     * If upload takes U ms and batch interval is B ms, then two consecutive cycles should
+     * complete in approximately max(B, U) + B, NOT 2*(B + U).
+     *
+     * We verify this by injecting a slow upload (300ms) with a short batch interval (50ms).
+     * Without pipelining: 2 cycles = 2 * (50 + 300) = 700ms minimum.
+     * With pipelining:    2 cycles = (50 + 300) + 50 = 400ms (upload and next collection overlap).
+     */
+    public void testNextBatchCollectionStartsWhileUploadInProgress() throws Exception {
+        int batchIntervalMs = 50;
+        int uploadDelayMs = 300;
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(batchIntervalMs));
+        TransferService transferService = mock(TransferService.class);
+
+        // Slow upload: blocks for uploadDelayMs
+        org.mockito.Mockito.doAnswer(inv -> {
+            Thread.sleep(uploadDelayMs);
+            return null;
+        }).when(transferService).uploadBlobStream(any(), anyLong(), any(), anyString(), any(), any());
+
+        CountDownLatch bothDone = new CountDownLatch(2);
+        AtomicReference<Exception> error = new AtomicReference<>();
+        AtomicReference<Long> firstSubmitEndMs = new AtomicReference<>();
+        AtomicReference<Long> secondSubmitEndMs = new AtomicReference<>();
+
+        // Batch 1: submit shard 0, wait for it to complete
+        Thread batch1 = new Thread(() -> {
+            try {
+                coordinator.submitAndWait(createShardData(0, "batch1"), transferService);
+                firstSubmitEndMs.set(System.currentTimeMillis());
+            } catch (Exception e) {
+                error.set(e);
+            } finally {
+                bothDone.countDown();
+            }
+        }, "batch1-thread");
+
+        // Batch 2: submit shard 1 shortly after batch 1 starts (while upload of batch 1 is in progress)
+        Thread batch2 = new Thread(() -> {
+            try {
+                Thread.sleep(batchIntervalMs + 10); // start after batch 1 has been dispatched
+                coordinator.submitAndWait(createShardData(1, "batch2"), transferService);
+                secondSubmitEndMs.set(System.currentTimeMillis());
+            } catch (Exception e) {
+                error.set(e);
+            } finally {
+                bothDone.countDown();
+            }
+        }, "batch2-thread");
+
+        long start = System.currentTimeMillis();
+        batch1.start();
+        batch2.start();
+
+        assertTrue("Both batches should complete", bothDone.await(10, TimeUnit.SECONDS));
+        long totalMs = System.currentTimeMillis() - start;
+        assertNull("No errors expected: " + error.get(), error.get());
+
+        // With pipelining: batch2 collection starts while batch1 uploads
+        // total ≈ (batchInterval + uploadDelay) + batchInterval = 400ms
+        // Without pipelining: total ≈ (batchInterval + uploadDelay) * 2 = 700ms
+        long pipelinedBound = (batchIntervalMs + uploadDelayMs) + batchIntervalMs + 100; // 400ms + slack
+        assertTrue(
+            "With pipelining total time "
+                + totalMs
+                + "ms should be < "
+                + pipelinedBound
+                + "ms (non-pipelined would be ~"
+                + 2 * (batchIntervalMs + uploadDelayMs)
+                + "ms)",
+            totalMs < pipelinedBound
+        );
+
+        // Both uploads happened (two separate batches)
+        verify(transferService, times(2)).uploadBlobStream(any(), anyLong(), any(), anyString(), any(), any());
+    }
+
+    /**
      * Coordinator failure propagates to multiple waiting threads: when upload fails,
      * all threads that submitted to the same batch receive the error.
      */
