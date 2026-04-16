@@ -140,6 +140,13 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      */
     protected final AtomicBoolean canDeleteStaleCommits = new AtomicBoolean(true);
 
+    /**
+     * Tracks the last time (epoch ms) a segment GC run was dispatched.
+     * Used to rate-limit GC frequency via {@code cluster.remote_store.segment.metadata.gc.min_interval}.
+     * Visible for testing.
+     */
+    protected final AtomicLong lastSegmentGcRunTimeMs = new AtomicLong(0);
+
     private final AtomicLong metadataUploadCounter = new AtomicLong(0);
 
     public static final int METADATA_FILES_TO_FETCH = 10;
@@ -665,9 +672,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                 }
             }
         }
-        throw new NoSuchFileException(
-            name + " (not found inside archive blob " + archiveBlobName + ")"
-        );
+        throw new NoSuchFileException(name + " (not found inside archive blob " + archiveBlobName + ")");
     }
 
     /**
@@ -1229,20 +1234,42 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     }
 
     public void deleteStaleSegmentsAsync(int lastNMetadataFilesToKeep) {
-        deleteStaleSegmentsAsync(lastNMetadataFilesToKeep, ActionListener.wrap(r -> {}, e -> {}));
+        deleteStaleSegmentsAsync(lastNMetadataFilesToKeep, 0, ActionListener.wrap(r -> {}, e -> {}));
     }
 
     /**
-     * Delete stale segment and metadata files asynchronously.
-     * This method calls {@link RemoteSegmentStoreDirectory#deleteStaleSegments(int)} in an async manner.
+     * Delete stale segment and metadata files asynchronously, with a minimum GC interval guard.
      *
      * @param lastNMetadataFilesToKeep number of metadata files to keep
+     * @param minIntervalMs            minimum milliseconds that must elapse between consecutive GC runs;
+     *                                 {@code 0} disables rate-limiting and preserves the original behaviour
      */
-    public void deleteStaleSegmentsAsync(int lastNMetadataFilesToKeep, ActionListener<Void> listener) {
+    public void deleteStaleSegmentsAsync(int lastNMetadataFilesToKeep, long minIntervalMs) {
+        deleteStaleSegmentsAsync(lastNMetadataFilesToKeep, minIntervalMs, ActionListener.wrap(r -> {}, e -> {}));
+    }
+
+    /**
+     * Delete stale segment and metadata files asynchronously, with a minimum GC interval guard.
+     * <p>
+     * When {@code minIntervalMs > 0}, the GC is skipped if less than {@code minIntervalMs} have elapsed
+     * since the last dispatch. The underlying {@link #deleteStaleSegments(int)} algorithm is unchanged —
+     * it still performs a full S3 LIST and correctly identifies stale files each time it runs.
+     * Skipping only delays cleanup; it never causes orphaned files or incorrect deletions.
+     *
+     * @param lastNMetadataFilesToKeep number of metadata files to keep
+     * @param minIntervalMs            minimum milliseconds between GC runs; {@code 0} = no rate-limit
+     * @param listener                 callback on completion or failure
+     */
+    public void deleteStaleSegmentsAsync(int lastNMetadataFilesToKeep, long minIntervalMs, ActionListener<Void> listener) {
+        if (minIntervalMs > 0 && (threadPool.absoluteTimeInMillis() - lastSegmentGcRunTimeMs.get()) < minIntervalMs) {
+            logger.trace("Skipping segment GC — min interval {}ms not yet elapsed since last run", minIntervalMs);
+            return;
+        }
         if (canDeleteStaleCommits.compareAndSet(true, false)) {
             try {
                 threadPool.executor(ThreadPool.Names.REMOTE_PURGE).execute(() -> {
                     try {
+                        lastSegmentGcRunTimeMs.set(threadPool.absoluteTimeInMillis());
                         deleteStaleSegments(lastNMetadataFilesToKeep);
                         listener.onResponse(null);
                     } catch (Exception e) {
@@ -1311,6 +1338,6 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
     @Override
     public void close() throws IOException {
-        deleteStaleSegmentsAsync(0, ActionListener.wrap(r -> deleteIfEmpty(), e -> logger.error("Failed to cleanup remote directory")));
+        deleteStaleSegmentsAsync(0, 0, ActionListener.wrap(r -> deleteIfEmpty(), e -> logger.error("Failed to cleanup remote directory")));
     }
 }

@@ -815,6 +815,7 @@ public class RemoteStoreRefreshListenerTests extends IndexShardTestCase {
         when(shard.shardId()).thenReturn(indexShard.shardId());
         RemoteStoreSettings remoteStoreSettings = mock(RemoteStoreSettings.class);
         when(remoteStoreSettings.getMinRemoteSegmentMetadataFiles()).thenReturn(10);
+        when(remoteStoreSettings.getSegmentMetadataGcMinInterval()).thenReturn(TimeValue.ZERO);
         when(shard.getRemoteStoreSettings()).thenReturn(remoteStoreSettings);
         if (testUploadTimeout) {
             when(remoteStoreSettings.getClusterRemoteSegmentTransferTimeout()).thenReturn(TimeValue.timeValueMillis(10));

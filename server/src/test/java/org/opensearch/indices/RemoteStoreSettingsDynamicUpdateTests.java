@@ -127,4 +127,36 @@ public class RemoteStoreSettingsDynamicUpdateTests extends OpenSearchTestCase {
         );
         assertEquals(-1, remoteStoreSettings.getMaxRemoteTranslogReaders());
     }
+
+    public void testSegmentMetadataGcMinInterval() {
+        // Default value is 30s
+        assertEquals(TimeValue.timeValueSeconds(30), remoteStoreSettings.getSegmentMetadataGcMinInterval());
+
+        // Dynamic update to a custom value
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_METADATA_GC_MIN_INTERVAL.getKey(), "10s").build()
+        );
+        assertEquals(TimeValue.timeValueSeconds(10), remoteStoreSettings.getSegmentMetadataGcMinInterval());
+
+        // Setting to 0s disables rate-limiting
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_METADATA_GC_MIN_INTERVAL.getKey(), "0s").build()
+        );
+        assertEquals(TimeValue.ZERO, remoteStoreSettings.getSegmentMetadataGcMinInterval());
+
+        // Setting to a larger value (60s)
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_METADATA_GC_MIN_INTERVAL.getKey(), "60s").build()
+        );
+        assertEquals(TimeValue.timeValueSeconds(60), remoteStoreSettings.getSegmentMetadataGcMinInterval());
+
+        // Negative value should be rejected — existing value retained
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> clusterSettings.applySettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_METADATA_GC_MIN_INTERVAL.getKey(), "-1s").build()
+            )
+        );
+        assertEquals(TimeValue.timeValueSeconds(60), remoteStoreSettings.getSegmentMetadataGcMinInterval());
+    }
 }

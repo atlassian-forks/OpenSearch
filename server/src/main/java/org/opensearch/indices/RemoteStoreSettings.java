@@ -147,6 +147,21 @@ public class RemoteStoreSettings {
     );
 
     /**
+     * Minimum interval between consecutive segment metadata GC runs per shard.
+     * Segment GC is triggered after every refresh, but with high refresh rates this leads to excessive S3 LIST calls.
+     * Setting a minimum interval rate-limits how often the GC actually executes while keeping the algorithm correct —
+     * the full S3 LIST + stale file deletion still runs each time, just not more often than this interval.
+     * Set to {@code 0s} to restore the original behaviour (GC after every refresh).
+     */
+    public static final Setting<TimeValue> CLUSTER_REMOTE_STORE_SEGMENT_METADATA_GC_MIN_INTERVAL = Setting.timeSetting(
+        "cluster.remote_store.segment.metadata.gc.min_interval",
+        TimeValue.timeValueSeconds(30),
+        TimeValue.timeValueSeconds(0),
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
+    /**
      * This setting is used to set the remote store blob store path hash algorithm strategy. This setting is effective only for
      * remote store enabled cluster. This setting will come to effect if the {@link #CLUSTER_REMOTE_STORE_PATH_TYPE_SETTING}
      * is either {@code HASHED_PREFIX} or {@code HASHED_INFIX}.
@@ -250,6 +265,7 @@ public class RemoteStoreSettings {
     private volatile boolean clusterRemoteStoreSegmentArchiveEnabled;
     private volatile boolean clusterRemoteStoreSegmentArchiveFallbackToPerFile;
     private volatile TimeValue translogArchiveGcInterval;
+    private volatile TimeValue segmentMetadataGcMinInterval;
     private static volatile boolean isPinnedTimestampsEnabled;
     private static volatile TimeValue pinnedTimestampsSchedulerInterval;
     private static volatile TimeValue pinnedTimestampsLookbackInterval;
@@ -320,6 +336,12 @@ public class RemoteStoreSettings {
 
         translogArchiveGcInterval = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.get(settings);
         clusterSettings.addSettingsUpdateConsumer(CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL, this::setTranslogArchiveGcInterval);
+
+        segmentMetadataGcMinInterval = CLUSTER_REMOTE_STORE_SEGMENT_METADATA_GC_MIN_INTERVAL.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_SEGMENT_METADATA_GC_MIN_INTERVAL,
+            this::setSegmentMetadataGcMinInterval
+        );
     }
 
     public TimeValue getClusterRemoteTranslogBufferInterval() {
@@ -439,6 +461,14 @@ public class RemoteStoreSettings {
 
     private void setTranslogArchiveGcInterval(TimeValue translogArchiveGcInterval) {
         this.translogArchiveGcInterval = translogArchiveGcInterval;
+    }
+
+    public TimeValue getSegmentMetadataGcMinInterval() {
+        return segmentMetadataGcMinInterval;
+    }
+
+    private void setSegmentMetadataGcMinInterval(TimeValue segmentMetadataGcMinInterval) {
+        this.segmentMetadataGcMinInterval = segmentMetadataGcMinInterval;
     }
 
     private void setTranslogArchiveFallbackToPerShard(boolean translogArchiveFallbackToPerShard) {

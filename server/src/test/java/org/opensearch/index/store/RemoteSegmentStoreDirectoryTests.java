@@ -1117,6 +1117,69 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
         verify(remoteMetadataDirectory).deleteFile(metadataFilename3);
     }
 
+    public void testDeleteStaleCommitsRateLimitedSkipsWhenTooSoon() throws Exception {
+        populateMetadata();
+        remoteSegmentStoreDirectory.init();
+
+        long fixedNow = 1_000_000L;
+        // Simulate last GC ran just now
+        remoteSegmentStoreDirectory.lastSegmentGcRunTimeMs.set(fixedNow);
+        when(threadPool.absoluteTimeInMillis()).thenReturn(fixedNow + 5_000L); // only 5s elapsed
+
+        long minIntervalMs = 30_000L; // 30s min interval
+        remoteSegmentStoreDirectory.deleteStaleSegmentsAsync(2, minIntervalMs);
+
+        // GC must be skipped — no files deleted, semaphore still available
+        assertBusy(() -> assertThat(remoteSegmentStoreDirectory.canDeleteStaleCommits.get(), is(true)));
+        verify(remoteMetadataDirectory, times(0)).deleteFile(any(String.class));
+    }
+
+    public void testDeleteStaleCommitsRateLimitedRunsWhenIntervalElapsed() throws Exception {
+        populateMetadata();
+        remoteSegmentStoreDirectory.init();
+
+        long fixedNow = 1_000_000L;
+        // Simulate last GC ran 35s ago (> 30s min interval)
+        remoteSegmentStoreDirectory.lastSegmentGcRunTimeMs.set(fixedNow - 35_000L);
+        when(threadPool.absoluteTimeInMillis()).thenReturn(fixedNow);
+
+        long minIntervalMs = 30_000L; // 30s min interval
+        // populateMetadata() stubs 3 metadata files; keep 2 → 1 stale file deleted
+        remoteSegmentStoreDirectory.deleteStaleSegmentsAsync(2, minIntervalMs);
+
+        assertBusy(() -> assertThat(remoteSegmentStoreDirectory.canDeleteStaleCommits.get(), is(true)));
+        verify(remoteMetadataDirectory, times(1)).deleteFile(metadataFilename3);
+    }
+
+    public void testDeleteStaleCommitsRateLimitedZeroIntervalDisablesRateLimit() throws Exception {
+        populateMetadata();
+        remoteSegmentStoreDirectory.init();
+
+        // lastSegmentGcRunTimeMs = 0 (never run), minIntervalMs = 0 (disabled)
+        when(threadPool.absoluteTimeInMillis()).thenReturn(0L);
+
+        // minIntervalMs=0 means no rate-limiting — should always run
+        remoteSegmentStoreDirectory.deleteStaleSegmentsAsync(2, 0L);
+
+        assertBusy(() -> assertThat(remoteSegmentStoreDirectory.canDeleteStaleCommits.get(), is(true)));
+        verify(remoteMetadataDirectory, times(1)).deleteFile(metadataFilename3);
+    }
+
+    public void testDeleteStaleCommitsRateLimitedUpdatesLastRunTime() throws Exception {
+        populateMetadata();
+        remoteSegmentStoreDirectory.init();
+
+        long before = System.currentTimeMillis();
+        when(threadPool.absoluteTimeInMillis()).thenReturn(before);
+
+        // First call — interval elapsed (lastRunTime=0, minInterval=30s, now=before >> 30s)
+        remoteSegmentStoreDirectory.deleteStaleSegmentsAsync(2, 30_000L);
+        assertBusy(() -> assertThat(remoteSegmentStoreDirectory.canDeleteStaleCommits.get(), is(true)));
+
+        // lastSegmentGcRunTimeMs must have been updated to `before`
+        assertThat(remoteSegmentStoreDirectory.lastSegmentGcRunTimeMs.get(), is(before));
+    }
+
     public void testSegmentMetadataCurrentVersion() {
         /*
           This is a fake test which will fail whenever the CURRENT_VERSION is incremented.
