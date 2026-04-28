@@ -41,6 +41,7 @@ import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandler;
 import org.opensearch.index.store.remote.metadata.SegmentArchiveEntry;
 import org.opensearch.index.store.remote.segment.archive.SegmentArchiveRetentionHelper;
+import org.opensearch.index.store.remote.segment.archive.ZipSegmentParser;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 import org.opensearch.node.remotestore.RemoteStorePinnedTimestampService;
 import org.opensearch.threadpool.ThreadPool;
@@ -123,6 +124,34 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
     private final java.util.concurrent.atomic.AtomicReference<ArchiveState> archiveStateRef =
         new java.util.concurrent.atomic.AtomicReference<>(null);
+
+    /**
+     * LRU cache for central-directory entries of *older* archive blobs.
+     * Allows {@link #readFileFromArchiveBlob} to use a range-GET for the
+     * file data instead of downloading the entire ZIP.
+     *
+     * <p>Keyed by archive blob name; value is the map of filename →
+     * {@link SegmentArchiveEntry} parsed from that blob's central directory.
+     * Bounded to {@value #ARCHIVE_INDEX_CACHE_SIZE} entries so memory stays
+     * proportional to active segments, not the full history.
+     */
+    static final int ARCHIVE_INDEX_CACHE_SIZE = 20;
+
+    /** Max bytes to range-read from the tail of a ZIP for central-directory parsing. */
+    private static final int ZIP_TAIL_BYTES = 65_536 + 22; // max EOCD search range + EOCD record
+
+    @SuppressWarnings("serial")
+    private final Map<String, Map<String, SegmentArchiveEntry>> archiveIndexCache =
+        java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<String, Map<String, SegmentArchiveEntry>>(
+                ARCHIVE_INDEX_CACHE_SIZE + 1, 0.75f, true   // accessOrder=true → LRU
+            ) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Map<String, SegmentArchiveEntry>> eldest) {
+                    return size() > ARCHIVE_INDEX_CACHE_SIZE;
+                }
+            }
+        );
 
     private static final VersionedCodecStreamWrapper<RemoteSegmentMetadata> metadataStreamWrapper = new VersionedCodecStreamWrapper<>(
         new RemoteSegmentMetadataHandler(),
@@ -634,41 +663,85 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     }
 
     /**
-     * Extracts a single file from an archive ZIP blob.
-     * Used when the file's {@code uploadedFilename} references an archive blob that is
-     * not the current {@link #archiveStateRef} (i.e., the file lives in an older archive
-     * whose per-entry offsets are not in memory).
+     * Extracts a single file from an older archive ZIP blob using range-GETs.
      *
-     * The entire archive blob is buffered into memory before ZIP parsing.  This is
-     * necessary because the underlying blob stream (e.g., S3 HTTP) declares a
-     * Content-Length for the full archive.  If we wrapped the stream directly
-     * in a {@link java.util.zip.ZipInputStream} and returned after finding the target
-     * entry, the try-with-resources close would shut down the HTTP stream with
-     * most bytes unconsumed, causing {@code ConnectionClosedException: Premature end
-     * of Content-Length delimited message body}.
-     * Buffering ensures the blob stream is fully consumed before close.
+     * <p><b>Strategy (2 S3 GETs on cache miss, 1 S3 GET on cache hit):</b>
+     * <ol>
+     *   <li>Look up the archive's central-directory map in {@link #archiveIndexCache} (LRU, up to
+     *       {@value #ARCHIVE_INDEX_CACHE_SIZE} blobs).</li>
+     *   <li>On <em>cache miss</em>: range-read the last {@value ZIP_TAIL_BYTES} bytes of the blob to
+     *       parse the ZIP central directory via {@link ZipSegmentParser}, populate the cache.</li>
+     *   <li>Use the cached {@link SegmentArchiveEntry} to range-read just the target file's bytes.</li>
+     * </ol>
+     *
+     * <p>This replaces the previous full-blob download, reducing S3 bytes transferred from
+     * {@code archiveSize} to at most {@code ZIP_TAIL_BYTES + fileSize} per cache-miss call,
+     * and to just {@code fileSize} on a cache hit.
      *
      * @param name            the local segment filename to extract (e.g., {@code _a_Lucene90_0.dvm})
-     * @param archiveBlobName the remote archive blob name (e.g., {@code segment_archive_ts_uuid.zip})
+     * @param archiveBlobName the remote archive blob name
      * @return an {@link IndexInput} backed by the extracted file bytes
      * @throws NoSuchFileException if the file is not found inside the archive
-     * @throws IOException         on I/O failure reading the archive blob
+     * @throws IOException         on I/O failure
      */
     private IndexInput readFileFromArchiveBlob(String name, String archiveBlobName) throws IOException {
-        // Read the full archive blob into memory so the underlying S3/HTTP stream is
-        // fully consumed before close (avoids ConnectionClosedException).
+        // Step 1: resolve central-directory entries (cache hit = 0 S3 GETs, miss = 1 range GET)
+        Map<String, SegmentArchiveEntry> entries = archiveIndexCache.get(archiveBlobName);
+        if (entries == null) {
+            // Get blob size via exact-prefix LIST (1 LIST per cache miss, amortized across many reads).
+            Map<String, org.opensearch.common.blobstore.BlobMetadata> blobs =
+                remoteDataDirectory.getBlobContainer().listBlobsByPrefix(archiveBlobName);
+            org.opensearch.common.blobstore.BlobMetadata meta = blobs.get(archiveBlobName);
+            if (meta == null) {
+                throw new NoSuchFileException(archiveBlobName + " (blob not found)");
+            }
+            long blobLength = meta.length();
+
+            // Range-read the tail of the ZIP to parse its central directory.
+            long tailOffset = Math.max(0, blobLength - ZIP_TAIL_BYTES);
+            long tailLength = blobLength - tailOffset;
+            final byte[] tail;
+            try (InputStream tailStream = remoteDataDirectory.getBlobContainer()
+                .readBlob(archiveBlobName, tailOffset, tailLength)) {
+                tail = tailStream.readAllBytes();
+            }
+            entries = ZipSegmentParser.parseToMap(tail, tailOffset);
+            if (entries != null) {
+                archiveIndexCache.put(archiveBlobName, entries);
+                logger.debug("Cached central directory for archive blob {} ({} entries)", archiveBlobName, entries.size());
+            }
+        }
+
+        // Step 2: range-read just the target file's bytes (1 S3 GET)
+        if (entries != null) {
+            SegmentArchiveEntry entry = entries.get(name);
+            if (entry != null) {
+                logger.debug(
+                    "Range-reading {} from archive {} at offset={} length={}",
+                    name, archiveBlobName, entry.getOffset(), entry.getLength()
+                );
+                try (InputStream fileStream = remoteDataDirectory.getBlobContainer()
+                    .readBlob(archiveBlobName, entry.getOffset(), entry.getLength())) {
+                    return new ByteArrayIndexInput(name, fileStream.readAllBytes());
+                }
+            }
+        }
+
+        // Fallback: full blob download (only if ZipSegmentParser couldn't parse the central directory)
+        logger.warn(
+            "ZipSegmentParser failed for archive blob {}; falling back to full blob download for {}",
+            archiveBlobName, name
+        );
         final byte[] archiveBytes;
         try (InputStream blobStream = remoteDataDirectory.getBlobContainer().readBlob(archiveBlobName)) {
             archiveBytes = blobStream.readAllBytes();
         }
-
-        // Parse the in-memory ZIP to find the target entry.
-        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(archiveBytes))) {
-            java.util.zip.ZipEntry entry;
-            while ((entry = zis.getNextEntry()) != null) {
-                if (name.equals(entry.getName())) {
-                    byte[] content = zis.readAllBytes();
-                    return new ByteArrayIndexInput(name, content);
+        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
+            new java.io.ByteArrayInputStream(archiveBytes))) {
+            java.util.zip.ZipEntry zipEntry;
+            while ((zipEntry = zis.getNextEntry()) != null) {
+                if (name.equals(zipEntry.getName())) {
+                    return new ByteArrayIndexInput(name, zis.readAllBytes());
                 }
             }
         }
