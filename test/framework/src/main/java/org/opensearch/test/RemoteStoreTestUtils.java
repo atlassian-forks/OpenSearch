@@ -20,6 +20,8 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 
+import org.opensearch.index.store.remote.metadata.SegmentArchiveEntry;
+
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -67,6 +69,82 @@ public final class RemoteStoreTestUtils {
         CodecUtil.writeFooter(indexOutput);
         indexOutput.close();
         return new ByteArrayInputStream(BytesReference.toBytes(output.bytes()));
+    }
+
+    /**
+     * Creates metadata file bytes with archive fields enabled (VERSION_TWO format).
+     * Used to test archive GC flows where stale archive blobs should be deleted.
+     *
+     * @param segmentFilesMap       actual metadata content
+     * @param replicationCheckpoint replication checkpoint
+     * @param segmentInfos          segment infos
+     * @param archiveBlobName       the archive ZIP blob name (e.g. "segment_archive_12345.zip")
+     * @param archiveEntries        map of filename → SegmentArchiveEntry with offset/length
+     * @param archiveBlobLength     total byte length of the archive ZIP blob
+     */
+    public static InputStream createMetadataFileBytesWithArchive(
+        Map<String, String> segmentFilesMap,
+        ReplicationCheckpoint replicationCheckpoint,
+        SegmentInfos segmentInfos,
+        String archiveBlobName,
+        Map<String, SegmentArchiveEntry> archiveEntries,
+        long archiveBlobLength
+    ) throws IOException {
+        ByteBuffersDataOutput byteBuffersIndexOutput = new ByteBuffersDataOutput();
+        segmentInfos.write(new ByteBuffersIndexOutput(byteBuffersIndexOutput, "", ""));
+        byte[] byteArray = byteBuffersIndexOutput.toArrayCopy();
+
+        BytesStreamOutput output = new BytesStreamOutput();
+        OutputStreamIndexOutput indexOutput = new OutputStreamIndexOutput("segment metadata", "metadata output stream", output, 4096);
+        CodecUtil.writeHeader(indexOutput, RemoteSegmentMetadata.METADATA_CODEC, RemoteSegmentMetadata.CURRENT_VERSION);
+        indexOutput.writeMapOfStrings(segmentFilesMap);
+        RemoteSegmentMetadata.writeCheckpointToIndexOutput(replicationCheckpoint, indexOutput);
+        indexOutput.writeLong(byteArray.length);
+        indexOutput.writeBytes(byteArray, byteArray.length);
+        // Write archive fields for VERSION_TWO (archiveEnabled = true)
+        if (RemoteSegmentMetadata.CURRENT_VERSION >= RemoteSegmentMetadata.VERSION_TWO) {
+            indexOutput.writeByte((byte) 1); // archiveEnabled = true
+            indexOutput.writeString(archiveBlobName != null ? archiveBlobName : "");
+            indexOutput.writeString("zip_stored");
+            indexOutput.writeLong(archiveBlobLength);
+            if (archiveEntries != null && !archiveEntries.isEmpty()) {
+                indexOutput.writeVInt(archiveEntries.size());
+                for (Map.Entry<String, SegmentArchiveEntry> entry : archiveEntries.entrySet()) {
+                    indexOutput.writeString(entry.getKey());
+                    entry.getValue().write(indexOutput);
+                }
+            } else {
+                indexOutput.writeVInt(0);
+            }
+        }
+        CodecUtil.writeFooter(indexOutput);
+        indexOutput.close();
+        return new ByteArrayInputStream(BytesReference.toBytes(output.bytes()));
+    }
+
+    /**
+     * Creates dummy segment metadata for archive ON mode: all files have uploadedFilename = archiveBlobName,
+     * simulating how postUploadForArchive() registers files in segmentsUploadedToRemoteStore.
+     */
+    public static Map<String, String> getDummyMetadataForArchive(String prefix, int commitGeneration, String archiveBlobName) {
+        Map<String, String> metadata = new HashMap<>();
+        for (String ext : new String[] { ".cfe", ".cfs", ".si" }) {
+            String localFile = prefix + ext;
+            // uploadedFilename = archiveBlobName (not a UUID-suffixed per-file name)
+            metadata.put(
+                localFile,
+                localFile
+                    + "::"
+                    + archiveBlobName
+                    + "::"
+                    + randomIntBetween(1000, 5000)
+                    + "::"
+                    + randomIntBetween(512000, 1024000)
+                    + "::"
+                    + Version.MIN_SUPPORTED_MAJOR
+            );
+        }
+        return metadata;
     }
 
     public static Map<String, String> getDummyMetadata(String prefix, int commitGeneration) {

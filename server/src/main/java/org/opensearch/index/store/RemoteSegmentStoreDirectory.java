@@ -46,6 +46,7 @@ import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 import org.opensearch.node.remotestore.RemoteStorePinnedTimestampService;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.io.ByteArrayInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -53,6 +54,10 @@ import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import org.opensearch.common.blobstore.BlobMetadata;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -149,8 +154,8 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
     @SuppressWarnings("serial")
     private final Map<String, Map<String, SegmentArchiveEntry>> archiveIndexCache =
-        java.util.Collections.synchronizedMap(
-            new java.util.LinkedHashMap<String, Map<String, SegmentArchiveEntry>>(
+        Collections.synchronizedMap(
+            new LinkedHashMap<String, Map<String, SegmentArchiveEntry>>(
                 ARCHIVE_INDEX_CACHE_SIZE + 1, 0.75f, true   // accessOrder=true → LRU
             ) {
                 @Override
@@ -712,9 +717,9 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                 logger.debug("Using stored blobLength={} for archive blob {}, skipping LIST", blobLength, archiveBlobName);
             } else {
                 // Blob length unknown — do 1 LIST to get the size
-                Map<String, org.opensearch.common.blobstore.BlobMetadata> blobs =
+                Map<String, BlobMetadata> blobs =
                     remoteDataDirectory.getBlobContainer().listBlobsByPrefix(archiveBlobName);
-                org.opensearch.common.blobstore.BlobMetadata meta = blobs.get(archiveBlobName);
+                BlobMetadata meta = blobs.get(archiveBlobName);
                 if (meta == null) {
                     throw new NoSuchFileException(archiveBlobName + " (blob not found)");
                 }
@@ -760,9 +765,9 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         try (InputStream blobStream = remoteDataDirectory.getBlobContainer().readBlob(archiveBlobName)) {
             archiveBytes = blobStream.readAllBytes();
         }
-        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
-            new java.io.ByteArrayInputStream(archiveBytes))) {
-            java.util.zip.ZipEntry zipEntry;
+        try (ZipInputStream zis = new ZipInputStream(
+            new ByteArrayInputStream(archiveBytes))) {
+            ZipEntry zipEntry;
             while ((zipEntry = zis.getNextEntry()) != null) {
                 if (name.equals(zipEntry.getName())) {
                     return new ByteArrayIndexInput(name, zis.readAllBytes());
@@ -1322,22 +1327,9 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                         );
                     }
                 });
-            // Delete stale archive blob directly from metadata — no extra LIST needed.
-            // The archive blob name is stored in every metadata file (VERSION_TWO+), so we can
-            // delete it the same way per-file blobs are deleted: read stale metadata → get blob name → delete.
-            if (deletionSuccessful.get() && staleMeta.isArchiveEnabled() && staleMeta.getArchiveBlob() != null) {
-                String staleArchiveBlob = staleMeta.getArchiveBlob();
-                if (!activeArchiveBlobNames.contains(staleArchiveBlob)) {
-                    try {
-                        remoteDataDirectory.deleteFile(staleArchiveBlob);
-                        logger.debug("Deleted stale segment archive blob {} from metadata file {}", staleArchiveBlob, metadataFile);
-                    } catch (NoSuchFileException e) {
-                        logger.trace("Stale segment archive blob {} already deleted", staleArchiveBlob);
-                    } catch (IOException e) {
-                        logger.warn("Exception while deleting stale segment archive blob {}", staleArchiveBlob, e);
-                    }
-                }
-            }
+            // Note: when archive is ON, UploadedSegmentMetadata.uploadedFilename = archiveBlobName for ALL files
+            // in that archive. The Set deduplication above means the archive ZIP is deleted exactly once
+            // via the staleSegmentRemoteFilenames loop — no explicit archive blob deletion needed here.
             if (deletionSuccessful.get()) {
                 logger.debug("Deleting stale metadata file {} from remote segment store", metadataFile);
                 remoteMetadataDirectory.deleteFile(metadataFile);
