@@ -14,7 +14,6 @@ import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
@@ -87,12 +86,10 @@ public class TranslogArchiveBatchCoordinator {
     private final String nodeId;
     private final BlobPath archiveBasePath;
     private final RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm;
-    private final TimeValue batchInterval;
     private final long uploadTimeoutMillis;
 
     // Current batch state — guarded by lock
     private final ReentrantLock lock = new ReentrantLock();
-    private final Condition batchReady = lock.newCondition();
     private final Condition batchComplete = lock.newCondition();
 
     /** Accumulated shard data for current batch. */
@@ -103,10 +100,10 @@ public class TranslogArchiveBatchCoordinator {
     private volatile CountDownLatch dispatchLatch;
     /** Error from the most recent dispatch, if any. */
     private volatile IOException dispatchError;
-    /** Timestamp when the first shard submitted to this batch. */
-    private long batchStartNanos;
-    /** Whether a dispatch is currently in progress. */
+    /** Whether a dispatch is currently in progress — stays true until upload thread finishes. */
     private boolean dispatching;
+    /** Latch for the NEXT batch (accumulated while current upload runs). */
+    private volatile CountDownLatch nextDispatchLatch;
 
     /**
      * Data submitted by one shard for inclusion in the batch ZIP.
@@ -158,22 +155,33 @@ public class TranslogArchiveBatchCoordinator {
         String indexUUID,
         String nodeId,
         BlobPath archiveBasePath,
-        RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm,
-        TimeValue batchInterval
+        RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm
     ) {
         this.indexUUID = indexUUID;
         this.nodeId = nodeId;
         this.archiveBasePath = archiveBasePath;
         this.pathHashAlgorithm = pathHashAlgorithm;
-        this.batchInterval = batchInterval;
-        this.uploadTimeoutMillis = Math.max(batchInterval.millis() * 10, 30_000);
+        this.uploadTimeoutMillis = 30_000;
         this.dispatchLatch = new CountDownLatch(1);
-        this.batchStartNanos = 0;
+        this.nextDispatchLatch = null;
     }
 
     /**
      * Submit shard data to the current batch and block until the batch ZIP is uploaded.
      * Called by the shard's sync thread. Returns only after the ZIP is durably persisted in remote store.
+     * <p>
+     * <b>No batch interval wait here.</b> The upstream {@code BufferedAsyncIOProcessor} in
+     * {@code IndexShard.translogSyncProcessor} already buffers sync requests for the configured
+     * {@code cluster.remote_store.translog.buffer_interval} (default 650ms). By the time
+     * {@code Engine.ensureTranslogSynced()} calls {@code RemoteFsTranslog.upload()} →
+     * {@code submitAndWait()} for each shard sequentially, all shard sync requests from the same
+     * buffer interval drain are executed back-to-back. Adding a second wait here would
+     * double the latency on the indexing critical path (with {@code durability=request}).
+     * <p>
+     * Instead, this method uses a two-phase dispatch: if no upload is in progress, it dispatches
+     * immediately. If an upload IS in progress, the shard's data is queued for the NEXT batch,
+     * which is dispatched automatically when the current upload finishes. This allows back-to-back
+     * submissions (from the upstream drain) to be batched without any artificial wait.
      *
      * @param shardData the shard's translog data for this batch
      * @param transferService the transfer service to use for upload
@@ -188,33 +196,18 @@ public class TranslogArchiveBatchCoordinator {
             pendingShards.put(shardData.getShardId(), shardData);
             long shardBytes = shardData.getEntries().stream().mapToLong(ArchiveBuilder.ArchiveBuildEntry::getSize).sum();
             pendingBatchBytes += shardBytes;
-            if (batchStartNanos == 0) {
-                batchStartNanos = System.nanoTime();
-            }
-            myLatch = dispatchLatch;
 
-            // If batch size limit reached, dispatch immediately without waiting for interval.
-            if (pendingBatchBytes >= MAX_BATCH_BYTES) {
-                logger.debug("Batch size limit reached ({} bytes), dispatching early for index {}", pendingBatchBytes, indexUUID);
-                if (!dispatching) {
-                    dispatchUnderLock(transferService);
-                }
+            if (!dispatching) {
+                // No upload in progress — dispatch immediately.
+                myLatch = dispatchLatch;
+                dispatchUnderLock(transferService);
             } else {
-                // Wait for remaining batch interval, then dispatch
-                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - batchStartNanos);
-                long remainingMs = batchInterval.millis() - elapsedMs;
-                if (remainingMs > 0) {
-                    try {
-                        batchReady.await(remainingMs, TimeUnit.MILLISECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Interrupted while waiting for batch interval", e);
-                    }
+                // Upload in progress — this shard will be included in the NEXT batch.
+                // Create a next-batch latch if not already created.
+                if (nextDispatchLatch == null) {
+                    nextDispatchLatch = new CountDownLatch(1);
                 }
-                // After waiting, if no one else dispatched yet, this thread dispatches
-                if (!dispatching && !pendingShards.isEmpty()) {
-                    dispatchUnderLock(transferService);
-                }
+                myLatch = nextDispatchLatch;
             }
         } finally {
             lock.unlock();
@@ -256,29 +249,22 @@ public class TranslogArchiveBatchCoordinator {
     }
 
     /**
-     * Must be called under lock. Hands the current batch off to a background upload thread and
-     * resets the coordinator state immediately so that the next batch can start accumulating
-     * without waiting for the upload to complete (pipelining).
-     * <p>
-     * Callers still wait for the upload to finish via {@code dispatchLatch.await()} in
-     * {@link #submitAndWait}, preserving {@code durability=REQUEST} correctness.
+     * Must be called under lock. Hands the current batch off to a background upload thread.
+     * {@code dispatching} stays {@code true} while the upload runs, so subsequent submissions
+     * accumulate in {@code pendingShards} for the next batch. When the upload finishes, the
+     * upload thread re-acquires the lock and dispatches any accumulated pending shards.
      */
     private void dispatchUnderLock(TransferService transferService) {
         dispatching = true;
         Map<Integer, ShardArchiveData> batch = new HashMap<>(pendingShards);
         CountDownLatch currentLatch = dispatchLatch;
 
-        // Reset state for next batch immediately — callers can start accumulating while upload runs
+        // Clear pending state for next batch accumulation while upload runs
         pendingShards.clear();
         pendingBatchBytes = 0;
-        batchStartNanos = 0;
         dispatchError = null;
-        dispatchLatch = new CountDownLatch(1);
-        dispatching = false;
-        batchComplete.signalAll();
 
         // Hand off upload to a background thread — lock is NOT held during upload.
-        // dispatchError is set BEFORE countDown so submitAndWait() sees it after latch.await().
         Thread uploadThread = new Thread(() -> {
             IOException uploadException = null;
             try {
@@ -290,6 +276,33 @@ public class TranslogArchiveBatchCoordinator {
                 // Set error before releasing latch so submitAndWait() sees it after await()
                 dispatchError = uploadException;
                 currentLatch.countDown();
+
+                // Check if more shards accumulated while we were uploading
+                lock.lock();
+                try {
+                    dispatching = false;
+                    if (!pendingShards.isEmpty()) {
+                        // Promote nextDispatchLatch to dispatchLatch and dispatch
+                        if (nextDispatchLatch != null) {
+                            dispatchLatch = nextDispatchLatch;
+                            nextDispatchLatch = null;
+                        } else {
+                            dispatchLatch = new CountDownLatch(1);
+                        }
+                        dispatchUnderLock(transferService);
+                    } else {
+                        // No pending shards — reset for next submission
+                        if (nextDispatchLatch != null) {
+                            dispatchLatch = nextDispatchLatch;
+                            nextDispatchLatch = null;
+                        } else {
+                            dispatchLatch = new CountDownLatch(1);
+                        }
+                        batchComplete.signalAll();
+                    }
+                } finally {
+                    lock.unlock();
+                }
             }
         }, "translog-archive-upload-" + indexUUID);
         uploadThread.setDaemon(true);

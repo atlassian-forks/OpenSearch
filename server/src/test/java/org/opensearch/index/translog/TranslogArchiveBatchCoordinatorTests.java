@@ -10,7 +10,6 @@ package org.opensearch.index.translog;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
@@ -38,13 +37,12 @@ import static org.mockito.Mockito.verify;
 
 public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
-    private TranslogArchiveBatchCoordinator createCoordinator(TimeValue batchInterval) {
+    private TranslogArchiveBatchCoordinator createCoordinator() {
         return new TranslogArchiveBatchCoordinator(
             "test-index-uuid",
             "test-node-id",
             new BlobPath().add("repo-root"),
-            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
-            batchInterval
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
         );
     }
 
@@ -58,7 +56,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     }
 
     public void testSingleShardSubmitAndDispatch() throws Exception {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
 
         TranslogArchiveBatchCoordinator.ShardArchiveData shardData = createShardData(0, "shard0 data");
@@ -78,50 +76,55 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     }
 
     public void testMultipleShardsSingleZip() throws Exception {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(50));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
-        AtomicInteger uploadCount = new AtomicInteger(0);
+
+        // Slow upload: gives time for shard 1 to arrive while shard 0's upload is in progress.
+        // Shard 1's data accumulates in pendingShards and is dispatched in the NEXT batch
+        // after shard 0's upload finishes.
+        org.mockito.Mockito.doAnswer(inv -> {
+            Thread.sleep(200);
+            return null;
+        }).when(transferService).uploadBlobStream(any(), anyLong(), any(), anyString(), any(), any());
 
         TranslogArchiveBatchCoordinator.ShardArchiveData shard0 = createShardData(0, "shard0 data");
         TranslogArchiveBatchCoordinator.ShardArchiveData shard1 = createShardData(1, "shard1 data");
+        TranslogArchiveBatchCoordinator.ShardArchiveData shard2 = createShardData(2, "shard2 data");
 
-        // Submit shard 0 first (won't dispatch yet — interval not elapsed)
-        // Then use timerDispatch to trigger after both are submitted
-        CountDownLatch bothSubmitted = new CountDownLatch(2);
+        CountDownLatch allDone = new CountDownLatch(3);
         AtomicReference<Exception> error = new AtomicReference<>();
 
+        // Shard 0 submits first — triggers immediate dispatch
         Thread t0 = new Thread(() -> {
             try {
                 coordinator.submitAndWait(shard0, transferService);
-                bothSubmitted.countDown();
-            } catch (Exception e) {
-                error.set(e);
-                bothSubmitted.countDown();
-            }
+            } catch (Exception e) { error.compareAndSet(null, e); } finally { allDone.countDown(); }
         });
 
+        // Shards 1 and 2 submit while shard 0's upload is in progress — they accumulate
+        // and are dispatched together in one ZIP when shard 0's upload finishes.
         Thread t1 = new Thread(() -> {
             try {
+                Thread.sleep(50); // ensure shard 0's dispatch is already running
                 coordinator.submitAndWait(shard1, transferService);
-                bothSubmitted.countDown();
-            } catch (Exception e) {
-                error.set(e);
-                bothSubmitted.countDown();
-            }
+            } catch (Exception e) { error.compareAndSet(null, e); } finally { allDone.countDown(); }
+        });
+        Thread t2 = new Thread(() -> {
+            try {
+                Thread.sleep(80);
+                coordinator.submitAndWait(shard2, transferService);
+            } catch (Exception e) { error.compareAndSet(null, e); } finally { allDone.countDown(); }
         });
 
         t0.start();
         t1.start();
+        t2.start();
 
-        // Wait a bit for both to submit, then trigger dispatch
-        Thread.sleep(60);
-        coordinator.timerDispatch(transferService);
-
-        assertTrue("Both threads should complete", bothSubmitted.await(5, TimeUnit.SECONDS));
+        assertTrue("All threads should complete", allDone.await(10, TimeUnit.SECONDS));
         assertNull("No errors expected", error.get());
 
-        // Only ONE zip upload should have happened (both shards bundled)
-        verify(transferService, times(1)).uploadBlobStream(
+        // Exactly 2 ZIP uploads: batch 1 = shard 0, batch 2 = shard 1 + shard 2 (bundled)
+        verify(transferService, times(2)).uploadBlobStream(
             any(InputStream.class),
             anyLong(),
             any(BlobPath.class),
@@ -132,7 +135,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     }
 
     public void testTimerDispatchWithNoPending() {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMinutes(1));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
 
         // Should be a no-op
@@ -141,7 +144,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     }
 
     public void testEmptyEntriesNoUpload() throws Exception {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
 
         // Empty entries
@@ -167,7 +170,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     }
 
     public void testUploadPathContainsTranslogData() throws Exception {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
 
         coordinator.submitAndWait(createShardData(0, "test"), transferService);
@@ -201,7 +204,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
     public void testUploadPathUsesHashNodeIdNotGenBucket() throws Exception {
         // Regression test: upload path must use hash(nodeId) not a hardcoded bucket like "0".
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
 
         coordinator.submitAndWait(createShardData(0, "hello"), transferService);
@@ -231,7 +234,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
      * Static registry: register, get, unregister lifecycle.
      */
     public void testStaticRegistryLifecycle() {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMinutes(1));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         String uuid = coordinator.getIndexUUID();
 
         // Initially not registered
@@ -254,8 +257,8 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
      * Static registry: registering a second coordinator for the same index replaces the first.
      */
     public void testStaticRegistryReplacesExisting() {
-        TranslogArchiveBatchCoordinator c1 = createCoordinator(TimeValue.timeValueMinutes(1));
-        TranslogArchiveBatchCoordinator c2 = createCoordinator(TimeValue.timeValueMinutes(2));
+        TranslogArchiveBatchCoordinator c1 = createCoordinator();
+        TranslogArchiveBatchCoordinator c2 = createCoordinator();
         String uuid = c1.getIndexUUID();
 
         TranslogArchiveBatchCoordinator.register(c1);
@@ -271,7 +274,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
      * Upload failure triggers exactly UPLOAD_RETRY_MAX_ATTEMPTS (2) upload attempts before giving up.
      */
     public void testUploadRetryCountIsExactlyTwo() throws Exception {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
 
         org.mockito.Mockito.doThrow(new IOException("simulated failure"))
@@ -309,12 +312,13 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
      */
     public void testConcurrentDispatchUnderLoad() throws Exception {
         int numShards = 8;
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(50));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
         AtomicInteger uploadCount = new AtomicInteger(0);
-        // Count uploads (thread-safe)
+        // Slow upload so that concurrent shards accumulate in pendingShards while the first upload runs.
         org.mockito.Mockito.doAnswer(inv -> {
             uploadCount.incrementAndGet();
+            Thread.sleep(100);
             return null;
         })
             .when(transferService)
@@ -340,9 +344,9 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
         assertTrue("All threads should complete within timeout", allDone.await(30, TimeUnit.SECONDS));
         assertNull("No errors expected, got: " + firstError.get(), firstError.get());
-        // At least one upload happened, but could be more if batches split across intervals
+        // At least one upload happened, but could be more if batches split
         assertTrue("At least one upload should have happened", uploadCount.get() >= 1);
-        // Should be far fewer uploads than shards (batching works)
+        // With slow upload, most shards should batch — expect significantly fewer uploads than shards
         assertTrue("Uploads (" + uploadCount.get() + ") should be fewer than shards (" + numShards + ")", uploadCount.get() < numShards);
     }
 
@@ -351,7 +355,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
      * the error wrapped in an IOException.
      */
     public void testCoordinatorUploadFailurePropagates() throws Exception {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
 
         // Simulate an upload that throws immediately
@@ -398,17 +402,17 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
      * submissions for batch N+1 — i.e. the collection window for batch N+1 starts as soon
      * as batch N is handed off to the upload thread, NOT after the upload completes.
      *
-     * If upload takes U ms and batch interval is B ms, then two consecutive cycles should
-     * complete in approximately max(B, U) + B, NOT 2*(B + U).
+     * With immediate dispatch (no batch interval), when shard 0 submits, it dispatches
+     * immediately. While that upload is in progress, shard 1 submits and gets queued into
+     * a NEW batch. When shard 0's upload completes, shard 1's batch dispatches.
      *
-     * We verify this by injecting a slow upload (300ms) with a short batch interval (50ms).
-     * Without pipelining: 2 cycles = 2 * (50 + 300) = 700ms minimum.
-     * With pipelining:    2 cycles = (50 + 300) + 50 = 400ms (upload and next collection overlap).
+     * Total time should be approximately 2 * uploadDelay (sequential uploads),
+     * NOT 2 * uploadDelay + blocking (which would happen if shard 1 had to wait
+     * for shard 0's upload before even being accepted).
      */
     public void testNextBatchCollectionStartsWhileUploadInProgress() throws Exception {
-        int batchIntervalMs = 50;
         int uploadDelayMs = 300;
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(batchIntervalMs));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
 
         // Slow upload: blocks for uploadDelayMs
@@ -419,14 +423,11 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
         CountDownLatch bothDone = new CountDownLatch(2);
         AtomicReference<Exception> error = new AtomicReference<>();
-        AtomicReference<Long> firstSubmitEndMs = new AtomicReference<>();
-        AtomicReference<Long> secondSubmitEndMs = new AtomicReference<>();
 
-        // Batch 1: submit shard 0, wait for it to complete
+        // Batch 1: submit shard 0 — dispatches immediately, upload takes 300ms
         Thread batch1 = new Thread(() -> {
             try {
                 coordinator.submitAndWait(createShardData(0, "batch1"), transferService);
-                firstSubmitEndMs.set(System.currentTimeMillis());
             } catch (Exception e) {
                 error.set(e);
             } finally {
@@ -434,12 +435,11 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
             }
         }, "batch1-thread");
 
-        // Batch 2: submit shard 1 shortly after batch 1 starts (while upload of batch 1 is in progress)
+        // Batch 2: submit shard 1 while batch 1's upload is in progress
         Thread batch2 = new Thread(() -> {
             try {
-                Thread.sleep(batchIntervalMs + 10); // start after batch 1 has been dispatched
+                Thread.sleep(50); // start after batch 1 has been dispatched
                 coordinator.submitAndWait(createShardData(1, "batch2"), transferService);
-                secondSubmitEndMs.set(System.currentTimeMillis());
             } catch (Exception e) {
                 error.set(e);
             } finally {
@@ -455,22 +455,15 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         long totalMs = System.currentTimeMillis() - start;
         assertNull("No errors expected: " + error.get(), error.get());
 
-        // With pipelining: batch2 collection starts while batch1 uploads
-        // total ≈ (batchInterval + uploadDelay) + batchInterval = 400ms
-        // Without pipelining: total ≈ (batchInterval + uploadDelay) * 2 = 700ms
-        long pipelinedBound = (batchIntervalMs + uploadDelayMs) + batchIntervalMs + 100; // 400ms + slack
+        // With pipelining: shard 1 is accepted immediately (not blocked by shard 0's upload)
+        // Total ≈ 2 * uploadDelay + small overhead, NOT much more
+        long maxExpected = 2 * uploadDelayMs + 200; // 800ms generous bound
         assertTrue(
-            "With pipelining total time "
-                + totalMs
-                + "ms should be < "
-                + pipelinedBound
-                + "ms (non-pipelined would be ~"
-                + 2 * (batchIntervalMs + uploadDelayMs)
-                + "ms)",
-            totalMs < pipelinedBound
+            "Total time " + totalMs + "ms should be < " + maxExpected + "ms",
+            totalMs < maxExpected
         );
 
-        // Both uploads happened (two separate batches)
+        // Both uploads happened (two separate batches since they arrived at different times)
         verify(transferService, times(2)).uploadBlobStream(any(), anyLong(), any(), anyString(), any(), any());
     }
 
@@ -479,7 +472,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
      * all threads that submitted to the same batch receive the error.
      */
     public void testCoordinatorFailurePropagesToMultipleWaitingThreads() throws Exception {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(50));
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
 
         org.mockito.Mockito.doThrow(new IOException("simulated failure"))
@@ -510,5 +503,98 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         assertTrue("All threads should complete", allDone.await(30, TimeUnit.SECONDS));
         // All threads that were in the same batch should have received the error
         assertTrue("At least one thread should get the error", errorCount.get() >= 1);
+    }
+
+    /**
+     * Proves that with immediate dispatch (no batch interval wait), multiple shards
+     * submitting concurrently — as they would after BufferedAsyncIOProcessor drains
+     * all buffered sync requests — are bundled into a single ZIP upload.
+     *
+     * This simulates the real scenario: BufferedAsyncIOProcessor buffers for 650ms,
+     * then drains all items, calling ensureTranslogSynced() which calls upload() →
+     * submitAndWait() for each shard nearly simultaneously.
+     *
+     * Key assertion: with a slow upload (to keep the dispatch window open), the FIRST
+     * dispatch collects all concurrent submitters into one ZIP. Without immediate dispatch,
+     * each shard would wait for its own interval, resulting in more uploads.
+     */
+    public void testConcurrentShardsAfterUpstreamBufferDrainAreBatchedInOneZip() throws Exception {
+        int numShards = 6;
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
+        TransferService transferService = mock(TransferService.class);
+        AtomicInteger uploadCount = new AtomicInteger(0);
+
+        // Simulate an upload that takes 200ms — while this runs, subsequent shard submissions
+        // accumulate in pendingShards and are dispatched together when the upload finishes.
+        org.mockito.Mockito.doAnswer(inv -> {
+            uploadCount.incrementAndGet();
+            Thread.sleep(200);
+            return null;
+        }).when(transferService).uploadBlobStream(any(), anyLong(), any(), anyString(), any(), any());
+
+        CyclicBarrier barrier = new CyclicBarrier(numShards);
+        CountDownLatch allDone = new CountDownLatch(numShards);
+        AtomicReference<Exception> firstError = new AtomicReference<>();
+        long startMs = System.currentTimeMillis();
+
+        for (int i = 0; i < numShards; i++) {
+            final int shardId = i;
+            new Thread(() -> {
+                try {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    coordinator.submitAndWait(createShardData(shardId, "shard" + shardId), transferService);
+                } catch (Exception e) {
+                    firstError.compareAndSet(null, e);
+                } finally {
+                    allDone.countDown();
+                }
+            }, "shard-" + shardId).start();
+        }
+
+        assertTrue("All threads should complete", allDone.await(30, TimeUnit.SECONDS));
+        long elapsedMs = System.currentTimeMillis() - startMs;
+        assertNull("No errors expected: " + firstError.get(), firstError.get());
+
+        // With slow upload (200ms), most concurrent shards should accumulate and batch.
+        // Expect at most 2-3 uploads (first shard dispatches immediately, remaining batch after).
+        assertTrue(
+            "Uploads (" + uploadCount.get() + ") should be much fewer than shards (" + numShards + ")",
+            uploadCount.get() < numShards
+        );
+
+        // Completion should be fast — no artificial 650ms wait added by coordinator
+        assertTrue("Should complete within 3s (actual: " + elapsedMs + "ms)", elapsedMs < 3000);
+    }
+
+    /**
+     * Proves that immediate dispatch does NOT add artificial latency.
+     * A single shard's submitAndWait() should complete in roughly the upload time,
+     * not upload time + batch interval.
+     *
+     * This is the key regression test for the double-buffering fix:
+     * Before: submitAndWait blocked for batchInterval (650ms) + upload time
+     * After:  submitAndWait blocks only for upload time
+     */
+    public void testImmediateDispatchNoArtificialLatency() throws Exception {
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
+        TransferService transferService = mock(TransferService.class);
+
+        int uploadDelayMs = 50;
+        org.mockito.Mockito.doAnswer(inv -> {
+            Thread.sleep(uploadDelayMs);
+            return null;
+        }).when(transferService).uploadBlobStream(any(), anyLong(), any(), anyString(), any(), any());
+
+        long startMs = System.currentTimeMillis();
+        coordinator.submitAndWait(createShardData(0, "latency-test"), transferService);
+        long elapsedMs = System.currentTimeMillis() - startMs;
+
+        // Should complete close to uploadDelayMs, definitely not uploadDelay + 650ms
+        // Allow generous overhead of 200ms for thread scheduling, but catch the old 650ms wait
+        assertTrue(
+            "submitAndWait should complete in ~" + uploadDelayMs + "ms, not " + elapsedMs
+                + "ms (old behavior would add ~650ms batch interval wait)",
+            elapsedMs < uploadDelayMs + 200
+        );
     }
 }

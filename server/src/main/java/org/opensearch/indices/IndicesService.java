@@ -944,9 +944,6 @@ public class IndicesService extends AbstractLifecycleComponent
             // Wire archive batch coordinator for indices with archive upload enabled
             if (indexService.getIndexSettings().isTranslogArchiveUploadEnabled()
                 && indexService.getIndexSettings().isRemoteTranslogStoreEnabled()) {
-                TimeValue batchInterval = remoteStoreSettings != null
-                    ? remoteStoreSettings.getClusterRemoteTranslogBufferInterval()
-                    : TimeValue.timeValueMillis(650);
                 org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm hashAlgo = remoteStoreSettings != null
                     ? remoteStoreSettings.getPathHashAlgorithm()
                     : org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
@@ -963,8 +960,7 @@ public class IndicesService extends AbstractLifecycleComponent
                     index.getUUID(),
                     localNodeId,
                     new org.opensearch.common.blobstore.BlobPath(),
-                    hashAlgo,
-                    batchInterval
+                    hashAlgo
                 );
                 TranslogArchiveBatchCoordinator.register(coordinator);
                 translogArchiveCollector.registerCoordinatorIndex(index.getUUID());
