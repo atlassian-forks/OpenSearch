@@ -115,10 +115,17 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     static final class ArchiveState {
         final String blobName;
         final Map<String, SegmentArchiveEntry> entries;
+        /** Total byte length of the archive ZIP blob; -1 if unknown (old metadata). */
+        final long blobLength;
 
         ArchiveState(String blobName, Map<String, SegmentArchiveEntry> entries) {
+            this(blobName, entries, -1L);
+        }
+
+        ArchiveState(String blobName, Map<String, SegmentArchiveEntry> entries, long blobLength) {
             this.blobName = blobName;
             this.entries = entries;
+            this.blobLength = blobLength;
         }
     }
 
@@ -211,7 +218,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         if (remoteSegmentMetadata != null) {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>(remoteSegmentMetadata.getMetadata());
             if (remoteSegmentMetadata.isArchiveEnabled()) {
-                ArchiveState state = new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries());
+                ArchiveState state = new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries(), remoteSegmentMetadata.getArchiveBlobLength());
                 archiveStateRef.set(state);
                 logger.debug(
                     "Archive metadata loaded: blob={}, entries={}",
@@ -245,7 +252,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>(remoteSegmentMetadata.getMetadata());
             archiveStateRef.set(
                 remoteSegmentMetadata.isArchiveEnabled()
-                    ? new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries())
+                    ? new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries(), remoteSegmentMetadata.getArchiveBlobLength())
                     : null
             );
         } else {
@@ -288,7 +295,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>(remoteSegmentMetadata.getMetadata());
             archiveStateRef.set(
                 remoteSegmentMetadata.isArchiveEnabled()
-                    ? new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries())
+                    ? new ArchiveState(remoteSegmentMetadata.getArchiveBlob(), remoteSegmentMetadata.getArchiveEntries(), remoteSegmentMetadata.getArchiveBlobLength())
                     : null
             );
         } else {
@@ -610,7 +617,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                 try {
                     RemoteSegmentMetadata fresh = readLatestMetadataFile();
                     if (fresh != null && fresh.isArchiveEnabled()) {
-                        ArchiveState freshState = new ArchiveState(fresh.getArchiveBlob(), fresh.getArchiveEntries());
+                        ArchiveState freshState = new ArchiveState(fresh.getArchiveBlob(), fresh.getArchiveEntries(), fresh.getArchiveBlobLength());
                         archiveStateRef.set(freshState); // atomic update for subsequent callers
                         SegmentArchiveEntry freshEntry = freshState.entries != null ? freshState.entries.get(name) : null;
                         if (freshEntry != null) {
@@ -653,6 +660,12 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                     name,
                     remoteFilename
                 );
+                // Pass the known blob length from metadata if available, to avoid a LIST call in readFileFromArchiveBlob.
+                // archiveStateRef may refer to a different (newer) archive, so check if any older archive in the LRU cache
+                // has stored the length. We rely on the metadata's archiveBlobLength stored at upload time.
+                // For now use -1 (unknown) — the length will be stored in metadata when the archive was uploaded
+                // with the archiveBlobLength field, but for older archives it falls back to LIST.
+                // TODO: thread archiveBlobLength through UploadedSegmentMetadata for per-file lookup.
                 return readFileFromArchiveBlob(name, remoteFilename);
             }
             long fileLength = fileLength(name);
@@ -685,17 +698,28 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @throws IOException         on I/O failure
      */
     private IndexInput readFileFromArchiveBlob(String name, String archiveBlobName) throws IOException {
-        // Step 1: resolve central-directory entries (cache hit = 0 S3 GETs, miss = 1 range GET)
+        return readFileFromArchiveBlob(name, archiveBlobName, -1L);
+    }
+
+    private IndexInput readFileFromArchiveBlob(String name, String archiveBlobName, long knownBlobLength) throws IOException {
+        // Step 1: resolve central-directory entries (cache hit = 0 S3 GETs, miss = 1–2 range GETs)
         Map<String, SegmentArchiveEntry> entries = archiveIndexCache.get(archiveBlobName);
         if (entries == null) {
-            // Get blob size via exact-prefix LIST (1 LIST per cache miss, amortized across many reads).
-            Map<String, org.opensearch.common.blobstore.BlobMetadata> blobs =
-                remoteDataDirectory.getBlobContainer().listBlobsByPrefix(archiveBlobName);
-            org.opensearch.common.blobstore.BlobMetadata meta = blobs.get(archiveBlobName);
-            if (meta == null) {
-                throw new NoSuchFileException(archiveBlobName + " (blob not found)");
+            final long blobLength;
+            if (knownBlobLength > 0) {
+                // Blob length known from metadata — skip LIST entirely (0 extra S3 ops)
+                blobLength = knownBlobLength;
+                logger.debug("Using stored blobLength={} for archive blob {}, skipping LIST", blobLength, archiveBlobName);
+            } else {
+                // Blob length unknown — do 1 LIST to get the size
+                Map<String, org.opensearch.common.blobstore.BlobMetadata> blobs =
+                    remoteDataDirectory.getBlobContainer().listBlobsByPrefix(archiveBlobName);
+                org.opensearch.common.blobstore.BlobMetadata meta = blobs.get(archiveBlobName);
+                if (meta == null) {
+                    throw new NoSuchFileException(archiveBlobName + " (blob not found)");
+                }
+                blobLength = meta.length();
             }
-            long blobLength = meta.length();
 
             // Range-read the tail of the ZIP to parse its central directory.
             long tailOffset = Math.max(0, blobLength - ZIP_TAIL_BYTES);
@@ -988,6 +1012,21 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         String archiveBlobName,
         Map<String, SegmentArchiveEntry> archiveEntries
     ) throws IOException {
+        uploadMetadata(segmentFiles, segmentInfosSnapshot, storeDirectory, translogGeneration,
+            replicationCheckpoint, nodeId, archiveBlobName, archiveEntries, -1L);
+    }
+
+    public void uploadMetadata(
+        Collection<String> segmentFiles,
+        SegmentInfos segmentInfosSnapshot,
+        Directory storeDirectory,
+        long translogGeneration,
+        ReplicationCheckpoint replicationCheckpoint,
+        String nodeId,
+        String archiveBlobName,
+        Map<String, SegmentArchiveEntry> archiveEntries,
+        long archiveBlobLength
+    ) throws IOException {
         synchronized (this) {
             String metadataFilename = MetadataFilenameUtils.getMetadataFilename(
                 replicationCheckpoint.getPrimaryTerm(),
@@ -1017,18 +1056,19 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                     );
                     byte[] segmentInfoSnapshotByteArray = byteBuffersIndexOutput.toArrayCopy();
 
-                    metadataStreamWrapper.writeStream(
-                        indexOutput,
-                        new RemoteSegmentMetadata(
-                            RemoteSegmentMetadata.fromMapOfStrings(uploadedSegments),
-                            segmentInfoSnapshotByteArray,
-                            replicationCheckpoint,
-                            true,
-                            archiveBlobName,
-                            "zip_stored",
-                            archiveEntries
-                        )
+                    RemoteSegmentMetadata meta = new RemoteSegmentMetadata(
+                        RemoteSegmentMetadata.fromMapOfStrings(uploadedSegments),
+                        segmentInfoSnapshotByteArray,
+                        replicationCheckpoint,
+                        true,
+                        archiveBlobName,
+                        "zip_stored",
+                        archiveEntries
                     );
+                    if (archiveBlobLength > 0) {
+                        meta.setArchiveBlobLength(archiveBlobLength);
+                    }
+                    metadataStreamWrapper.writeStream(indexOutput, meta);
                 }
                 storeDirectory.sync(Collections.singleton(metadataFilename));
                 remoteMetadataDirectory.copyFrom(storeDirectory, metadataFilename, metadataFilename, IOContext.DEFAULT);

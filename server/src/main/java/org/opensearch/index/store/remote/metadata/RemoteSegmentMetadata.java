@@ -62,13 +62,15 @@ public class RemoteSegmentMetadata {
     private final String archiveBlob;
     private final String archiveFormat;
     private final Map<String, SegmentArchiveEntry> archiveEntries;
+    /** Total byte length of the archive ZIP blob — stored to allow zero-LIST range-reads on recovery. */
+    private long archiveBlobLength;
 
     public RemoteSegmentMetadata(
         Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> metadata,
         byte[] segmentInfosBytes,
         ReplicationCheckpoint replicationCheckpoint
     ) {
-        this(metadata, segmentInfosBytes, replicationCheckpoint, false, null, null, null);
+        this(metadata, segmentInfosBytes, replicationCheckpoint, false, null, null, null, -1L);
     }
 
     public RemoteSegmentMetadata(
@@ -80,6 +82,19 @@ public class RemoteSegmentMetadata {
         String archiveFormat,
         Map<String, SegmentArchiveEntry> archiveEntries
     ) {
+        this(metadata, segmentInfosBytes, replicationCheckpoint, archiveEnabled, archiveBlob, archiveFormat, archiveEntries, -1L);
+    }
+
+    public RemoteSegmentMetadata(
+        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> metadata,
+        byte[] segmentInfosBytes,
+        ReplicationCheckpoint replicationCheckpoint,
+        boolean archiveEnabled,
+        String archiveBlob,
+        String archiveFormat,
+        Map<String, SegmentArchiveEntry> archiveEntries,
+        long archiveBlobLength
+    ) {
         this.metadata = metadata;
         this.segmentInfosBytes = segmentInfosBytes;
         this.replicationCheckpoint = replicationCheckpoint;
@@ -87,6 +102,7 @@ public class RemoteSegmentMetadata {
         this.archiveBlob = archiveBlob;
         this.archiveFormat = archiveFormat;
         this.archiveEntries = archiveEntries;
+        this.archiveBlobLength = archiveBlobLength;
     }
 
     /**
@@ -127,6 +143,19 @@ public class RemoteSegmentMetadata {
 
     public Map<String, SegmentArchiveEntry> getArchiveEntries() {
         return archiveEntries;
+    }
+
+    /**
+     * Total byte size of the archive ZIP blob, or {@code -1} if not known.
+     * When present (>= 0) this allows {@code readFileFromArchiveBlob()} to skip
+     * the {@code listBlobsByPrefix()} call entirely and go straight to a tail range-GET.
+     */
+    public long getArchiveBlobLength() {
+        return archiveBlobLength;
+    }
+
+    public void setArchiveBlobLength(long archiveBlobLength) {
+        this.archiveBlobLength = archiveBlobLength;
     }
 
     /**
@@ -172,6 +201,7 @@ public class RemoteSegmentMetadata {
                 out.writeString(archiveFormat != null ? archiveFormat : "");
 
                 // Write archive entries map
+                out.writeLong(archiveBlobLength); // blob total size for zero-LIST range-read
                 if (archiveEntries != null) {
                     out.writeVInt(archiveEntries.size());
                     for (Map.Entry<String, SegmentArchiveEntry> entry : archiveEntries.entrySet()) {
@@ -205,6 +235,7 @@ public class RemoteSegmentMetadata {
         String archiveBlob = null;
         String archiveFormat = null;
         Map<String, SegmentArchiveEntry> archiveEntries = null;
+        long archiveBlobLength = -1L;
 
         try {
             archiveEnabled = indexInput.readByte() != 0;
@@ -212,7 +243,8 @@ public class RemoteSegmentMetadata {
                 archiveBlob = indexInput.readString();
                 archiveFormat = indexInput.readString();
 
-                // Read archive entries map
+                // Read archive entries map (with blob length prefix)
+                archiveBlobLength = indexInput.readLong();
                 int entryCount = indexInput.readVInt();
                 archiveEntries = new java.util.HashMap<>(entryCount);
                 for (int i = 0; i < entryCount; i++) {
@@ -232,7 +264,8 @@ public class RemoteSegmentMetadata {
             archiveEnabled,
             archiveBlob,
             archiveFormat,
-            archiveEntries
+            archiveEntries,
+            archiveBlobLength
         );
     }
 

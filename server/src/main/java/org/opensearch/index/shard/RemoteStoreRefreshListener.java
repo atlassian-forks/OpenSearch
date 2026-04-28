@@ -108,6 +108,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
      */
     private volatile String lastArchiveBlobName;
     private volatile Map<String, SegmentArchiveEntry> lastArchiveEntries;
+    private volatile long lastArchiveBlobLength = -1L;
 
     public RemoteStoreRefreshListener(
         IndexShard indexShard,
@@ -438,9 +439,11 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                 // If metadata upload fails here, the next refresh will re-upload segments as a new archive.
                 String archiveBlobName = this.lastArchiveBlobName;
                 Map<String, SegmentArchiveEntry> archiveEntries = this.lastArchiveEntries;
+                long archiveBlobLength = this.lastArchiveBlobLength;
                 this.lastArchiveBlobName = null;
                 this.lastArchiveEntries = null;
-                // Upload metadata with archive fields
+                this.lastArchiveBlobLength = -1L;
+                // Upload metadata with archive fields (including blob length for zero-LIST recovery reads)
                 remoteDirectory.uploadMetadata(
                     localSegmentsPostRefresh,
                     segmentInfosSnapshot,
@@ -449,7 +452,8 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                     replicationCheckpoint,
                     indexShard.getNodeId(),
                     archiveBlobName,
-                    archiveEntries
+                    archiveEntries,
+                    archiveBlobLength
                 );
             } else {
                 remoteDirectory.uploadMetadata(
@@ -614,6 +618,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                 }
             }
 
+            this.lastArchiveBlobLength = archiveSize;
             logger.debug("Archive upload successful: {} ({} bytes, {} files)", archiveBlobName, archiveSize, filteredFiles.size());
             listener.onResponse(null);
         } catch (Exception e) {
