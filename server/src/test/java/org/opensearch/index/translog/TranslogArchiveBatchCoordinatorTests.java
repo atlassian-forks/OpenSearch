@@ -511,4 +511,74 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         // All threads that were in the same batch should have received the error
         assertTrue("At least one thread should get the error", errorCount.get() >= 1);
     }
+
+    /**
+     * Regression test for double-dispatch race condition introduced by the pipelining fix.
+     *
+     * After pipelining was added, {@code dispatchUnderLock()} resets {@code dispatching=false}
+     * immediately (before the upload thread finishes), so that the next batch can accumulate.
+     * However, this meant that a shard thread waking up from {@code batchReady.await()} would see
+     * {@code dispatching=false} and dispatch a SECOND ZIP for the same batch — producing one ZIP
+     * per shard per interval instead of one ZIP per index per interval.
+     *
+     * The fix: check {@code myLatch == dispatchLatch} to detect whether the current batch was
+     * already dispatched (latch replaced) before deciding to dispatch.
+     */
+    public void testNoDoubleDispatchAfterPipeliningFix() throws Exception {
+        // Use a short interval so shards arrive within the same batch window
+        int batchIntervalMs = 100;
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(batchIntervalMs));
+        TransferService transferService = mock(TransferService.class);
+        AtomicInteger uploadCount = new AtomicInteger(0);
+
+        // Count how many actual S3 uploads happen
+        org.mockito.Mockito.doAnswer(inv -> {
+            uploadCount.incrementAndGet();
+            Thread.sleep(10); // simulate brief upload latency
+            return null;
+        })
+            .when(transferService)
+            .uploadBlobStream(any(InputStream.class), anyLong(), any(BlobPath.class), anyString(), eq(WritePriority.HIGH), eq(null));
+
+        int numShards = 10;
+        // Stagger arrivals: shards arrive at different points within the batch interval
+        // This is what causes the race — the last shard to arrive waits only a small remainder
+        // and may dispatch before the first shard's timer fires.
+        CyclicBarrier startBarrier = new CyclicBarrier(numShards);
+        CountDownLatch allDone = new CountDownLatch(numShards);
+        AtomicReference<Exception> firstError = new AtomicReference<>();
+
+        for (int i = 0; i < numShards; i++) {
+            final int shardId = i;
+            final int staggerMs = (batchIntervalMs / numShards) * shardId; // 0, 10, 20, ... 90ms
+            new Thread(() -> {
+                try {
+                    startBarrier.await(5, TimeUnit.SECONDS);
+                    // Stagger: simulate shards arriving at different times within the window
+                    if (staggerMs > 0) {
+                        Thread.sleep(staggerMs);
+                    }
+                    coordinator.submitAndWait(createShardData(shardId, "shard-" + shardId), transferService);
+                } catch (Exception e) {
+                    firstError.compareAndSet(null, e);
+                } finally {
+                    allDone.countDown();
+                }
+            }, "staggered-shard-" + shardId).start();
+        }
+
+        assertTrue("All threads should complete within timeout", allDone.await(30, TimeUnit.SECONDS));
+        assertNull("No errors expected, got: " + firstError.get(), firstError.get());
+
+        // KEY ASSERTION: with 10 shards across a 100ms window (staggered 10ms apart),
+        // the buggy code would produce ~10 uploads (one per shard).
+        // The fixed code should produce exactly 1 upload (all shards batched).
+        // We allow up to 2 in case the batch window boundary is crossed.
+        int uploads = uploadCount.get();
+        assertTrue(
+            "Expected at most 2 uploads for " + numShards + " shards (batch window may split), but got " + uploads,
+            uploads <= 2
+        );
+        assertTrue("Expected at least 1 upload", uploads >= 1);
+    }
 }

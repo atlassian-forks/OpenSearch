@@ -211,8 +211,11 @@ public class TranslogArchiveBatchCoordinator {
                         throw new IOException("Interrupted while waiting for batch interval", e);
                     }
                 }
-                // After waiting, if no one else dispatched yet, this thread dispatches
-                if (!dispatching && !pendingShards.isEmpty()) {
+                // After waiting, only dispatch if this batch hasn't been dispatched yet.
+                // myLatch == dispatchLatch means the latch hasn't been replaced yet (no dispatch occurred).
+                // If the latch was replaced (by another thread or dispatchUnderLock resetting it),
+                // this batch was already dispatched — don't dispatch again.
+                if (myLatch == dispatchLatch && !dispatching && !pendingShards.isEmpty()) {
                     dispatchUnderLock(transferService);
                 }
             }
