@@ -231,24 +231,6 @@ public class TranslogArchiveBatchCoordinator {
     }
 
     /**
-     * Force-dispatch the current batch even if the interval hasn't elapsed.
-     * Called by a scheduled timer to ensure batches don't wait forever.
-     *
-     * @param transferService the transfer service for upload
-     */
-    public void timerDispatch(TransferService transferService) {
-        lock.lock();
-        try {
-            if (pendingShards.isEmpty() || dispatching) {
-                return;
-            }
-            dispatchUnderLock(transferService);
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
      * Must be called under lock. Hands the current batch off to a background upload thread.
      * {@code dispatching} stays {@code true} while the upload runs, so subsequent submissions
      * accumulate in {@code pendingShards} for the next batch. When the upload finishes, the
@@ -282,22 +264,16 @@ public class TranslogArchiveBatchCoordinator {
                 try {
                     dispatching = false;
                     if (!pendingShards.isEmpty()) {
-                        // Promote nextDispatchLatch to dispatchLatch and dispatch
-                        if (nextDispatchLatch != null) {
-                            dispatchLatch = nextDispatchLatch;
-                            nextDispatchLatch = null;
-                        } else {
-                            dispatchLatch = new CountDownLatch(1);
-                        }
+                        // Shards accumulated while upload ran — they all hold nextDispatchLatch.
+                        // Promote it to dispatchLatch and dispatch the next batch.
+                        assert nextDispatchLatch != null : "pendingShards non-empty but nextDispatchLatch is null";
+                        dispatchLatch = nextDispatchLatch;
+                        nextDispatchLatch = null;
                         dispatchUnderLock(transferService);
                     } else {
-                        // No pending shards — reset for next submission
-                        if (nextDispatchLatch != null) {
-                            dispatchLatch = nextDispatchLatch;
-                            nextDispatchLatch = null;
-                        } else {
-                            dispatchLatch = new CountDownLatch(1);
-                        }
+                        // No pending work — reset latch for the next submitAndWait() call.
+                        assert nextDispatchLatch == null : "nextDispatchLatch set but pendingShards is empty";
+                        dispatchLatch = new CountDownLatch(1);
                         batchComplete.signalAll();
                     }
                 } finally {

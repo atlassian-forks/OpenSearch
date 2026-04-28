@@ -134,15 +134,6 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         );
     }
 
-    public void testTimerDispatchWithNoPending() {
-        TranslogArchiveBatchCoordinator coordinator = createCoordinator();
-        TransferService transferService = mock(TransferService.class);
-
-        // Should be a no-op
-        coordinator.timerDispatch(transferService);
-        assertEquals(0, coordinator.getPendingShardCount());
-    }
-
     public void testEmptyEntriesNoUpload() throws Exception {
         TranslogArchiveBatchCoordinator coordinator = createCoordinator();
         TransferService transferService = mock(TransferService.class);
@@ -498,7 +489,6 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
         // Force dispatch after threads have submitted
         Thread.sleep(60);
-        coordinator.timerDispatch(transferService);
 
         assertTrue("All threads should complete", allDone.await(30, TimeUnit.SECONDS));
         // All threads that were in the same batch should have received the error
