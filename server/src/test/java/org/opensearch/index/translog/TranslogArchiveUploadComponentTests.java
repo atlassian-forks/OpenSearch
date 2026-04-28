@@ -352,7 +352,73 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
     }
 
     // -----------------------------------------------------------------------
-    // 6. OFF→ON toggle: fallback to per-shard metadata when no ZIPs found
+    // 6. GC LIST-count: cleanup() LIST operations for archive ON vs OFF
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verifies that translog GC (cleanup) LIST call counts are lower with archive ON vs OFF.
+     *
+     * <p>Archive-ON: {@code cleanup()} returns immediately — 0 LIST calls.
+     * Archive-OFF: {@code cleanup()} calls {@code listTranslogMetadataFilesAsync()} = 1 LIST,
+     * then optionally more for primary term cleanup.
+     *
+     * <p>This confirms that archive ON reduces S3 LIST API costs for translog GC operations.
+     */
+    public void testGcListCountArchiveOnVsOff() throws IOException {
+        int cycles = 5;
+
+        // --- Archive-OFF: seed metadata blobs then measure cleanup() LISTs ---
+        TranslogTransferManager offMgr = buildManager(false);
+        List<BlobMetadata> blobs = new LinkedList<>();
+        for (int i = 0; i < cycles; i++) {
+            TranslogTransferMetadata md = new TranslogTransferMetadata(primaryTerm, generation + i, minTranslogGeneration, 2);
+            blobs.add(new PlainBlobMetadata(md.getFileName(), 1));
+        }
+        transferService.setMetadataBlobs(blobs);
+        transferService.reset();
+
+        RemoteFsTimestampAwareTranslog.cleanup(offMgr);
+        int offLists = transferService.listCount();
+        int offTotal = offLists + transferService.deleteCount() + transferService.putCount() + transferService.getCount();
+
+        logger.info(
+            "Translog GC Archive-OFF ({} cycles) — LISTs={}, DELETEs={}, PUTs={}, GETs={}, TOTAL={}",
+            cycles,
+            offLists,
+            transferService.deleteCount(),
+            transferService.putCount(),
+            transferService.getCount(),
+            offTotal
+        );
+
+        // Archive-OFF cleanup MUST issue at least 1 LIST to discover stale metadata blobs.
+        assertTrue("Archive-OFF GC: ≥1 LIST", offLists >= 1);
+
+        transferService.reset();
+
+        // --- Archive-ON: cleanup() must be a complete no-op (0 LISTs, 0 everything) ---
+        TranslogTransferManager onMgr = buildManager(true);
+        RemoteFsTimestampAwareTranslog.cleanup(onMgr);
+        int onLists = transferService.listCount();
+        int onTotal = transferService.putCount() + transferService.getCount() + onLists + transferService.deleteCount();
+
+        logger.info(
+            "Translog GC Archive-ON ({} cycles) — LISTs={}, TOTAL={}",
+            cycles,
+            onLists,
+            onTotal
+        );
+
+        assertEquals("Archive-ON GC: 0 LISTs — cleanup() is no-op", 0, onLists);
+        assertEquals("Archive-ON GC: 0 total blob ops", 0, onTotal);
+        assertTrue(
+            "Archive-ON GC LIST count (" + onLists + ") < Archive-OFF (" + offLists + ")",
+            onLists < offLists
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. OFF→ON toggle: fallback to per-shard metadata when no ZIPs found
     // -----------------------------------------------------------------------
 
     /**
