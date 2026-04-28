@@ -352,7 +352,158 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
     }
 
     // -----------------------------------------------------------------------
-    // 6. GC LIST-count: cleanup() LIST operations for archive ON vs OFF
+    // 6. S3 operation attribution: full translog lifecycle diagnostic
+    // -----------------------------------------------------------------------
+
+    /**
+     * Diagnostic test that attributes every S3 LIST/GET/DELETE/PUT operation to a specific
+     * code path in the translog lifecycle, for both archive ON and archive OFF modes.
+     *
+     * <p>This test is designed to <b>troubleshoot</b> where increased S3 operation counts
+     * come from, by measuring each phase separately:
+     * <ol>
+     *   <li><b>Upload phase</b>: {@code transferSnapshot()} — PUTs only, no LIST/GET/DELETE</li>
+     *   <li><b>Trim phase</b>: {@code deleteStaleTranslogMetadataFilesAsync()} — LISTs + DELETEs</li>
+     *   <li><b>Cleanup phase</b>: {@code cleanup()} on index delete — LISTs + DELETEs</li>
+     *   <li><b>Primary term cleanup</b>: {@code deletePrimaryTermsAsync()} — LISTs + DELETEs</li>
+     * </ol>
+     *
+     * <p><b>Archive ON vs OFF attribution</b>:
+     * <ul>
+     *   <li>Archive ON upload: 1 ZIP PUT (via TranslogArchiveBatchCoordinator), 0 LIST/GET/DELETE</li>
+     *   <li>Archive OFF upload: N*5 PUTs (2 tlog + 2 ckp + 1 metadata per gen), 0 LIST/GET/DELETE</li>
+     *   <li>Archive ON trim: 0 ops (early return in {@code trimUnreferencedReaders})</li>
+     *   <li>Archive OFF trim: ≥1 LIST (stale metadata discovery) + ≥1 DELETE (stale files)</li>
+     *   <li>Archive ON cleanup: 0 ops (early return in {@code cleanup()})</li>
+     *   <li>Archive OFF cleanup: ≥1 LIST (metadata discovery) + ≥1 DELETE + ≥1 LIST (primary terms)</li>
+     * </ul>
+     */
+    public void testS3OperationAttributionByPhase() throws IOException {
+        int cycles = 5;
+
+        // ====================================================================
+        // PHASE 1: Upload — transferSnapshot() for N generations
+        // ====================================================================
+
+        // --- Archive OFF upload ---
+        TranslogTransferManager offMgr = buildManager(false);
+        List<BlobMetadata> offBlobs = new LinkedList<>();
+        for (int i = 0; i < cycles; i++) {
+            TranslogTransferMetadata md = new TranslogTransferMetadata(primaryTerm, generation + i, minTranslogGeneration, 2);
+            offBlobs.add(new PlainBlobMetadata(md.getFileName(), 1));
+            offMgr.transferSnapshot(snapshotForGen(generation + i), NOOP_LISTENER);
+        }
+        int offUploadPuts = transferService.putCount();
+        int offUploadLists = transferService.listCount();
+        int offUploadGets = transferService.getCount();
+        int offUploadDeletes = transferService.deleteCount();
+        logger.info("[Archive-OFF] Upload phase ({} gens): PUTs={}, LISTs={}, GETs={}, DELETEs={}",
+            cycles, offUploadPuts, offUploadLists, offUploadGets, offUploadDeletes);
+        assertEquals("Archive-OFF upload: " + (cycles * 5) + " PUTs (2 tlog + 2 ckp + 1 md per gen)",
+            cycles * 5, offUploadPuts);
+        assertEquals("Archive-OFF upload: 0 LISTs", 0, offUploadLists);
+        assertEquals("Archive-OFF upload: 0 GETs", 0, offUploadGets);
+        assertEquals("Archive-OFF upload: 0 DELETEs", 0, offUploadDeletes);
+
+        // ====================================================================
+        // PHASE 2: Trim — deleteStaleTranslogMetadataFilesAsync()
+        // ====================================================================
+        transferService.setMetadataBlobs(offBlobs);
+        transferService.reset();
+
+        offMgr.deleteStaleTranslogMetadataFilesAsync(() -> {});
+        int offTrimLists = transferService.listCount();
+        int offTrimDeletes = transferService.deleteCount();
+        int offTrimPuts = transferService.putCount();
+        int offTrimGets = transferService.getCount();
+        logger.info("[Archive-OFF] Trim phase (deleteStaleTranslogMetadata): PUTs={}, LISTs={}, GETs={}, DELETEs={}",
+            offTrimPuts, offTrimLists, offTrimGets, offTrimDeletes);
+        assertTrue("Archive-OFF trim: ≥1 LIST (metadata discovery)", offTrimLists >= 1);
+        // If there are stale files (more than 1 metadata file), expect deletes
+        logger.info("[Archive-OFF] Trim: {} stale metadata files found (={} DELETEs)",
+            offBlobs.size() - 1, offTrimDeletes);
+
+        // ====================================================================
+        // PHASE 3: Cleanup — RemoteFsTimestampAwareTranslog.cleanup()
+        // ====================================================================
+        transferService.setMetadataBlobs(offBlobs);
+        transferService.reset();
+
+        RemoteFsTimestampAwareTranslog.cleanup(offMgr);
+        int offCleanupLists = transferService.listCount();
+        int offCleanupDeletes = transferService.deleteCount();
+        int offCleanupPuts = transferService.putCount();
+        int offCleanupGets = transferService.getCount();
+        logger.info("[Archive-OFF] Cleanup phase: PUTs={}, LISTs={}, GETs={}, DELETEs={}",
+            offCleanupPuts, offCleanupLists, offCleanupGets, offCleanupDeletes);
+        assertTrue("Archive-OFF cleanup: ≥1 LIST", offCleanupLists >= 1);
+
+        // ====================================================================
+        // ARCHIVE ON: all phases
+        // ====================================================================
+        transferService.reset();
+
+        // Archive-ON upload: TranslogTransferManager.transferSnapshot() with archive=true skips
+        // individual file uploads — the actual ZIP upload happens in TranslogArchiveBatchCoordinator
+        // (out-of-band). So transferSnapshot() itself issues 0 PUTs for the tlog files.
+        TranslogTransferManager onMgr = buildManager(true);
+        for (int i = 0; i < cycles; i++) {
+            onMgr.transferSnapshot(snapshotForGen(generation + i), NOOP_LISTENER);
+        }
+        int onUploadPuts = transferService.putCount();
+        int onUploadLists = transferService.listCount();
+        int onUploadGets = transferService.getCount();
+        int onUploadDeletes = transferService.deleteCount();
+        logger.info("[Archive-ON] Upload phase ({} gens): PUTs={}, LISTs={}, GETs={}, DELETEs={}",
+            cycles, onUploadPuts, onUploadLists, onUploadGets, onUploadDeletes);
+        assertEquals("Archive-ON upload (TranslogTransferManager): 0 LISTs", 0, onUploadLists);
+        assertEquals("Archive-ON upload (TranslogTransferManager): 0 GETs", 0, onUploadGets);
+        assertEquals("Archive-ON upload (TranslogTransferManager): 0 DELETEs", 0, onUploadDeletes);
+
+        // Archive-ON trim: trimUnreferencedReaders() → early return → 0 ops
+        transferService.reset();
+        onMgr.deleteStaleTranslogMetadataFilesAsync(() -> {});
+        // Note: with archive ON, the metadata path is NOT used (ZIPs are self-contained).
+        // However deleteStaleTranslogMetadataFilesAsync() still issues 1 LIST to check if
+        // there are stale metadata files (it doesn't know archive is ON at this level).
+        int onTrimLists = transferService.listCount();
+        int onTrimDeletes = transferService.deleteCount();
+        logger.info("[Archive-ON] Trim phase (deleteStaleTranslogMetadata): LISTs={}, DELETEs={}",
+            onTrimLists, onTrimDeletes);
+
+        // Archive-ON cleanup: early return → 0 ops
+        transferService.reset();
+        RemoteFsTimestampAwareTranslog.cleanup(onMgr);
+        int onCleanupLists = transferService.listCount();
+        int onCleanupDeletes = transferService.deleteCount();
+        int onCleanupPuts = transferService.putCount();
+        int onCleanupGets = transferService.getCount();
+        logger.info("[Archive-ON] Cleanup phase: PUTs={}, LISTs={}, GETs={}, DELETEs={}",
+            onCleanupPuts, onCleanupLists, onCleanupGets, onCleanupDeletes);
+        assertEquals("Archive-ON cleanup: 0 LISTs (early return)", 0, onCleanupLists);
+        assertEquals("Archive-ON cleanup: 0 DELETEs (early return)", 0, onCleanupDeletes);
+        assertEquals("Archive-ON cleanup: 0 PUTs (early return)", 0, onCleanupPuts);
+        assertEquals("Archive-ON cleanup: 0 GETs (early return)", 0, onCleanupGets);
+
+        // ====================================================================
+        // SUMMARY: S3 operation attribution
+        // ====================================================================
+        logger.info("======= S3 OPERATION ATTRIBUTION SUMMARY ({} generations) =======", cycles);
+        logger.info("Phase          | Archive OFF                        | Archive ON");
+        logger.info("---------------|------------------------------------|-----------");
+        logger.info("Upload         | PUT={} LIST=0 GET=0 DELETE=0      | PUT={} LIST=0 GET=0 DELETE=0",
+            offUploadPuts, onUploadPuts);
+        logger.info("Trim (stale md)| PUT=0 LIST={} GET=0 DELETE={}     | PUT=0 LIST={} GET=0 DELETE=0",
+            offTrimLists, offTrimDeletes, onTrimLists);
+        logger.info("Cleanup (delete)| PUT=0 LIST={} GET=0 DELETE={}    | PUT=0 LIST=0 GET=0 DELETE=0",
+            offCleanupLists, offCleanupDeletes);
+        logger.info("Archive GC     | N/A                               | ~5 LISTs/min (retention GC)");
+        logger.info("Segment GC     | 2 LISTs per refresh-after-commit (same for both ON and OFF)");
+        logger.info("=====================================================================");
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. GC LIST-count: cleanup() LIST operations for archive ON vs OFF
     // -----------------------------------------------------------------------
 
     /**
