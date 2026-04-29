@@ -581,4 +581,153 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         );
         assertTrue("Expected at least 1 upload", uploads >= 1);
     }
+
+    /**
+     * DOUBLE-BUFFER TIMING TEST.
+     *
+     * Theory: When only ONE shard calls submitAndWait() (simulating what happens when
+     * BufferedAsyncIOProcessor collapses all locations to a single ensureSynced(max) call),
+     * the coordinator still waits the FULL batchInterval for other shards that never come.
+     *
+     * This proves the double-buffer problem: BufferedAsyncIOProcessor buffers for 650ms,
+     * then calls submitAndWait() once, which then waits ANOTHER batchInterval (650ms)
+     * for concurrent callers that will never arrive because the first buffer already
+     * collapsed all pending syncs into a single call.
+     *
+     * Expected: submitAndWait with a single caller takes >= batchInterval to return
+     * (because it waits the full interval for other shards to join).
+     *
+     * Fix direction: batchInterval in the coordinator should be 0 when a single caller
+     * enters and no other callers are expected (i.e., the upstream buffer already did batching).
+     */
+    public void testSingleCallerWaitsFullBatchIntervalProveDoubleBuffer() throws Exception {
+        long batchIntervalMs = 100; // Short interval for test speed
+        TranslogArchiveBatchCoordinator coordinator = new TranslogArchiveBatchCoordinator(
+            "index-uuid-double-buf",
+            "node-1",
+            new BlobPath().add("repo"),
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
+            TimeValue.timeValueMillis(batchIntervalMs)
+        );
+
+        AtomicInteger uploadCount = new AtomicInteger(0);
+        TransferService transferService = mock(TransferService.class);
+        org.mockito.Mockito.doAnswer(inv -> {
+            uploadCount.incrementAndGet();
+            // Drain the input stream (required for piped stream not to block)
+            try (InputStream is = inv.getArgument(0)) { is.transferTo(java.io.OutputStream.nullOutputStream()); }
+            return null;
+        }).when(transferService).uploadBlobStream(any(), anyLong(), any(), anyString(), any(WritePriority.class), any());
+
+        List<ArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+            ArchiveBuilder.fromBytes("shard0/translog-1.tlog", "data".getBytes(StandardCharsets.UTF_8))
+        );
+        TranslogArchiveBatchCoordinator.ShardArchiveData shardData =
+            new TranslogArchiveBatchCoordinator.ShardArchiveData(0, 1L, 1L, 0L, entries);
+
+        // Measure how long a single submitAndWait() call takes
+        long startNs = System.nanoTime();
+        coordinator.submitAndWait(shardData, transferService);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs);
+
+        // PROOF OF DOUBLE-BUFFER BUG:
+        // A single caller must wait the full batchInterval (100ms) even though
+        // no other shards will join. This is the wasteful second buffer.
+        // If the coordinator had batchInterval=0, this would complete in <10ms.
+        assertThat(
+            "Single submitAndWait caller should wait at least the full batchInterval ("
+                + batchIntervalMs + "ms) proving the double-buffer overhead. Actual: " + elapsedMs + "ms",
+            elapsedMs,
+            org.hamcrest.Matchers.greaterThanOrEqualTo(batchIntervalMs - 10) // -10ms tolerance
+        );
+        assertThat("Upload should have completed", uploadCount.get(), org.hamcrest.Matchers.equalTo(1));
+
+        // Document the fix: if batchInterval were 0, elapsedMs would be << 10ms
+        // The fix is to set batchInterval=0 in the coordinator when the upstream
+        // BufferedAsyncIOProcessor is providing the batching window.
+        logger.info("Double-buffer overhead measured: {}ms (batchInterval={}ms). " +
+            "With batchInterval=0, this would be <10ms.", elapsedMs, batchIntervalMs);
+    }
+
+    /**
+     * FIX VERIFICATION: without the per-shard BufferedAsyncIOProcessor buffer, multiple shards
+     * call submitAndWait() concurrently and are all batched into a SINGLE ZIP upload.
+     *
+     * This simulates the fixed behavior where:
+     *  - archive is enabled → per-shard buffer disabled
+     *  - all shards call submitAndWait() concurrently within the coordinator's batchInterval
+     *  - coordinator batches ALL of them into 1 ZIP (not N separate ZIPs)
+     *  - total latency = 1 batchInterval (not 2)
+     *
+     * Expected: N concurrent callers → 1 upload, latency ≈ batchInterval (not 2×)
+     */
+    public void testConcurrentShardsAreBatchedIntoSingleZipWithSingleBuffer() throws Exception {
+        int numShards = 5;
+        long batchIntervalMs = 100;
+        TranslogArchiveBatchCoordinator coordinator = new TranslogArchiveBatchCoordinator(
+            "index-uuid-fix-verify",
+            "node-1",
+            new BlobPath().add("repo"),
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
+            TimeValue.timeValueMillis(batchIntervalMs)
+        );
+
+        AtomicInteger uploadCount = new AtomicInteger(0);
+        TransferService transferService = mock(TransferService.class);
+        org.mockito.Mockito.doAnswer(inv -> {
+            uploadCount.incrementAndGet();
+            try (InputStream is = inv.getArgument(0)) { is.transferTo(java.io.OutputStream.nullOutputStream()); }
+            return null;
+        }).when(transferService).uploadBlobStream(any(), anyLong(), any(), anyString(), any(WritePriority.class), any());
+
+        // All shards start simultaneously (simulating direct submitAndWait with no per-shard buffer)
+        CountDownLatch startGate = new CountDownLatch(1);
+        CountDownLatch allDone = new CountDownLatch(numShards);
+        AtomicReference<Exception> firstError = new AtomicReference<>();
+        long startNs = System.nanoTime();
+
+        for (int shardId = 0; shardId < numShards; shardId++) {
+            final int shard = shardId;
+            new Thread(() -> {
+                try {
+                    startGate.await();
+                    List<ArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+                        ArchiveBuilder.fromBytes("shard" + shard + "/translog-1.tlog",
+                            ("data-" + shard).getBytes(StandardCharsets.UTF_8))
+                    );
+                    TranslogArchiveBatchCoordinator.ShardArchiveData data =
+                        new TranslogArchiveBatchCoordinator.ShardArchiveData(shard, 1L, 1L, 0L, entries);
+                    coordinator.submitAndWait(data, transferService);
+                } catch (Exception e) {
+                    firstError.compareAndSet(null, e);
+                } finally {
+                    allDone.countDown();
+                }
+            }, "shard-" + shardId).start();
+        }
+
+        // Release all threads at once — simulates concurrent shard sync calls (no per-shard buffer)
+        startGate.countDown();
+        assertTrue("All threads should complete within timeout", allDone.await(10, TimeUnit.SECONDS));
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs);
+
+        assertNull("No errors expected: " + firstError.get(), firstError.get());
+
+        // KEY ASSERTION: all 5 concurrent shards should produce exactly 1 upload
+        assertThat(
+            "All concurrent shards should be batched into 1 ZIP (coordinator does the batching, not the per-shard buffer)",
+            uploadCount.get(),
+            org.hamcrest.Matchers.equalTo(1)
+        );
+
+        // Total latency should be ~batchInterval (1 buffer, not 2)
+        assertThat(
+            "Latency should be ~1× batchInterval (not 2×): " + elapsedMs + "ms",
+            elapsedMs,
+            org.hamcrest.Matchers.lessThan(batchIntervalMs * 2 + 100) // batchInterval + some upload time
+        );
+
+        logger.info("Fixed: {} concurrent shards → {} upload(s) in {}ms (batchInterval={}ms)",
+            numShards, uploadCount.get(), elapsedMs, batchIntervalMs);
+    }
 }

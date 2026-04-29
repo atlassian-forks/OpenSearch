@@ -412,11 +412,23 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.indexSortSupplier = indexSortSupplier;
         this.indexEventListener = indexEventListener;
         this.threadPool = threadPool;
+        // When translog archive upload is enabled, the per-index TranslogArchiveBatchCoordinator
+        // provides the batching window (batchInterval) by accumulating concurrent shard sync calls.
+        // Having BOTH BufferedAsyncIOProcessor (per-shard, 650ms) AND the coordinator's batchInterval
+        // (per-index, 650ms) creates a "double-buffer" problem: the per-shard buffer collapses all
+        // pending shard syncs into a single ensureSynced(max) call, so the coordinator never receives
+        // concurrent callers and wastes its full batchInterval waiting for callers that never come.
+        // Fix: disable the per-shard buffer when archive is enabled, allowing each shard to call
+        // submitAndWait() directly. The coordinator then receives concurrent calls from all shards
+        // during its batchInterval window and batches them into a single ZIP (as designed).
+        // Non-archive path keeps the per-shard buffer unchanged.
+        boolean usePerShardBuffer = indexSettings.isAssignedOnRemoteNode()
+            && !indexSettings.isTranslogArchiveUploadEnabled();
         this.translogSyncProcessor = createTranslogSyncProcessor(
             logger,
             threadPool,
             this::getEngine,
-            indexSettings.isAssignedOnRemoteNode(),
+            usePerShardBuffer,
             () -> getRemoteTranslogUploadBufferInterval(remoteStoreSettings::getClusterRemoteTranslogBufferInterval)
         );
         this.mapperService = mapperService;

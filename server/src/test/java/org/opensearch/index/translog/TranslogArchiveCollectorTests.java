@@ -310,7 +310,12 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         realMeta.setGenerationToPrimaryTermMapper(new java.util.HashMap<>());
         TransferSnapshot mockSnapshot = mock(TransferSnapshot.class);
         when(mockSnapshot.getTranslogTransferMetadata()).thenReturn(realMeta);
-        when(mockSnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.emptySet());
+        // Provide a real translog file snapshot so snapshotToEntries() returns non-empty entries.
+        // Without this, the new empty-entries guard would skip the upload (correct behavior for truly empty
+        // translog, but this test verifies the upload path with pending data).
+        FileSnapshot.TransferFileSnapshot tlogFile =
+            new FileSnapshot.TransferFileSnapshot("translog-5.tlog", "dummy-tlog-data".getBytes(StandardCharsets.UTF_8), 1L);
+        when(mockSnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.singleton(tlogFile));
         when(mockSnapshot.getCheckpointFileSnapshots()).thenReturn(Collections.emptySet());
 
         ShardRouting routing = mock(ShardRouting.class);
@@ -416,10 +421,15 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         TransferSnapshot mockSnapshot0 = mock(TransferSnapshot.class);
         TransferSnapshot mockSnapshot1 = mock(TransferSnapshot.class);
         when(mockSnapshot0.getTranslogTransferMetadata()).thenReturn(realMeta0);
-        when(mockSnapshot0.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.emptySet());
+        // Provide real file snapshots so snapshotToEntries() returns non-empty entries for the upload path.
+        FileSnapshot.TransferFileSnapshot tlogFile0 =
+            new FileSnapshot.TransferFileSnapshot("translog-5.tlog", "tlog-data-shard0".getBytes(StandardCharsets.UTF_8), 1L);
+        when(mockSnapshot0.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.singleton(tlogFile0));
         when(mockSnapshot0.getCheckpointFileSnapshots()).thenReturn(Collections.emptySet());
         when(mockSnapshot1.getTranslogTransferMetadata()).thenReturn(realMeta1);
-        when(mockSnapshot1.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.emptySet());
+        FileSnapshot.TransferFileSnapshot tlogFile1 =
+            new FileSnapshot.TransferFileSnapshot("translog-6.tlog", "tlog-data-shard1".getBytes(StandardCharsets.UTF_8), 1L);
+        when(mockSnapshot1.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.singleton(tlogFile1));
         when(mockSnapshot1.getCheckpointFileSnapshots()).thenReturn(Collections.emptySet());
 
         ShardRouting routing = mock(ShardRouting.class);
@@ -531,7 +541,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         );
         when(mockMeta.getPrimaryTerm()).thenReturn(1L);
         when(mockSnapshot.getTranslogTransferMetadata()).thenReturn(mockMeta);
-        when(mockSnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.emptySet());
+        // Provide a real file snapshot so upload is attempted (then fails) to trigger fallback
+        FileSnapshot.TransferFileSnapshot fallbackTlogFile =
+            new FileSnapshot.TransferFileSnapshot("translog-5.tlog", "tlog-data".getBytes(java.nio.charset.StandardCharsets.UTF_8), 1L);
+        when(mockSnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.singleton(fallbackTlogFile));
         when(mockSnapshot.getCheckpointFileSnapshots()).thenReturn(Collections.emptySet());
         when(mockSnapshot.getTranslogFileSnapshots()).thenReturn(Collections.emptySet());
 
@@ -617,7 +630,9 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         );
         when(mockMeta.getPrimaryTerm()).thenReturn(1L);
         when(mockSnapshot.getTranslogTransferMetadata()).thenReturn(mockMeta);
-        when(mockSnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.emptySet());
+        FileSnapshot.TransferFileSnapshot noFallbackTlogFile =
+            new FileSnapshot.TransferFileSnapshot("translog-5.tlog", "tlog-data".getBytes(java.nio.charset.StandardCharsets.UTF_8), 1L);
+        when(mockSnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.singleton(noFallbackTlogFile));
         when(mockSnapshot.getCheckpointFileSnapshots()).thenReturn(Collections.emptySet());
         when(mockSnapshot.getTranslogFileSnapshots()).thenReturn(Collections.emptySet());
 
@@ -702,10 +717,14 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         );
         when(mockMeta.getPrimaryTerm()).thenReturn(1L);
         when(mockSnapshot.getTranslogTransferMetadata()).thenReturn(mockMeta);
-        when(mockSnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.emptySet());
+        FileSnapshot.TransferFileSnapshot releaseCallback2TlogFile =
+            new FileSnapshot.TransferFileSnapshot("translog-5.tlog", "tlog-data".getBytes(java.nio.charset.StandardCharsets.UTF_8), 1L);
+        when(mockSnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.singleton(releaseCallback2TlogFile));
         when(mockSnapshot.getCheckpointFileSnapshots()).thenReturn(Collections.emptySet());
         when(mockSnapshot.getTranslogFileSnapshots()).thenReturn(Collections.emptySet());
-
+        FileSnapshot.TransferFileSnapshot releaseCallbackTlogFile =
+            new FileSnapshot.TransferFileSnapshot("translog-5.tlog", "tlog-data".getBytes(java.nio.charset.StandardCharsets.UTF_8), 1L);
+        when(mockSnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.singleton(releaseCallbackTlogFile));
         AtomicInteger releaseCount = new AtomicInteger(0);
         ShardRouting routing = mock(ShardRouting.class);
         when(routing.primary()).thenReturn(true);
