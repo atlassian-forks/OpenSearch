@@ -174,8 +174,8 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldBlobName, zipBytes, 0L), zipDir, WritePriority.HIGH);
             assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
 
-            ArchiveDeletionHelper.RetentionBounds bounds = new ArchiveDeletionHelper.RetentionBounds(1L, 3L, 5L);
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, bounds);
+            long retentionMinutes = 5L;
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
             assertThat(deleted, equalTo(1));
             assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(0L));
         } finally {
@@ -211,8 +211,8 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             String freshBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
             transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshBlobName, zipBytes, 0L), zipDir, WritePriority.HIGH);
 
-            ArchiveDeletionHelper.RetentionBounds bounds = new ArchiveDeletionHelper.RetentionBounds(1L, 2L, 60L);
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, bounds);
+            long retentionMinutes = 60L;
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
             assertThat(deleted, equalTo(0));
             assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
         } finally {
@@ -1046,8 +1046,8 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshName, zipBytes, 0L), zipDir, WritePriority.HIGH);
             assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
 
-            ArchiveDeletionHelper.RetentionBounds bounds = new ArchiveDeletionHelper.RetentionBounds(1L, 2L, 60L);
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, bounds);
+            long retentionMinutes = 60L;
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
             assertThat("fresh ZIP within retention should not be deleted", deleted, equalTo(0));
             assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
         } finally {
@@ -1117,8 +1117,8 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             assertThat("should have 3 ZIPs before retention", zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(3L));
 
             // 5-minute retention: 2 old ZIPs deleted, 1 new ZIP kept
-            ArchiveDeletionHelper.RetentionBounds bounds = new ArchiveDeletionHelper.RetentionBounds(1L, 3L, 5L);
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, bounds);
+            long retentionMinutes = 5L;
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
             assertThat("2 old ZIPs should be deleted", deleted, equalTo(2));
             assertThat("1 new ZIP should remain", zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
             assertThat("new ZIP should still be present", blobStore.blobContainer(zipDir).listBlobs().containsKey(newName), equalTo(true));
@@ -1204,9 +1204,12 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
 
     /**
      * Orphaned archive ZIPs (from deleted indices) are detected via S3 folder scan and deleted
-     * when runRetentionForTesting is called with a live index that shares the same repo.
-     * The GC lists translog/data/ folders, computes live hashTypeIndex set, and deletes ZIPs
-     * under any folder not in the live set.
+     * by the same pure-timestamp pass that deletes live-index ZIPs.
+     * <p>
+     * In the new (pure-timestamp) GC model, orphaned dirs are not special-cased: we simply scan
+     * every {@code hashTypeIndex} dir found under {@code translog/data/} and delete ZIPs older
+     * than the largest configured retention (or the safety floor, whichever is greater). Eventually,
+     * an orphaned dir's ZIPs all age out and the dir becomes empty.
      */
     public void testOrphanedIndexArchiveZipsAreCleanedUpViaScan() throws IOException {
         BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
@@ -1224,8 +1227,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, hashAlgo);
             BlobPath deletedZipDir = basePath.add("translog").add("data").add(deletedHashTypeIndex).add(hashNodeId);
             byte[] zipBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(Collections.emptyList());
+            // Both timestamps are well past the 5-minute safety-floor retention so they will both
+            // be deleted by the pure-timestamp GC pass on this orphaned dir.
             String blob1 = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(2))) + ".zip";
-            String blob2 = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofMinutes(5))) + ".zip";
+            String blob2 = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(1))) + ".zip";
             transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blob1, zipBytes, 0L), deletedZipDir, WritePriority.HIGH);
             transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blob2, zipBytes, 0L), deletedZipDir, WritePriority.HIGH);
             assertThat(zipBlobCount(blobStore.blobContainer(deletedZipDir).listBlobs()), equalTo(2L));
@@ -1325,8 +1330,8 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(fresh, zipBytes, 0L), zipDir, WritePriority.HIGH);
             assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(3L));
 
-            ArchiveDeletionHelper.RetentionBounds bounds = new ArchiveDeletionHelper.RetentionBounds(1L, 3L, 5L);
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, bounds);
+            long retentionMinutes = 5L;
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
 
             assertThat("2 old ZIPs should be deleted, fresh ZIP should stop further iteration", deleted, equalTo(2));
             assertThat("fresh ZIP should still be present", zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));

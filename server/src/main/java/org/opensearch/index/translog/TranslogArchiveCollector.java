@@ -322,129 +322,146 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
     }
 
     /**
-     * Runs archive retention for live indices and orphan cleanup for deleted indices.
+     * Pure-timestamp-based archive GC.
      * <p>
-     * <b>Live index retention</b>: deletes ZIPs older than {@code index.remote_store.translog.archive_retention}
-     * for each live (indexUUID, nodeId) pair.
+     * For each live primary shard on this node we know:
+     *   - the index UUID (and so the {@code hashTypeIndex} S3 directory)
+     *   - the node ID (and so the {@code hashNodeId} S3 directory belonging to this node)
+     *   - the configured {@code translog.archive_retention} (clamped to {@link ArchiveDeletionHelper#MIN_RETENTION_SAFETY_BUFFER_MINUTES})
      * <p>
-     * <b>Orphan detection</b> (2 LISTs per orphaned index):
+     * Algorithm:
      * <ol>
-     *   <li>LIST 1: {@code listFolders("translog/data/")} → all {@code {hashTypeIndex}} dirs on S3</li>
-     *   <li>Compute live set: {@code hashTypeIndex} for each live index UUID</li>
-     *   <li>Orphaned = S3 dirs − live set</li>
-     *   <li>LIST 2: for each orphaned dir, {@code listFolders("{hashTypeIndex}/")} → node dirs →
-     *       LIST + DELETE ALL ZIPs unconditionally</li>
+     *   <li>List {@code translog/data/} → all {@code hashTypeIndex} directories present in S3.</li>
+     *   <li>For each {@code hashTypeIndex}, scan ONLY this node's subfolder
+     *       ({@code hashNodeId(localNodeId)}). Other nodes' subfolders belong to peers and they
+     *       run their own GC for those.</li>
+     *   <li>Page through ZIPs in lexicographic (= chronological by {@code yyyyMMddHHmmssSSS} prefix)
+     *       order; build the expired list in memory; <b>early-exit pagination</b> when a ZIP within
+     *       retention is encountered.</li>
+     *   <li>Delete the expired list in batches of {@link #RETENTION_DELETE_BATCH_SIZE}.</li>
      * </ol>
-     * Uses the transferService/basePath from any live shard (all indices share the same repo root).
+     * <p>
+     * <b>Pure timestamp-based:</b> no per-shard generation/primaryTerm checks. Orphaned-index
+     * directories are not special-cased — their ZIPs simply age past retention and get deleted by
+     * the normal pass on a future cycle.
      */
     private void runArchiveRetention() {
         RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm = remoteStoreSettings != null
             ? remoteStoreSettings.getPathHashAlgorithm()
             : RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
 
-        List<ShardId> eligible = getEligibleShardIds();
-
-        // Collect per-index info from live shards
-        Map<String, ArchiveDeletionHelper.RetentionBounds> retentionByIndex = new HashMap<>();
-        Map<String, TranslogTransferManager> transferManagerByIndex = new HashMap<>();
-        Map<String, String> nodeIdByIndex = new HashMap<>();
+        // 1. Discover live indices on this node + a TransferService/basePath/nodeId/retention to use.
+        Map<String, Long> retentionMinutesByIndex = new HashMap<>();
         TransferService anyTransferService = null;
         BlobPath anyBasePath = null;
+        String localNodeId = null;
+        long defaultRetentionMinutes = ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES;
 
-        for (ShardId sid : eligible) {
+        for (ShardId sid : getEligibleShardIds()) {
             IndexService indexService = indicesService.indexService(sid.getIndex());
             if (indexService == null) continue;
             IndexShard shard = indexService.getShardOrNull(sid.id());
             if (shard == null) continue;
             String indexUUID = shard.indexSettings().getIndexMetadata().getIndexUUID();
-            shard.getArchiveRetentionBounds().ifPresent(bounds -> retentionByIndex.put(indexUUID, bounds));
-            if (!transferManagerByIndex.containsKey(indexUUID)) {
+            long retentionMinutes = Math.max(
+                shard.indexSettings().getTranslogArchiveRetention().getMinutes(),
+                ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES
+            );
+            retentionMinutesByIndex.put(indexUUID, retentionMinutes);
+            // Use the largest configured retention as the default for orphaned-index dirs we encounter,
+            // so we never accidentally delete a ZIP newer than ANY live index's retention.
+            if (retentionMinutes > defaultRetentionMinutes) {
+                defaultRetentionMinutes = retentionMinutes;
+            }
+            if (anyTransferService == null) {
                 Optional<TranslogTransferManager> tmOpt = shard.getTranslogTransferManager();
-                if (tmOpt.isPresent()) {
-                    TranslogTransferManager tm = tmOpt.get();
-                    transferManagerByIndex.put(indexUUID, tm);
-                    shard.getTranslogNodeId().ifPresent(nid -> nodeIdByIndex.put(indexUUID, nid));
-                    if (anyTransferService == null) {
-                        anyTransferService = tm.getTransferService();
-                        anyBasePath = tm.getArchiveBasePath();
-                    }
+                Optional<String> nodeIdOpt = shard.getTranslogNodeId();
+                if (tmOpt.isPresent() && nodeIdOpt.isPresent()) {
+                    anyTransferService = tmOpt.get().getTransferService();
+                    anyBasePath = tmOpt.get().getArchiveBasePath();
+                    localNodeId = nodeIdOpt.get();
                 }
             }
         }
 
-        // --- Live index retention ---
-        for (Map.Entry<String, ArchiveDeletionHelper.RetentionBounds> e : retentionByIndex.entrySet()) {
-            String indexUUID = e.getKey();
-            ArchiveDeletionHelper.RetentionBounds bounds = e.getValue();
-            TranslogTransferManager tm = transferManagerByIndex.get(indexUUID);
-            String nodeId = nodeIdByIndex.get(indexUUID);
-            if (tm == null || nodeId == null) continue;
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, pathHashAlgorithm);
-            BlobPath zipDir = tm.getArchiveBasePath().add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
-            try {
-                deleteArchivesOlderThanRetention(tm.getTransferService(), zipDir, bounds);
-            } catch (IOException ex) {
-                logger.warn("Archive retention delete failed for index {}: {}", indexUUID, ex.getMessage());
-            }
-        }
-
-        // --- Orphaned index cleanup ---
-        // Requires at least one live shard to provide transferService + basePath for S3 access.
-        if (anyTransferService == null || anyBasePath == null) {
+        // No archive-enabled live shards on this node → nothing to clean up here.
+        if (anyTransferService == null || anyBasePath == null || localNodeId == null) {
             return;
         }
-        // Compute the set of hashTypeIndex values for all currently live archive-enabled indices
-        Set<String> liveHashTypeIndices = new HashSet<>();
-        for (String indexUUID : transferManagerByIndex.keySet()) {
-            liveHashTypeIndices.add(TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm));
-        }
-        // LIST 1: all hashTypeIndex directories under translog/data/
+
+        // 2. List all hashTypeIndex directories present in S3 (one S3 LIST).
         BlobPath archiveDataPath = anyBasePath.add("translog").add("data");
         Set<String> s3HashTypeDirs;
         try {
             s3HashTypeDirs = anyTransferService.listFolders(archiveDataPath);
         } catch (IOException e) {
-            logger.warn("Failed to list archive data dirs for orphan detection: {}", e.getMessage());
+            logger.warn("Failed to list archive data dirs: {}", e.getMessage());
             return;
         }
+
+        String hashNodeIdLocal = TranslogArchivePathHelper.hashNodeId(localNodeId, pathHashAlgorithm);
+
+        // 3. For each hashTypeIndex dir present in S3, scan THIS node's subfolder and delete by age.
+        //    Use the index's configured retention if it's still live; otherwise use the largest
+        //    retention seen on this node so we stay safe.
         for (String hashTypeDir : s3HashTypeDirs) {
-            if (liveHashTypeIndices.contains(hashTypeDir)) {
-                continue; // live index — skip
-            }
-            // Orphaned index directory — LIST 2: find node subdirs then delete all ZIPs
-            BlobPath hashTypePath = archiveDataPath.add(hashTypeDir);
-            Set<String> nodeDirs;
-            try {
-                nodeDirs = anyTransferService.listFolders(hashTypePath);
-            } catch (IOException e) {
-                logger.warn("Failed to list node dirs for orphaned index dir {}: {}", hashTypeDir, e.getMessage());
-                continue;
-            }
-            for (String nodeDir : nodeDirs) {
-                BlobPath zipDir = hashTypePath.add(nodeDir);
-                try {
-                    int deleted = deleteAllArchives(anyTransferService, zipDir);
-                    if (deleted > 0) {
-                        logger.info("Deleted {} orphaned archive ZIPs from {}", deleted, zipDir.buildAsString());
-                    }
-                } catch (IOException e) {
-                    logger.warn("Failed to delete orphaned archive ZIPs from {}: {}", zipDir.buildAsString(), e.getMessage());
+            // Find which live index (if any) maps to this hashTypeDir.
+            Long retentionMinutes = null;
+            for (Map.Entry<String, Long> e : retentionMinutesByIndex.entrySet()) {
+                if (TranslogArchivePathHelper.hashTypeIndex(e.getKey(), pathHashAlgorithm).equals(hashTypeDir)) {
+                    retentionMinutes = e.getValue();
+                    break;
                 }
+            }
+            if (retentionMinutes == null) {
+                retentionMinutes = defaultRetentionMinutes;  // orphaned dir → safe default
+            }
+            BlobPath zipDir = archiveDataPath.add(hashTypeDir).add(hashNodeIdLocal);
+            try {
+                deleteArchivesOlderThanRetention(anyTransferService, zipDir, retentionMinutes);
+            } catch (IOException ex) {
+                logger.warn("Archive retention delete failed for {}: {}", zipDir.buildAsString(), ex.getMessage());
             }
         }
     }
 
     /**
-     * Deletes all archive ZIPs under {@code zipDir} unconditionally (used for deleted-index cleanup).
-     * Does up to 2 LIST calls (paginated) and batch-deletes all found ZIPs.
+     * Pure-timestamp-based deletion of expired archive ZIPs in {@code zipDir}.
+     * <p>
+     * <b>Algorithm:</b>
+     * <ol>
+     *   <li>Page through ZIPs in {@code zipDir} (size {@link #MAX_ARCHIVE_BLOBS_PER_NODE}, sorted
+     *       ascending by name = ascending by {@code yyyyMMddHHmmssSSS} timestamp).</li>
+     *   <li>Build {@code expired} list in memory by parsing each ZIP's filename timestamp and
+     *       comparing against {@code now - retentionMinutes}.</li>
+     *   <li>Stop paginating as soon as we hit a ZIP whose timestamp is within retention — every
+     *       subsequent ZIP (in any page) is even newer and therefore also within retention.</li>
+     *   <li>Delete all collected expired ZIPs in batches of {@link #RETENTION_DELETE_BATCH_SIZE}.</li>
+     * </ol>
+     * <p>
+     * <b>No generation/primaryTerm checks.</b> Decision is purely the ZIP filename timestamp vs the
+     * retention cutoff.
      *
-     * @return total number of ZIPs deleted
+     * @param transferService blob transfer service
+     * @param zipDir          this node's ZIP directory ({@code translog/data/{hashTypeIndex}/{hashNodeId}})
+     * @param retentionMinutes retention age in minutes (caller is expected to clamp to safety floor)
+     * @return number of ZIPs deleted
+     * @throws IOException if the initial listing fails irrecoverably
      */
-    static int deleteAllArchives(TransferService transferService, BlobPath zipDir) throws IOException {
+    static int deleteArchivesOlderThanRetention(
+        TransferService transferService,
+        BlobPath zipDir,
+        long retentionMinutes
+    ) throws IOException {
+        Instant retentionCutoff = Instant.now().minus(Duration.ofMinutes(retentionMinutes));
         int deleted = 0;
-        boolean morePages;
-        do {
+
+        // Outer loop: re-LIST after each deletion batch. Because deletions actually remove the
+        // ZIPs from S3, the next listAllInSortedOrder() returns the NEXT block of ZIPs (sorted
+        // ascending by name = timestamp). We stop when:
+        //   - LIST returns fewer than MAX_ARCHIVE_BLOBS_PER_NODE → no more pages, OR
+        //   - the current page contains a ZIP within retention → all remaining blobs are newer.
+        while (true) {
             List<BlobMetadata> blobs;
             try {
                 blobs = PlainActionFuture.<List<BlobMetadata>, IOException>get(
@@ -455,95 +472,35 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 throw e;
             }
             if (blobs == null || blobs.isEmpty()) {
-                break;
+                return deleted;
             }
-            List<String> toDelete = new ArrayList<>();
-            for (BlobMetadata blob : blobs) {
-                String name = blob.name();
-                if (name != null && name.endsWith(".zip")) {
-                    toDelete.add(name);
-                }
-            }
-            for (int i = 0; i < toDelete.size(); i += RETENTION_DELETE_BATCH_SIZE) {
-                int end = Math.min(i + RETENTION_DELETE_BATCH_SIZE, toDelete.size());
-                List<String> batch = toDelete.subList(i, end);
-                transferService.deleteBlobs(zipDir, new ArrayList<>(batch));
-                deleted += batch.size();
-            }
-            morePages = blobs.size() >= MAX_ARCHIVE_BLOBS_PER_NODE;
-        } while (morePages);
-        return deleted;
-    }
 
-    /**
-     * Deletes archive ZIPs under {@code zipDir} that are older than the configured retention age.
-     * Uses timestamp-only deletion (parsed from blob name) — no range-reads or generation checks needed.
-     * The retention age minimum (5 min) ensures no live ZIP is deleted prematurely.
-     *
-     * <p>Path: {@code translog/data/{hashTypeIndex}/{hashNodeId}/{yyyyMMddHHmmssSSS}.zip}
-     *
-     * @param transferService blob transfer service
-     * @param zipDir          direct path to the node's ZIP directory (no intermediate LISTs needed)
-     * @param bounds          retention bounds containing the effective retention age
-     * @return number of ZIPs deleted
-     */
-    static int deleteArchivesOlderThanRetention(
-        TransferService transferService,
-        BlobPath zipDir,
-        ArchiveDeletionHelper.RetentionBounds bounds
-    ) throws IOException {
-        long effectiveRetentionMinutes = bounds.getEffectiveRetentionMinutes();
-        Instant retentionCutoff = Instant.now().minus(Duration.ofMinutes(effectiveRetentionMinutes));
-        int deleted = 0;
-        boolean morePages;
-        do {
-            List<BlobMetadata> blobs;
-            try {
-                blobs = PlainActionFuture.<List<BlobMetadata>, IOException>get(
-                    f -> transferService.listAllInSortedOrder(zipDir, "", MAX_ARCHIVE_BLOBS_PER_NODE, f)
-                );
-            } catch (IOException e) {
-                logger.warn("List archive ZIPs failed at {}: {}", zipDir.buildAsString(), e.getMessage());
-                break;
-            }
-            if (blobs == null || blobs.isEmpty()) {
-                break;
-            }
-            List<String> toDelete = new ArrayList<>();
-            boolean hitFreshZip = false;
+            // Walk page; collect expired with early-exit on first within-retention ZIP.
+            List<String> expired = new ArrayList<>(blobs.size());
+            boolean hitWithinRetention = false;
             for (BlobMetadata blob : blobs) {
                 String name = blob.name();
                 if (name == null || !name.endsWith(".zip")) {
                     continue;
                 }
-                // Blobs are returned in lexicographic (= chronological) order by timestamp prefix.
-                // Once we encounter a ZIP within retention, all subsequent ZIPs are also within
-                // retention (newer), so we can stop processing this page entirely.
-                boolean withinRetention = TranslogArchivePathHelper.parseBlobNameTimestamp(name)
-                    .filter(ts -> ts.isAfter(retentionCutoff))
-                    .isPresent();
-                if (withinRetention) {
-                    hitFreshZip = true;
-                    break;  // early-exit: all remaining ZIPs are newer → within retention
+                Optional<Instant> tsOpt = TranslogArchivePathHelper.parseBlobNameTimestamp(name);
+                if (tsOpt.isEmpty()) {
+                    continue;  // unparseable name — leave alone
                 }
-                toDelete.add(name);
+                if (tsOpt.get().isAfter(retentionCutoff)) {
+                    hitWithinRetention = true;
+                    break;  // all remaining blobs in this page (and any next page) are newer
+                }
+                expired.add(name);
             }
-            // If we hit a fresh ZIP, no more pages can have deletable ZIPs (sorted order).
-            if (hitFreshZip) {
-                morePages = false;
-            }
-            for (int i = 0; i < toDelete.size(); i += RETENTION_DELETE_BATCH_SIZE) {
-                int end = Math.min(i + RETENTION_DELETE_BATCH_SIZE, toDelete.size());
-                List<String> batch = toDelete.subList(i, end);
+
+            // Delete expired blobs from this page in batches of RETENTION_DELETE_BATCH_SIZE.
+            for (int i = 0; i < expired.size(); i += RETENTION_DELETE_BATCH_SIZE) {
+                int end = Math.min(i + RETENTION_DELETE_BATCH_SIZE, expired.size());
+                List<String> batch = expired.subList(i, end);
                 try {
                     transferService.deleteBlobs(zipDir, new ArrayList<>(batch));
                     deleted += batch.size();
-                    logger.debug(
-                        "Deleted {} archive ZIPs older than {} minutes from {}",
-                        batch.size(),
-                        effectiveRetentionMinutes,
-                        zipDir.buildAsString()
-                    );
                 } catch (IOException e) {
                     logger.warn(
                         "Failed to delete archive batch ({} blobs) from {}: {}",
@@ -551,11 +508,32 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                         zipDir.buildAsString(),
                         e.getMessage()
                     );
+                    // If deletion fails, abort the loop to avoid re-listing the same blobs forever.
+                    return deleted;
                 }
             }
-            morePages = blobs.size() >= MAX_ARCHIVE_BLOBS_PER_NODE;
-        } while (morePages);
-        return deleted;
+            if (deleted > 0) {
+                logger.debug(
+                    "Deleted {} archive ZIPs older than {} minutes from {} (page deletions={}, hitWithinRetention={})",
+                    deleted,
+                    retentionMinutes,
+                    zipDir.buildAsString(),
+                    expired.size(),
+                    hitWithinRetention
+                );
+            }
+
+            // Termination conditions:
+            //   1. Hit a within-retention ZIP → no need to look further.
+            //   2. Page was not full → S3 has nothing more to offer in this dir.
+            if (hitWithinRetention) {
+                return deleted;
+            }
+            if (blobs.size() < MAX_ARCHIVE_BLOBS_PER_NODE) {
+                return deleted;
+            }
+            // Otherwise: we deleted a full page of expired ZIPs; loop and re-LIST to get the next batch.
+        }
     }
 
     private void collectSnapshotsFromShards(
