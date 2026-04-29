@@ -412,18 +412,15 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.indexSortSupplier = indexSortSupplier;
         this.indexEventListener = indexEventListener;
         this.threadPool = threadPool;
-        // When translog archive upload is enabled, the per-index TranslogArchiveBatchCoordinator
-        // provides the batching window (batchInterval) by accumulating concurrent shard sync calls.
-        // Having BOTH BufferedAsyncIOProcessor (per-shard, 650ms) AND the coordinator's batchInterval
-        // (per-index, 650ms) creates a "double-buffer" problem: the per-shard buffer collapses all
-        // pending shard syncs into a single ensureSynced(max) call, so the coordinator never receives
-        // concurrent callers and wastes its full batchInterval waiting for callers that never come.
-        // Fix: disable the per-shard buffer when archive is enabled, allowing each shard to call
-        // submitAndWait() directly. The coordinator then receives concurrent calls from all shards
-        // during its batchInterval window and batches them into a single ZIP (as designed).
-        // Non-archive path keeps the per-shard buffer unchanged.
-        boolean usePerShardBuffer = indexSettings.isAssignedOnRemoteNode()
-            && !indexSettings.isTranslogArchiveUploadEnabled();
+        // The per-shard BufferedAsyncIOProcessor batches all translog sync requests within a 650ms
+        // window into one ensureSynced(max) call per shard — this is the "regional bus" that collects
+        // passengers (transactions) and departs every 650ms to the central station (coordinator).
+        // The coordinator uses a fixed-schedule timer (also 650ms, driven by buffer_interval) to
+        // dispatch all pending shards in one ZIP — this is the "central bus" with its own schedule.
+        // Regional buses wait at the central station for at most one batchInterval (0-650ms) before
+        // the central bus departs. Total latency = per-shard buffer (0-650ms) + central wait (0-650ms)
+        // + upload time. No double-buffering: each buffer has a distinct role (shard vs index level).
+        boolean usePerShardBuffer = indexSettings.isAssignedOnRemoteNode();
         this.translogSyncProcessor = createTranslogSyncProcessor(
             logger,
             threadPool,

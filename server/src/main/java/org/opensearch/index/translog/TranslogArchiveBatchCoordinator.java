@@ -61,8 +61,13 @@ public class TranslogArchiveBatchCoordinator {
 
     /** Unregister the coordinator for an index. */
     public static void unregister(String indexUUID) {
-        COORDINATORS.remove(indexUUID);
+        TranslogArchiveBatchCoordinator coordinator = COORDINATORS.remove(indexUUID);
+        if (coordinator != null) {
+            coordinator.close();
+        }
     }
+
+
 
     /** Look up the coordinator for an index. Returns null if not registered. */
     public static TranslogArchiveBatchCoordinator get(String indexUUID) {
@@ -92,6 +97,11 @@ public class TranslogArchiveBatchCoordinator {
 
     // Current batch state — guarded by lock
     private final ReentrantLock lock = new ReentrantLock();
+    /**
+     * Condition signalled on a fixed schedule (every batchInterval) by the timer thread.
+     * Regional bus threads (submitAndWait callers) wait on this condition.
+     * When signalled, the first thread to acquire the lock dispatches the batch.
+     */
     private final Condition batchReady = lock.newCondition();
     private final Condition batchComplete = lock.newCondition();
 
@@ -103,10 +113,15 @@ public class TranslogArchiveBatchCoordinator {
     private volatile CountDownLatch dispatchLatch;
     /** Error from the most recent dispatch, if any. */
     private volatile IOException dispatchError;
-    /** Timestamp when the first shard submitted to this batch. */
-    private long batchStartNanos;
     /** Whether a dispatch is currently in progress. */
     private boolean dispatching;
+    /** Whether this coordinator has been closed. */
+    private volatile boolean closed;
+    /**
+     * Fixed-schedule timer thread: signals batchReady every batchInterval regardless of arrivals.
+     * This is the "central bus clock" — regional buses wait for up to one full batchInterval.
+     */
+    private final Thread timerThread;
 
     /**
      * Data submitted by one shard for inclusion in the batch ZIP.
@@ -168,7 +183,40 @@ public class TranslogArchiveBatchCoordinator {
         this.batchInterval = batchInterval;
         this.uploadTimeoutMillis = Math.max(batchInterval.millis() * 10, 30_000);
         this.dispatchLatch = new CountDownLatch(1);
-        this.batchStartNanos = 0;
+        this.closed = false;
+
+        // Fixed-schedule timer: signals batchReady every batchInterval.
+        // This is the "central bus clock" — it fires on a fixed schedule regardless of
+        // when regional buses (shards) arrive. Regional buses wait on batchReady.await()
+        // for at most one full batchInterval before the central bus departs.
+        this.timerThread = new Thread(() -> {
+            while (!closed) {
+                try {
+                    Thread.sleep(batchInterval.millis());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                lock.lock();
+                try {
+                    // Signal all waiting regional buses: "central bus is departing now"
+                    batchReady.signalAll();
+                } finally {
+                    lock.unlock();
+                }
+            }
+        }, "translog-archive-batch-timer-" + indexUUID);
+        this.timerThread.setDaemon(true);
+        this.timerThread.start();
+    }
+
+    /**
+     * Stops the timer thread when this coordinator is unregistered.
+     * Called from {@link #unregister(String)}.
+     */
+    public void close() {
+        this.closed = true;
+        this.timerThread.interrupt();
     }
 
     /**
@@ -184,37 +232,34 @@ public class TranslogArchiveBatchCoordinator {
 
         lock.lock();
         try {
-            // Add to current batch
+            // Add shard data to the current batch (the "regional bus passengers board at central station").
+            // Regional buses arrive at any time within the batchInterval window and wait here until the
+            // fixed-schedule central bus departs (timer signals batchReady every batchInterval).
             pendingShards.put(shardData.getShardId(), shardData);
             long shardBytes = shardData.getEntries().stream().mapToLong(ArchiveBuilder.ArchiveBuildEntry::getSize).sum();
             pendingBatchBytes += shardBytes;
-            if (batchStartNanos == 0) {
-                batchStartNanos = System.nanoTime();
-            }
             myLatch = dispatchLatch;
 
-            // If batch size limit reached, dispatch immediately without waiting for interval.
+            // If batch size limit reached, dispatch immediately without waiting for the next timer signal.
             if (pendingBatchBytes >= MAX_BATCH_BYTES) {
                 logger.debug("Batch size limit reached ({} bytes), dispatching early for index {}", pendingBatchBytes, indexUUID);
                 if (!dispatching) {
                     dispatchUnderLock(transferService);
                 }
             } else {
-                // Wait for remaining batch interval, then dispatch
-                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - batchStartNanos);
-                long remainingMs = batchInterval.millis() - elapsedMs;
-                if (remainingMs > 0) {
-                    try {
-                        batchReady.await(remainingMs, TimeUnit.MILLISECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Interrupted while waiting for batch interval", e);
-                    }
+                // Wait for the timer thread to signal batchReady (fixed-schedule "central bus departure").
+                // The wait is at most one full batchInterval; the timer fires every batchInterval regardless
+                // of when regional buses arrive (no "first arrival starts the clock" behaviour).
+                // A spurious wakeup or size-limit dispatch may wake us early — the check below handles that.
+                try {
+                    batchReady.await(batchInterval.millis(), TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while waiting for batch interval", e);
                 }
-                // After waiting, only dispatch if this batch hasn't been dispatched yet.
-                // myLatch == dispatchLatch means the latch hasn't been replaced yet (no dispatch occurred).
-                // If the latch was replaced (by another thread or dispatchUnderLock resetting it),
-                // this batch was already dispatched — don't dispatch again.
+                // After wakeup: dispatch only if not already dispatched by another thread.
+                // myLatch == dispatchLatch: latch not yet replaced → batch not yet dispatched → we dispatch.
+                // myLatch != dispatchLatch: another thread already dispatched this batch → we skip.
                 if (myLatch == dispatchLatch && !dispatching && !pendingShards.isEmpty()) {
                     dispatchUnderLock(transferService);
                 }
@@ -274,7 +319,6 @@ public class TranslogArchiveBatchCoordinator {
         // Reset state for next batch immediately — callers can start accumulating while upload runs
         pendingShards.clear();
         pendingBatchBytes = 0;
-        batchStartNanos = 0;
         dispatchError = null;
         dispatchLatch = new CountDownLatch(1);
         dispatching = false;

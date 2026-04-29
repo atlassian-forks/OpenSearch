@@ -15,6 +15,7 @@ import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
+import org.junit.After;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -38,14 +39,27 @@ import static org.mockito.Mockito.verify;
 
 public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
+    /** All coordinators created during a test — closed in tearDown to stop timer threads. */
+    private final java.util.List<TranslogArchiveBatchCoordinator> coordinatorsToClose = new java.util.ArrayList<>();
+
+    @After
+    public void closeCoordinators() {
+        for (TranslogArchiveBatchCoordinator c : coordinatorsToClose) {
+            c.close();
+        }
+        coordinatorsToClose.clear();
+    }
+
     private TranslogArchiveBatchCoordinator createCoordinator(TimeValue batchInterval) {
-        return new TranslogArchiveBatchCoordinator(
+        TranslogArchiveBatchCoordinator c = new TranslogArchiveBatchCoordinator(
             "test-index-uuid",
             "test-node-id",
             new BlobPath().add("repo-root"),
             RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
             batchInterval
         );
+        coordinatorsToClose.add(c);
+        return c;
     }
 
     private TranslogArchiveBatchCoordinator.ShardArchiveData createShardData(int shardId, String content) {
@@ -647,6 +661,8 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         // BufferedAsyncIOProcessor is providing the batching window.
         logger.info("Double-buffer overhead measured: {}ms (batchInterval={}ms). " +
             "With batchInterval=0, this would be <10ms.", elapsedMs, batchIntervalMs);
+
+        coordinator.close(); // stop timer thread to avoid thread leak
     }
 
     /**
@@ -729,5 +745,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
         logger.info("Fixed: {} concurrent shards → {} upload(s) in {}ms (batchInterval={}ms)",
             numShards, uploadCount.get(), elapsedMs, batchIntervalMs);
+
+        coordinator.close(); // stop timer thread to avoid thread leak
     }
 }
