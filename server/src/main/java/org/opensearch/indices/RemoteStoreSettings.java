@@ -140,7 +140,7 @@ public class RemoteStoreSettings {
      */
     public static final Setting<TimeValue> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL = Setting.timeSetting(
         "cluster.remote_store.translog.archive.gc_interval",
-        TimeValue.timeValueMinutes(5),
+        TimeValue.timeValueMinutes(1),
         TimeValue.timeValueMinutes(1),
         Property.NodeScope,
         Property.Dynamic

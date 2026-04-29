@@ -1487,11 +1487,11 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
      * Fix: gc_interval default is 5 minutes.
      * Verifies the setting default is 5m so that the retention GC doesn't run too frequently.
      */
-    public void testTranslogArchiveGcIntervalDefaultIsFiveMinutes() {
+    public void testTranslogArchiveGcIntervalDefaultIsOneMinute() {
         // The default gc_interval should be 5 minutes (not 1 minute) to reduce S3 LIST storms.
         TimeValue defaultInterval = RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.getDefault(
             org.opensearch.common.settings.Settings.EMPTY
         );
-        assertThat("gc_interval default should be 5 minutes", defaultInterval, equalTo(TimeValue.timeValueMinutes(5)));
+        assertThat("gc_interval default should be 1 minute", defaultInterval, equalTo(TimeValue.timeValueMinutes(1)));
     }
 }
