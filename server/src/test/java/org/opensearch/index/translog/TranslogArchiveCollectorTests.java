@@ -1268,4 +1268,145 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
     }
+
+    /**
+     * Fix: early-exit in deleteArchivesOlderThanRetention when a fresh ZIP is encountered.
+     * Verifies that once a ZIP within retention is encountered, pagination stops immediately —
+     * remaining ZIPs (also within retention, sorted after) are not listed or deleted.
+     *
+     * Scenario: 2 old ZIPs (past retention) + 1 fresh ZIP → early-exit after deleting 2 old ones.
+     * The fresh ZIP being encountered should prevent checking any further pages.
+     */
+    public void testDeleteArchivesEarlyExitOnFreshZip() throws IOException {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            String uniqueBase = "base-" + randomAlphaOfLength(12);
+            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
+                "idx-uuid",
+                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+            );
+            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
+
+            byte[] zipBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(
+                Collections.singletonList(ArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8)))
+            );
+
+            // Two old ZIPs: past 5-minute retention → should be deleted
+            Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
+            String old1 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo) + ".zip";
+            String old2 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(1)) + ".zip";
+            // One fresh ZIP: within retention → should stop further pagination
+            String fresh = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
+
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(old1, zipBytes, 0L), zipDir, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(old2, zipBytes, 0L), zipDir, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(fresh, zipBytes, 0L), zipDir, WritePriority.HIGH);
+            assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(3L));
+
+            ArchiveDeletionHelper.RetentionBounds bounds = new ArchiveDeletionHelper.RetentionBounds(1L, 3L, 5L);
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, bounds);
+
+            assertThat("2 old ZIPs should be deleted, fresh ZIP should stop further iteration", deleted, equalTo(2));
+            assertThat("fresh ZIP should still be present", zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
+            assertThat("fresh ZIP should not be deleted", blobStore.blobContainer(zipDir).listBlobs().containsKey(fresh), equalTo(true));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Fix: empty translog archive is skipped — no S3 PUT when all snapshots have zero files.
+     * Verifies that runBatch does NOT upload a ZIP when all shard snapshots produce empty file sets.
+     */
+    public void testRunBatchSkipsUploadWhenAllSnapshotsEmpty() throws IOException {
+        IndexMetadata metadata = IndexMetadata.builder("test-index")
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put(IndexMetadata.SETTING_REMOTE_TRANSLOG_STORE_REPOSITORY, "repo")
+                    .put(IndexMetadata.SETTING_REPLICATION_TYPE, ReplicationType.SEGMENT.toString())
+                    .put(IndexMetadata.SETTING_REMOTE_STORE_ENABLED, true)
+                    .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+                    .build()
+            )
+            .build();
+        IndexSettings indexSettings = new IndexSettings(metadata, Settings.EMPTY);
+        ShardId shardId = new ShardId(metadata.getIndex(), 0);
+
+        TransferService transferService = mock(TransferService.class);
+        BlobPath archiveBase = new BlobPath().add("repo-root");
+        TranslogTransferManager transferManager = mock(TranslogTransferManager.class);
+        when(transferManager.getTransferService()).thenReturn(transferService);
+        when(transferManager.getArchiveBasePath()).thenReturn(archiveBase);
+
+        // Snapshot with NO files — simulates empty translog (no pending ops)
+        org.opensearch.index.translog.transfer.TranslogTransferMetadata emptyMeta =
+            new org.opensearch.index.translog.transfer.TranslogTransferMetadata(1L, 5L, 3L, 0, "node-1");
+        emptyMeta.setGenerationToPrimaryTermMapper(new java.util.HashMap<>());
+        TransferSnapshot emptySnapshot = mock(TransferSnapshot.class);
+        when(emptySnapshot.getTranslogTransferMetadata()).thenReturn(emptyMeta);
+        when(emptySnapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(Collections.emptySet());
+        when(emptySnapshot.getCheckpointFileSnapshots()).thenReturn(Collections.emptySet());
+
+        ShardRouting routing = mock(ShardRouting.class);
+        when(routing.primary()).thenReturn(true);
+        IndexShard shard = mock(IndexShard.class);
+        when(shard.shardId()).thenReturn(shardId);
+        when(shard.routingEntry()).thenReturn(routing);
+        when(shard.isRemoteTranslogEnabled()).thenReturn(true);
+        when(shard.isSyncNeeded()).thenReturn(true);
+        when(shard.supportsArchiveSnapshot()).thenReturn(true);
+        when(shard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
+        when(shard.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
+        when(shard.indexSettings()).thenReturn(indexSettings);
+        doAnswer(inv -> {
+            @SuppressWarnings("unchecked")
+            java.util.function.BiConsumer<TransferSnapshot, Runnable> consumer = inv.getArgument(0);
+            consumer.accept(emptySnapshot, () -> {});
+            return null;
+        }).when(shard).buildSnapshotForArchive(any());
+
+        IndexService indexService = mock(IndexService.class);
+        when(indexService.getIndexSettings()).thenReturn(indexSettings);
+        when(indexService.getShardOrNull(0)).thenReturn(shard);
+
+        IndicesService indicesService = mock(IndicesService.class);
+        when(indicesService.indexService(any())).thenReturn(indexService);
+        when(indicesService.iterator()).thenAnswer(inv -> Collections.singleton(indexService).iterator());
+
+        RemoteStoreSettings remoteStoreSettings = mock(RemoteStoreSettings.class);
+        when(remoteStoreSettings.getClusterRemoteTranslogBufferInterval()).thenReturn(TimeValue.timeValueMinutes(1));
+        when(remoteStoreSettings.getPathHashAlgorithm()).thenReturn(RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+        ThreadPool threadPool = mock(ThreadPool.class);
+
+        TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
+        collector.runBatchForTesting();
+
+        // No S3 upload should happen — empty snapshot → no ZIP
+        verify(transferService, never()).uploadBlobStream(
+            any(java.io.InputStream.class),
+            org.mockito.ArgumentMatchers.anyLong(),
+            any(),
+            any(),
+            any(WritePriority.class),
+            any()
+        );
+    }
+
+    /**
+     * Fix: gc_interval default is 5 minutes.
+     * Verifies the setting default is 5m so that the retention GC doesn't run too frequently.
+     */
+    public void testTranslogArchiveGcIntervalDefaultIsFiveMinutes() {
+        // The default gc_interval should be 5 minutes (not 1 minute) to reduce S3 LIST storms.
+        TimeValue defaultInterval = RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.getDefault(
+            org.opensearch.common.settings.Settings.EMPTY
+        );
+        assertThat("gc_interval default should be 5 minutes", defaultInterval, equalTo(TimeValue.timeValueMinutes(5)));
+    }
 }

@@ -297,6 +297,13 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             for (int i = 0; i < snapshots.size(); i++) {
                 allEntries.addAll(snapshotToEntries(snapshots.get(i), pathPrefixes.get(i)));
             }
+            // Skip upload if there are no actual entries — all snapshots were empty (no translog ops).
+            // Uploading an empty ZIP wastes S3 PUTs and creates stale objects that GC must clean up.
+            // Note: releaseSnapshots is called in the finally block below, so we just return here.
+            if (allEntries.isEmpty()) {
+                logger.debug("Skipping translog archive upload: all snapshots are empty (no translog files to archive)");
+                return;
+            }
             uploadArchiveNewPathAndMetadata(
                 transferService,
                 basePath,
@@ -503,18 +510,27 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 break;
             }
             List<String> toDelete = new ArrayList<>();
+            boolean hitFreshZip = false;
             for (BlobMetadata blob : blobs) {
                 String name = blob.name();
                 if (name == null || !name.endsWith(".zip")) {
                     continue;
                 }
-                // Delete if blob timestamp < retentionCutoff (i.e. NOT after cutoff)
+                // Blobs are returned in lexicographic (= chronological) order by timestamp prefix.
+                // Once we encounter a ZIP within retention, all subsequent ZIPs are also within
+                // retention (newer), so we can stop processing this page entirely.
                 boolean withinRetention = TranslogArchivePathHelper.parseBlobNameTimestamp(name)
                     .filter(ts -> ts.isAfter(retentionCutoff))
                     .isPresent();
-                if (!withinRetention) {
-                    toDelete.add(name);
+                if (withinRetention) {
+                    hitFreshZip = true;
+                    break;  // early-exit: all remaining ZIPs are newer → within retention
                 }
+                toDelete.add(name);
+            }
+            // If we hit a fresh ZIP, no more pages can have deletable ZIPs (sorted order).
+            if (hitFreshZip) {
+                morePages = false;
             }
             for (int i = 0; i < toDelete.size(); i += RETENTION_DELETE_BATCH_SIZE) {
                 int end = Math.min(i + RETENTION_DELETE_BATCH_SIZE, toDelete.size());
