@@ -8,6 +8,9 @@
 
 package org.opensearch.remotestore;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+import org.opensearch.index.translog.TranslogArchiveTimerThreadLeakFilter;
+
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
@@ -62,6 +65,7 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  * that archive throughput is within an acceptable ratio of non-archive throughput.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
+@ThreadLeakFilters(filters = TranslogArchiveTimerThreadLeakFilter.class)
 public class TranslogArchiveThroughputIT extends RemoteStoreBaseIntegTestCase {
 
     static final String LATENCY_FS_TYPE = "latency-fs";

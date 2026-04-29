@@ -8,7 +8,9 @@
 
 package org.opensearch.remotestore;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import org.opensearch.action.admin.cluster.remotestore.restore.RestoreRemoteStoreRequest;
+import org.opensearch.index.translog.TranslogArchiveTimerThreadLeakFilter;
 import org.opensearch.action.admin.cluster.remotestore.restore.RestoreRemoteStoreResponse;
 import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.index.IndexRequest;
@@ -43,6 +45,7 @@ import static org.junit.Assert.assertTrue;
  * Integration tests for translog archive upload: index with archive upload enabled,
  * then restore from remote and verify doc count.
  */
+@ThreadLeakFilters(filters = TranslogArchiveTimerThreadLeakFilter.class)
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
 public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
 

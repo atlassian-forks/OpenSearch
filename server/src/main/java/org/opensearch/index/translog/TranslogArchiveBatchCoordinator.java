@@ -28,6 +28,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
@@ -118,10 +120,11 @@ public class TranslogArchiveBatchCoordinator {
     /** Whether this coordinator has been closed. */
     private volatile boolean closed;
     /**
-     * Fixed-schedule timer thread: signals batchReady every batchInterval regardless of arrivals.
+     * Fixed-schedule timer executor: signals batchReady every batchInterval regardless of arrivals.
      * This is the "central bus clock" — regional buses wait for up to one full batchInterval.
+     * Uses ScheduledExecutorService for clean shutdown via shutdownNow().
      */
-    private final Thread timerThread;
+    private final ScheduledExecutorService timerExecutor;
 
     /**
      * Data submitted by one shard for inclusion in the batch ZIP.
@@ -189,34 +192,47 @@ public class TranslogArchiveBatchCoordinator {
         // This is the "central bus clock" — it fires on a fixed schedule regardless of
         // when regional buses (shards) arrive. Regional buses wait on batchReady.await()
         // for at most one full batchInterval before the central bus departs.
-        this.timerThread = new Thread(() -> {
-            while (!closed) {
-                try {
-                    Thread.sleep(batchInterval.millis());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-                lock.lock();
-                try {
-                    // Signal all waiting regional buses: "central bus is departing now"
-                    batchReady.signalAll();
-                } finally {
-                    lock.unlock();
-                }
+        // ScheduledExecutorService is used for clean, deterministic shutdown via shutdownNow()
+        // which reliably stops the scheduled task without thread-leak issues.
+        this.timerExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "translog-archive-batch-timer-" + indexUUID);
+            t.setDaemon(true);
+            return t;
+        });
+        this.timerExecutor.scheduleAtFixedRate(() -> {
+            if (closed) return;
+            lock.lock();
+            try {
+                // Signal all waiting regional buses: "central bus is departing now"
+                batchReady.signalAll();
+            } finally {
+                lock.unlock();
             }
-        }, "translog-archive-batch-timer-" + indexUUID);
-        this.timerThread.setDaemon(true);
-        this.timerThread.start();
+        }, batchInterval.millis(), batchInterval.millis(), TimeUnit.MILLISECONDS);
     }
 
     /**
-     * Stops the timer thread when this coordinator is unregistered.
+     * Stops the timer executor when this coordinator is unregistered.
      * Called from {@link #unregister(String)}.
+     * Signals any waiting threads and shuts down the timer cleanly.
      */
     public void close() {
         this.closed = true;
-        this.timerThread.interrupt();
+        // Shut down the timer executor immediately — no new scheduled tasks will fire.
+        this.timerExecutor.shutdownNow();
+        // Signal any submitAndWait() callers that are waiting on batchReady so they can exit.
+        lock.lock();
+        try {
+            batchReady.signalAll();
+        } finally {
+            lock.unlock();
+        }
+        // Wait briefly for the executor thread to fully stop.
+        try {
+            this.timerExecutor.awaitTermination(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**

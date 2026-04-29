@@ -8,6 +8,9 @@
 
 package org.opensearch.remotestore;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+import org.opensearch.index.translog.TranslogArchiveTimerThreadLeakFilter;
+
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
@@ -40,6 +43,7 @@ import static org.hamcrest.Matchers.not;
  * Two indices — 10 shards each — one with archive enabled and one without.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
+@ThreadLeakFilters(filters = TranslogArchiveTimerThreadLeakFilter.class)
 public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestCase {
 
     private static final String INDEX_ARCHIVE_ON = "test-archive-on";
