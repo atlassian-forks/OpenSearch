@@ -1342,6 +1342,67 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
     }
 
     /**
+     * When there are more than MAX_ARCHIVE_BLOBS_PER_NODE (500) expired ZIPs, the loop must
+     * re-list after each batch of deletions until all expired ZIPs are gone.
+     *
+     * Scenario: 600 old ZIPs (all past retention) + 1 fresh ZIP.
+     * Expected: all 600 old ZIPs deleted in one GC cycle (2 re-list passes), fresh ZIP kept.
+     */
+    public void testDeleteArchivesMoreThan500ExpiredZipsDeletedInOneGcCycle() throws IOException {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            String uniqueBase = "base-" + randomAlphaOfLength(12);
+            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
+                "idx-uuid",
+                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+            );
+            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
+
+            byte[] zipBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(
+                Collections.singletonList(ArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8)))
+            );
+
+            // Upload 600 expired ZIPs (sorted ascending: each 1ms apart, all > 2h ago)
+            int expiredCount = 600;
+            Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
+            for (int i = 0; i < expiredCount; i++) {
+                String name = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(i)) + ".zip";
+                transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(name, zipBytes, 0L), zipDir, WritePriority.HIGH);
+            }
+
+            // Upload 1 fresh ZIP (within retention)
+            String freshName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshName, zipBytes, 0L), zipDir, WritePriority.HIGH);
+
+            assertThat(
+                "Should have 601 ZIPs before GC",
+                zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()),
+                equalTo((long) expiredCount + 1)
+            );
+
+            // Run GC with 5-minute retention: all 600 old ZIPs should be deleted in one cycle
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, 5L);
+
+            assertThat("All 600 expired ZIPs should be deleted in one GC cycle", deleted, equalTo(expiredCount));
+            assertThat(
+                "Only 1 fresh ZIP should remain",
+                zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()),
+                equalTo(1L)
+            );
+            assertThat(
+                "Fresh ZIP should still be present",
+                blobStore.blobContainer(zipDir).listBlobs().containsKey(freshName),
+                equalTo(true)
+            );
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
      * Fix: empty translog archive is skipped — no S3 PUT when all snapshots have zero files.
      * Verifies that runBatch does NOT upload a ZIP when all shard snapshots produce empty file sets.
      */
