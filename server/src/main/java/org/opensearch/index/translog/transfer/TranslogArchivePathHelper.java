@@ -55,6 +55,13 @@ public final class TranslogArchivePathHelper {
     }
 
     /**
+     * Blob name for TAR archives: yyyyMMddHHmmssSSS.tar
+     */
+    public static String tarBlobNameFromCurrentTime() {
+        return BLOB_TIMESTAMP_FORMAT.format(Instant.now()) + ".tar";
+    }
+
+    /**
      * Format an {@link Instant} to the blob timestamp string ({@code yyyyMMddHHmmssSSS}).
      * Useful in tests to construct blob names with controlled timestamps.
      */
@@ -63,13 +70,21 @@ public final class TranslogArchivePathHelper {
     }
 
     /**
-     * Parse blob name to timestamp for retention hint. Returns empty if name is not yyyyMMddHHmmssSSS.zip.
+     * Parse blob name to timestamp for retention hint.
+     * Returns empty if name is not yyyyMMddHHmmssSSS.zip or yyyyMMddHHmmssSSS.tar.
      */
     public static java.util.Optional<Instant> parseBlobNameTimestamp(String blobName) {
-        if (blobName == null || !blobName.endsWith(".zip")) {
+        if (blobName == null) {
             return java.util.Optional.empty();
         }
-        String base = blobName.substring(0, blobName.length() - 4);
+        String base;
+        if (blobName.endsWith(".zip")) {
+            base = blobName.substring(0, blobName.length() - 4);
+        } else if (blobName.endsWith(".tar")) {
+            base = blobName.substring(0, blobName.length() - 4);
+        } else {
+            return java.util.Optional.empty();
+        }
         if (base.length() != 17) {
             return java.util.Optional.empty();
         }
@@ -78,5 +93,12 @@ public final class TranslogArchivePathHelper {
         } catch (DateTimeParseException e) {
             return java.util.Optional.empty();
         }
+    }
+
+    /**
+     * Returns true if the blob name is an archive blob (ZIP or TAR).
+     */
+    public static boolean isArchiveBlob(String blobName) {
+        return blobName != null && (blobName.endsWith(".zip") || blobName.endsWith(".tar"));
     }
 }

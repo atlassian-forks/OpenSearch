@@ -28,6 +28,7 @@ import org.opensearch.index.translog.transfer.TransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
+import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.IndicesService;
@@ -480,7 +481,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             boolean hitWithinRetention = false;
             for (BlobMetadata blob : blobs) {
                 String name = blob.name();
-                if (name == null || !name.endsWith(".zip")) {
+                if (!TranslogArchivePathHelper.isArchiveBlob(name)) {
                     continue;
                 }
                 Optional<Instant> tsOpt = TranslogArchivePathHelper.parseBlobNameTimestamp(name);
@@ -576,19 +577,21 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
         List<IndexShard> contributingShards,
         List<ArchiveBuilder.ArchiveBuildEntry> allEntries
     ) throws IOException {
-        // Path: translog/data/{hashTypeIndex}/{hashNodeId}/{timestamp}.zip
+        // Path: translog/data/{hashTypeIndex}/{hashNodeId}/{timestamp}.tar
         // hashTypeIndex = hash("translog_zip|{indexUUID}") — same for all nodes, used for per-index GC
         // hashNodeId = hash(nodeId) — unique per node, isolates writes for S3 partition safety
         BlobPath archivePath = basePath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
-        // Pre-compute ZIP size (deterministic since STORED compression) for streaming upload.
-        // Offsets are embedded in the ZIP comment by ArchiveBuilder.buildWithComment — no separate metadata needed.
-        ArchiveBuilder.SizeAndOffsets sizeAndOffsets = ArchiveBuilder.computeSizeAndOffsetsWithComment(allEntries);
+        // TAR streaming: compute layout from file sizes alone (no content reads).
+        // All offsets and total size are determined before any data is read — enabling true
+        // single-pass streaming to S3 with exact Content-Length.
+        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(allEntries);
+        long contentLength = layout.getTotalSize();
+
         AtomicReference<String> uploadedBlobName = new AtomicReference<>();
         IOException lastFailure = null;
         for (int attempt = 0; attempt < UPLOAD_RETRY_MAX_ATTEMPTS; attempt++) {
-            String blobName = TranslogArchivePathHelper.blobNameFromCurrentTime();
-            long contentLength = sizeAndOffsets.getSize();
+            String blobName = TranslogArchivePathHelper.tarBlobNameFromCurrentTime();
             try (PipedOutputStream pos = new PipedOutputStream(); PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)) {
                 AtomicReference<IOException> uploadError = new AtomicReference<>();
                 java.util.concurrent.CountDownLatch uploadLatch = new java.util.concurrent.CountDownLatch(1);
@@ -607,7 +610,9 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                     }
                 });
                 try {
-                    ArchiveBuilder.buildWithComment(pos, allEntries);
+                    // Single-pass streaming: reads each file once, lazily, directly to the pipe.
+                    // Peak memory = one file read buffer (64 KB), not all shard translog bytes.
+                    TarArchiveBuilder.build(pos, layout, allEntries);
                 } finally {
                     pos.close();
                 }
@@ -646,21 +651,18 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
                 throw e;
             }
             logger.debug(
-                "Archive uploaded path={} hashTypeIndex={} hashNodeId={} blob={}",
+                "TAR archive uploaded path={} hashTypeIndex={} hashNodeId={} blob={} size={}",
                 archivePath.buildAsString(),
                 hashTypeIndex,
                 hashNodeId,
-                blobName
+                blobName,
+                contentLength
             );
             uploadedBlobName.set(blobName);
             break;
         }
-        // No per-shard metadata upload: the ZIP comment already contains all offset/length info
-        // (ArchiveCommentFormat: shardId,primaryTerm,gen,tlogOffset,tlogLen,ckpOffset,ckpLen per line).
-        // Recovery uses TranslogArchiveRecovery which range-reads ZIP tails and binary-searches
-        // by generation — no per-shard metadata file needed, saving N PUTs per batch.
         logger.debug(
-            "Archive batch uploaded: path={} blob={} shards={}",
+            "TAR archive batch uploaded: path={} blob={} shards={}",
             archivePath.buildAsString(),
             uploadedBlobName.get(),
             contributingShards.size()
