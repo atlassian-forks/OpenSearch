@@ -159,4 +159,25 @@ public class RemoteStoreSettingsDynamicUpdateTests extends OpenSearchTestCase {
         );
         assertEquals(TimeValue.timeValueSeconds(60), remoteStoreSettings.getSegmentMetadataGcMinInterval());
     }
+
+    public void testTranslogArchiveUseTar() {
+        // Default should be true (TAR enabled)
+        assertTrue(remoteStoreSettings.isTranslogArchiveUseTar());
+
+        // Disable TAR (fall back to ZIP)
+        clusterSettings.applySettings(
+            Settings.builder()
+                .put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_USE_TAR.getKey(), false)
+                .build()
+        );
+        assertFalse(remoteStoreSettings.isTranslogArchiveUseTar());
+
+        // Re-enable TAR
+        clusterSettings.applySettings(
+            Settings.builder()
+                .put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_USE_TAR.getKey(), true)
+                .build()
+        );
+        assertTrue(remoteStoreSettings.isTranslogArchiveUseTar());
+    }
 }
