@@ -20,6 +20,7 @@ import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.transfer.archive.ArchiveCommentFormat;
 import org.opensearch.index.translog.transfer.archive.ArchiveIndexEntry;
+import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -95,14 +96,14 @@ public final class TranslogArchiveRecovery {
             BlobPath nodePath = indexPath.add(nodeDir);
             List<BlobMetadata> blobs = listBlobsSorted(transferService, nodePath, MAX_ZIPS_PER_BUCKET);
             for (BlobMetadata blob : blobs) {
-                if (blob.name().endsWith(".zip")) {
+                if (TranslogArchivePathHelper.isArchiveBlob(blob.name())) {
                     allZips.add(new ZipRef(nodePath, blob.name(), blob.length()));
                 }
             }
         }
 
         if (allZips.isEmpty()) {
-            logger.info("No archive ZIPs found; nothing to recover");
+            logger.info("No archive ZIPs/TARs found; nothing to recover");
             return;
         }
 
@@ -181,14 +182,14 @@ public final class TranslogArchiveRecovery {
             BlobPath nodePath = indexPath.add(nodeDir);
             List<BlobMetadata> blobs = listBlobsSorted(transferService, nodePath, MAX_ZIPS_PER_BUCKET);
             for (BlobMetadata blob : blobs) {
-                if (blob.name().endsWith(".zip")) {
+                if (TranslogArchivePathHelper.isArchiveBlob(blob.name())) {
                     allZips.add(new ZipRef(nodePath, blob.name(), blob.length()));
                 }
             }
         }
 
         if (allZips.isEmpty()) {
-            throw new IOException("No archive ZIPs found under " + indexPath.buildAsString());
+            throw new IOException("No archive ZIPs/TARs found under " + indexPath.buildAsString());
         }
 
         // Sort by blob name (timestamp-based, lexicographic = chronological)
@@ -311,9 +312,118 @@ public final class TranslogArchiveRecovery {
         if (cache.containsKey(index)) {
             return cache.get(index);
         }
-        List<ArchiveIndexEntry> entries = readZipComment(transferService, zips.get(index));
+        ZipRef ref = zips.get(index);
+        List<ArchiveIndexEntry> entries = ref.blobName.endsWith(".tar")
+            ? readTarIndex(transferService, ref)
+            : readZipComment(transferService, ref);
         cache.put(index, entries);
         return entries;
+    }
+
+    /**
+     * Reads the TAR index from the HEAD of a .tar archive blob (byte-range GET of first two TAR entries).
+     * This is the TAR equivalent of {@link #readZipComment} — both return a list of {@link ArchiveIndexEntry}.
+     *
+     * <p>TAR layout: [512B header][index data padded to 512][...data entries...][2*512 EOF marker]
+     * The index is always at offset 512 with a known size (from the TAR header), so we can read it
+     * with a bounded byte-range GET without knowing the total archive size.
+     */
+    static List<ArchiveIndexEntry> readTarIndex(TransferService transferService, ZipRef ref) throws IOException {
+        // Step 1: read the first 512 bytes (TAR header for the index entry) to get index size
+        byte[] header;
+        try (InputStream hStream = transferService.downloadBlob(ref.path, ref.blobName, 0, TarArchiveBuilder.TAR_BLOCK)) {
+            header = hStream.readAllBytes();
+        }
+        if (header.length < TarArchiveBuilder.TAR_BLOCK) {
+            logger.warn("TAR {} too small for header ({} bytes)", ref.blobName, header.length);
+            return Collections.emptyList();
+        }
+
+        // Parse size field from TAR header (bytes 124-135, octal ASCII)
+        String sizeOctal = new String(header, 124, 12, StandardCharsets.US_ASCII).trim().replace("\0", "");
+        long indexDataSize;
+        try {
+            indexDataSize = Long.parseLong(sizeOctal, 8);
+        } catch (NumberFormatException e) {
+            logger.warn("TAR {} has invalid size field in header: '{}'", ref.blobName, sizeOctal);
+            return Collections.emptyList();
+        }
+
+        if (indexDataSize <= 0 || indexDataSize > 65536) {
+            // Sanity check: index should be small
+            logger.warn("TAR {} index size {} out of expected range", ref.blobName, indexDataSize);
+            return Collections.emptyList();
+        }
+
+        // Step 2: read the index data (immediately after the 512-byte header)
+        byte[] indexBytes;
+        try (InputStream iStream = transferService.downloadBlob(ref.path, ref.blobName, TarArchiveBuilder.TAR_BLOCK, (int) indexDataSize)) {
+            indexBytes = iStream.readAllBytes();
+        }
+
+        // Step 3: parse the binary index into ArchiveIndexEntry list
+        List<TarArchiveBuilder.EntryLocation> locations;
+        try {
+            locations = TarArchiveBuilder.parseIndex(indexBytes);
+        } catch (Exception e) {
+            logger.warn("Failed to parse TAR index from {}: {}", ref.blobName, e.getMessage());
+            return Collections.emptyList();
+        }
+
+        // Step 4: convert EntryLocation pairs (tlog+ckp) into ArchiveIndexEntry objects
+        return parseTarLocationsToArchiveEntries(locations);
+    }
+
+    /**
+     * Converts a list of TAR {@link TarArchiveBuilder.EntryLocation} entries into {@link ArchiveIndexEntry} objects.
+     * Expects entries in pairs: (tlog, ckp) for each generation, in the path format:
+     * {@code {uuid}/{shardId}/{primaryTerm}/translog-{generation}.tlog}
+     * {@code {uuid}/{shardId}/{primaryTerm}/translog-{generation}.ckp}
+     */
+    static List<ArchiveIndexEntry> parseTarLocationsToArchiveEntries(List<TarArchiveBuilder.EntryLocation> locations) {
+        List<ArchiveIndexEntry> result = new ArrayList<>();
+        // Group by generation key: uuid/shardId/primaryTerm/generation
+        Map<String, TarArchiveBuilder.EntryLocation> byPath = new HashMap<>();
+        for (TarArchiveBuilder.EntryLocation loc : locations) {
+            byPath.put(loc.getPath(), loc);
+        }
+
+        // Find all .tlog entries and pair with .ckp
+        for (TarArchiveBuilder.EntryLocation tlogLoc : locations) {
+            String path = tlogLoc.getPath();
+            if (!path.endsWith(".tlog")) continue;
+
+            // Path format: {uuid}/{shardId}/{primaryTerm}/translog-{generation}.tlog
+            // Checkpoint path: same prefix but .ckp extension
+            String ckpPath = path.substring(0, path.length() - 5) + ".ckp";
+
+            TarArchiveBuilder.EntryLocation ckpLoc = byPath.get(ckpPath);
+
+            // Parse path components
+            String[] parts = path.split("/");
+            if (parts.length < 4) continue;
+            try {
+                int shardId = Integer.parseInt(parts[parts.length - 3]);
+                long primaryTerm = Long.parseLong(parts[parts.length - 2]);
+                // filename: translog-{generation}.tlog
+                String filename = parts[parts.length - 1];
+                long generation = Long.parseLong(
+                    filename.replace("translog-", "").replace(".tlog", "")
+                );
+
+                long ckpOffset = ckpLoc != null ? ckpLoc.getDataOffset() : 0;
+                long ckpLength = ckpLoc != null ? ckpLoc.getDataLength() : 0;
+
+                result.add(new ArchiveIndexEntry(
+                    shardId, primaryTerm, generation,
+                    tlogLoc.getDataOffset(), tlogLoc.getDataLength(),
+                    ckpOffset, ckpLength
+                ));
+            } catch (NumberFormatException e) {
+                logger.warn("Could not parse TAR entry path: {}", path);
+            }
+        }
+        return result;
     }
 
     /**

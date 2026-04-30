@@ -61,7 +61,7 @@ import java.util.List;
 public final class TarArchiveBuilder {
 
     /** TAR block size — all headers and padded data are multiples of this. */
-    static final int TAR_BLOCK = 512;
+    public static final int TAR_BLOCK = 512;
 
     /** Name of the index entry (always first in the archive). */
     static final String INDEX_ENTRY_NAME = "_index";

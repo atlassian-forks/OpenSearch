@@ -54,6 +54,7 @@ import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.hamcrest.Matchers.anyOf;
 import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
@@ -363,7 +364,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             eq(WritePriority.HIGH),
             eq(null)
         );
-        assertThat(nameCaptor.getValue(), endsWith(".zip"));
+        assertThat(nameCaptor.getValue(), anyOf(endsWith(".zip"), endsWith(".tar")));
         String uploadedPath = pathCaptor.getValue().buildAsString();
         // Archive is index+node scoped: path must start with repo-root, not contain shardId
         assertThat(uploadedPath, org.hamcrest.Matchers.startsWith("repo-root/translog/data/"));
