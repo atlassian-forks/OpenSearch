@@ -134,19 +134,6 @@ public class RemoteStoreSettings {
     );
 
     /**
-     * Controls whether translog archives are written in TAR format (true) or ZIP format (false).
-     * TAR uses a streaming single-pass build with a head-index, eliminating the double-build overhead
-     * of the ZIP format and significantly improving indexing throughput.
-     * Default: true (TAR). Set to false to fall back to ZIP for compatibility.
-     */
-    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_USE_TAR = Setting.boolSetting(
-        "cluster.remote_store.translog.archive.use_tar",
-        true,
-        Property.NodeScope,
-        Property.Dynamic
-    );
-
-    /**
      * Controls how often the translog archive retention GC runs (i.e. how frequently stale ZIPs are deleted).
      * This is the timer repeat interval — separate from the data retention age.
      * Default: 1 minute. Minimum: 1 minute.
@@ -278,7 +265,6 @@ public class RemoteStoreSettings {
     private volatile boolean clusterRemoteStoreSegmentArchiveEnabled;
     private volatile boolean clusterRemoteStoreSegmentArchiveFallbackToPerFile;
     private volatile TimeValue translogArchiveGcInterval;
-    private volatile boolean translogArchiveUseTar;
     private volatile TimeValue segmentMetadataGcMinInterval;
     private static volatile boolean isPinnedTimestampsEnabled;
     private static volatile TimeValue pinnedTimestampsSchedulerInterval;
@@ -350,9 +336,6 @@ public class RemoteStoreSettings {
 
         translogArchiveGcInterval = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.get(settings);
         clusterSettings.addSettingsUpdateConsumer(CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL, this::setTranslogArchiveGcInterval);
-
-        translogArchiveUseTar = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_USE_TAR.get(settings);
-        clusterSettings.addSettingsUpdateConsumer(CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_USE_TAR, this::setTranslogArchiveUseTar);
 
         segmentMetadataGcMinInterval = CLUSTER_REMOTE_STORE_SEGMENT_METADATA_GC_MIN_INTERVAL.get(settings);
         clusterSettings.addSettingsUpdateConsumer(
@@ -478,18 +461,6 @@ public class RemoteStoreSettings {
 
     private void setTranslogArchiveGcInterval(TimeValue translogArchiveGcInterval) {
         this.translogArchiveGcInterval = translogArchiveGcInterval;
-    }
-
-    /**
-     * Returns true if translog archives should be written in TAR format (single-pass streaming),
-     * false to use the legacy ZIP format.
-     */
-    public boolean isTranslogArchiveUseTar() {
-        return translogArchiveUseTar;
-    }
-
-    private void setTranslogArchiveUseTar(boolean translogArchiveUseTar) {
-        this.translogArchiveUseTar = translogArchiveUseTar;
     }
 
     public TimeValue getSegmentMetadataGcMinInterval() {

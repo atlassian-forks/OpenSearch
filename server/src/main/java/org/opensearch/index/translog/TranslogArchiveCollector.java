@@ -577,13 +577,6 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
         List<IndexShard> contributingShards,
         List<ArchiveBuilder.ArchiveBuildEntry> allEntries
     ) throws IOException {
-        // Use TAR format by default; fall back to ZIP if feature flag disabled.
-        boolean useTar = remoteStoreSettings == null || remoteStoreSettings.isTranslogArchiveUseTar();
-        if (!useTar) {
-            uploadArchiveZip(transferService, basePath, hashTypeIndex, hashNodeId, snapshots, contributingShards, allEntries);
-            return;
-        }
-
         // Path: translog/data/{hashTypeIndex}/{hashNodeId}/{timestamp}.tar
         // hashTypeIndex = hash("translog_zip|{indexUUID}") — same for all nodes, used for per-index GC
         // hashNodeId = hash(nodeId) — unique per node, isolates writes for S3 partition safety
@@ -672,65 +665,6 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent {
             "TAR archive batch uploaded: path={} blob={} shards={}",
             archivePath.buildAsString(),
             uploadedBlobName.get(),
-            contributingShards.size()
-        );
-    }
-
-    /**
-     * Fallback ZIP-based archive upload (legacy format). Used when {@code use_tar=false}.
-     * Unlike the TAR path, this builds the ZIP twice: once to compute size/offsets, once to upload.
-     */
-    private void uploadArchiveZip(
-        TransferService transferService,
-        BlobPath basePath,
-        String hashTypeIndex,
-        String hashNodeId,
-        List<TransferSnapshot> snapshots,
-        List<IndexShard> contributingShards,
-        List<ArchiveBuilder.ArchiveBuildEntry> allEntries
-    ) throws IOException {
-        BlobPath archivePath = basePath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
-        ArchiveBuilder.SizeAndOffsets sao = ArchiveBuilder.computeSizeAndOffsetsWithComment(allEntries);
-        long contentLength = sao.getSize();
-        String blobName = TranslogArchivePathHelper.blobNameFromCurrentTime();
-        try (PipedOutputStream pos = new PipedOutputStream(); PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)) {
-            AtomicReference<IOException> uploadError = new AtomicReference<>();
-            java.util.concurrent.CountDownLatch uploadLatch = new java.util.concurrent.CountDownLatch(1);
-            java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "translog-archive-zip-upload");
-                t.setDaemon(true);
-                return t;
-            });
-            executor.submit(() -> {
-                try {
-                    transferService.uploadBlobStream(pis, contentLength, archivePath, blobName, WritePriority.HIGH, null);
-                } catch (IOException e) {
-                    uploadError.set(e);
-                } finally {
-                    uploadLatch.countDown();
-                }
-            });
-            try {
-                ArchiveBuilder.buildWithComment(pos, allEntries);
-            } finally {
-                pos.close();
-            }
-            try {
-                uploadLatch.await();
-            } catch (InterruptedException e) {
-                executor.shutdownNow();
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while waiting for ZIP archive upload", e);
-            }
-            executor.shutdown();
-            if (uploadError.get() != null) {
-                throw uploadError.get();
-            }
-        }
-        logger.debug(
-            "ZIP archive uploaded path={} blob={} shards={}",
-            archivePath.buildAsString(),
-            blobName,
             contributingShards.size()
         );
     }
