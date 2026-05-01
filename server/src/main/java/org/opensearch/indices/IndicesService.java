@@ -944,31 +944,28 @@ public class IndicesService extends AbstractLifecycleComponent
             // Wire archive batch coordinator for indices with archive upload enabled
             if (indexService.getIndexSettings().isTranslogArchiveUploadEnabled()
                 && indexService.getIndexSettings().isRemoteTranslogStoreEnabled()) {
-                TimeValue batchInterval = remoteStoreSettings != null
-                    ? remoteStoreSettings.getClusterRemoteTranslogBufferInterval()
-                    : TimeValue.timeValueMillis(650);
+                TimeValue archiveMaxWait = indexService.getIndexSettings().getTranslogArchiveMaxWait();
+                int archiveThreshold = indexService.getIndexSettings().getTranslogArchiveThreshold();
                 org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm hashAlgo = remoteStoreSettings != null
                     ? remoteStoreSettings.getPathHashAlgorithm()
                     : org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
-                // Archive basePath is intentionally empty: BlobStore.blobContainer() prepends the
-                // repository root automatically. The coordinator's archiveBasePath is relative to the
-                // repo root, and "translog/data/{hash}/{bucket}" is appended at upload time.
-                // This matches how TranslogArchiveCollector resolves paths via TransferManager.
-                // createIndex is called from IndicesClusterStateService on the cluster state applier thread.
-                // We cannot call clusterService.state() or clusterService.localNode() there (both assert
-                // they are NOT called from the applier thread). Use getLocalNodeIdUnsafe() which reads the
-                // raw AtomicReference directly without the assertion guard.
                 String localNodeId = clusterService.getClusterApplierService().getLocalNodeIdUnsafe();
                 TranslogArchiveBatchCoordinator coordinator = new TranslogArchiveBatchCoordinator(
                     index.getUUID(),
                     localNodeId,
                     new org.opensearch.common.blobstore.BlobPath(),
                     hashAlgo,
-                    batchInterval
+                    archiveMaxWait,
+                    archiveThreshold
                 );
                 TranslogArchiveBatchCoordinator.register(coordinator);
                 translogArchiveCollector.registerCoordinatorIndex(index.getUUID());
-                logger.info("Registered translog archive batch coordinator for index {}", index);
+                logger.info(
+                    "Registered translog archive batch coordinator for index {} (maxWait={}, threshold={})",
+                    index,
+                    archiveMaxWait,
+                    archiveThreshold
+                );
             }
             if (writeDanglingIndices) {
                 if (nodeWriteDanglingIndicesInfo) {

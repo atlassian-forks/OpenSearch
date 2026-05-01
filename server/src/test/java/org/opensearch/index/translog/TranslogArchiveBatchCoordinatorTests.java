@@ -51,12 +51,14 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     }
 
     private TranslogArchiveBatchCoordinator createCoordinator(TimeValue batchInterval) {
+        // threshold=Integer.MAX_VALUE so only the time-based dispatch fires, matching old batchInterval semantics
         TranslogArchiveBatchCoordinator c = new TranslogArchiveBatchCoordinator(
             "test-index-uuid",
             "test-node-id",
             new BlobPath().add("repo-root"),
             RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
-            batchInterval
+            batchInterval,
+            Integer.MAX_VALUE
         );
         coordinatorsToClose.add(c);
         return c;
@@ -621,7 +623,8 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
             "node-1",
             new BlobPath().add("repo"),
             RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
-            TimeValue.timeValueMillis(batchIntervalMs)
+            TimeValue.timeValueMillis(batchIntervalMs),
+            Integer.MAX_VALUE
         );
 
         AtomicInteger uploadCount = new AtomicInteger(0);
@@ -685,7 +688,8 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
             "node-1",
             new BlobPath().add("repo"),
             RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
-            TimeValue.timeValueMillis(batchIntervalMs)
+            TimeValue.timeValueMillis(batchIntervalMs),
+            Integer.MAX_VALUE
         );
 
         AtomicInteger uploadCount = new AtomicInteger(0);

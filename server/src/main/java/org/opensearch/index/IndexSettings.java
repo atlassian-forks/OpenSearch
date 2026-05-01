@@ -768,6 +768,34 @@ public final class IndexSettings {
     );
 
     /**
+     * Maximum time to wait after the first shard arrives before dispatching the archive batch.
+     * Acts as the "shared car departure deadline" — once a shard joins the batch, the clock starts
+     * and the batch dispatches after this interval if the threshold is not hit first.
+     * Default: 200ms.
+     */
+    public static final Setting<TimeValue> INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_MAX_WAIT_SETTING = Setting.timeSetting(
+        "index.remote_store.translog.archive_max_wait",
+        TimeValue.timeValueMillis(200),
+        TimeValue.ZERO,
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
+    /**
+     * Minimum number of shards that must join a batch before it is dispatched immediately,
+     * without waiting for the full archive_max_wait interval.
+     * Acts as the "shared car seat threshold" — once this many seats fill, the car departs early.
+     * Default: 5.
+     */
+    public static final Setting<Integer> INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_THRESHOLD_SETTING = Setting.intSetting(
+        "index.remote_store.translog.archive_threshold",
+        5,
+        1,
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
+    /**
      * When true, translog upload uses per-node archive (ZIP) upload to reduce PUT count; when false, uses existing per-shard upload.
      */
     public static final Setting<Boolean> INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING = Setting.boolSetting(
@@ -831,6 +859,8 @@ public final class IndexSettings {
     private volatile String remoteStoreRepository;
     private int remoteTranslogKeepExtraGen;
     private volatile boolean translogArchiveUploadEnabled;
+    private volatile TimeValue translogArchiveMaxWait;
+    private volatile int translogArchiveThreshold;
     private volatile TimeValue translogArchiveRetention;
     private volatile boolean segmentArchiveUploadEnabled;
     private Version extendedCompatibilitySnapshotVersion;
@@ -1040,6 +1070,8 @@ public final class IndexSettings {
         remoteStoreRepository = settings.get(IndexMetadata.SETTING_REMOTE_SEGMENT_STORE_REPOSITORY);
         this.remoteTranslogKeepExtraGen = INDEX_REMOTE_TRANSLOG_KEEP_EXTRA_GEN_SETTING.get(settings);
         this.translogArchiveUploadEnabled = INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.get(settings);
+        this.translogArchiveMaxWait = INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_MAX_WAIT_SETTING.get(settings);
+        this.translogArchiveThreshold = INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_THRESHOLD_SETTING.get(settings);
         this.translogArchiveRetention = INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.get(settings);
         this.segmentArchiveUploadEnabled = INDEX_REMOTE_STORE_SEGMENT_ARCHIVE_UPLOAD_ENABLED_SETTING.get(settings);
 
@@ -1227,6 +1259,11 @@ public final class IndexSettings {
         scopedSettings.addSettingsUpdateConsumer(
             INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING,
             this::setTranslogArchiveUploadEnabled
+        );
+        scopedSettings.addSettingsUpdateConsumer(INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_MAX_WAIT_SETTING, this::setTranslogArchiveMaxWait);
+        scopedSettings.addSettingsUpdateConsumer(
+            INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_THRESHOLD_SETTING,
+            this::setTranslogArchiveThreshold
         );
         scopedSettings.addSettingsUpdateConsumer(INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING, this::setTranslogArchiveRetention);
         scopedSettings.addSettingsUpdateConsumer(
@@ -1566,6 +1603,22 @@ public final class IndexSettings {
 
     private void setTranslogArchiveUploadEnabled(boolean enabled) {
         this.translogArchiveUploadEnabled = enabled;
+    }
+
+    public TimeValue getTranslogArchiveMaxWait() {
+        return translogArchiveMaxWait;
+    }
+
+    private void setTranslogArchiveMaxWait(TimeValue maxWait) {
+        this.translogArchiveMaxWait = maxWait;
+    }
+
+    public int getTranslogArchiveThreshold() {
+        return translogArchiveThreshold;
+    }
+
+    private void setTranslogArchiveThreshold(int threshold) {
+        this.translogArchiveThreshold = threshold;
     }
 
     public TimeValue getTranslogArchiveRetention() {

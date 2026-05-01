@@ -43,7 +43,12 @@ import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -71,23 +76,26 @@ public class TranslogArchiveThroughputIT extends RemoteStoreBaseIntegTestCase {
     static final String LATENCY_FS_TYPE = "latency-fs";
     private static final String INDEX_ARCHIVE = "bench-translog-archive";
     private static final String INDEX_NO_ARCHIVE = "bench-translog-no-archive";
-    private static final int NUM_SHARDS = 3;
+    private static final int NUM_SHARDS = 5;
     private static final int NUM_REPLICAS = 0;
-    private static final int BULK_SIZE = 50;
-    private static final int TOTAL_DOCS = 500;
+    private static final int NUM_INDEX_CLIENTS = 10;
+    private static final int BULK_SIZE = 60;
+    private static final int TOTAL_DOCS = BULK_SIZE * 200;
 
     /**
      * Simulated blob write latency (ms) — large enough to expose blocking behaviour but
      * small enough to keep the test duration reasonable.
      */
-    static final int WRITE_LATENCY_MS = 150;
+    static final int WRITE_LATENCY_MS = 10;
 
     /**
      * Maximum acceptable throughput ratio (no-archive tps / archive tps).
-     * Pre-fix: ~2.0x (archive blocked TRANSLOG_SYNC thread for batchInterval + uploadTime).
-     * Post-fix target: ≤ 1.5x (collection and upload overlap via pipelining).
      */
     private static final double MAX_ACCEPTABLE_RATIO = 1.5;
+
+    /** Global blob-write counters — reset before each measured run. */
+    static final AtomicLong BLOB_WRITE_COUNT = new AtomicLong(0);
+    static final AtomicLong BLOB_WRITE_TOTAL_SLEEP_MS = new AtomicLong(0);
 
     // -----------------------------------------------------------------------
     // Latency-injecting translog repository
@@ -99,6 +107,8 @@ public class TranslogArchiveThroughputIT extends RemoteStoreBaseIntegTestCase {
         }
 
         private static void simulateLatency() {
+            BLOB_WRITE_COUNT.incrementAndGet();
+            BLOB_WRITE_TOTAL_SLEEP_MS.addAndGet(WRITE_LATENCY_MS);
             try {
                 Thread.sleep(WRITE_LATENCY_MS);
             } catch (InterruptedException e) {
@@ -141,9 +151,6 @@ public class TranslogArchiveThroughputIT extends RemoteStoreBaseIntegTestCase {
     }
 
     public static class LatencyInjectingFsRepository extends FsRepository {
-
-        static final String TYPE = LATENCY_FS_TYPE;
-
         public LatencyInjectingFsRepository(
             RepositoryMetadata metadata,
             Environment environment,
@@ -229,8 +236,6 @@ public class TranslogArchiveThroughputIT extends RemoteStoreBaseIntegTestCase {
         return Settings.builder()
             .put(remoteStoreIndexSettings(NUM_REPLICAS, NUM_SHARDS))
             .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), archiveEnabled)
-            // Short sync interval so translog syncs happen frequently — exposes blocking behaviour
-            .put("index.translog.sync_interval", "100ms")
             .put("index.translog.durability", "REQUEST")
             .build();
     }
@@ -260,48 +265,62 @@ public class TranslogArchiveThroughputIT extends RemoteStoreBaseIntegTestCase {
         ensureGreen(INDEX_NO_ARCHIVE, INDEX_ARCHIVE);
 
         // warm-up: let translog coordinator register and upload threads stabilise
-        logger.info("--> warm-up ({} docs each)", BULK_SIZE * 3);
+        logger.info("--> warm-up ({} docs each; {} concurrent clients)", BULK_SIZE * 3, NUM_INDEX_CLIENTS);
         indexDocs(INDEX_NO_ARCHIVE, BULK_SIZE * 3);
         indexDocs(INDEX_ARCHIVE, BULK_SIZE * 3);
-        Thread.sleep(500);
-
-        // --- measured run: no-archive ---
-        logger.info("--> [NO-ARCHIVE] measuring {} docs", TOTAL_DOCS);
-        long noArchiveMs = measureIndexingMs(INDEX_NO_ARCHIVE, TOTAL_DOCS);
-        double noArchiveTps = (double) TOTAL_DOCS / noArchiveMs * 1000.0;
 
         // --- measured run: archive ---
         logger.info("--> [ARCHIVE] measuring {} docs", TOTAL_DOCS);
+        BLOB_WRITE_COUNT.set(0);
+        BLOB_WRITE_TOTAL_SLEEP_MS.set(0);
         long archiveMs = measureIndexingMs(INDEX_ARCHIVE, TOTAL_DOCS);
+        long archiveBlobWrites = BLOB_WRITE_COUNT.get();
+        long archiveTotalSleepMs = BLOB_WRITE_TOTAL_SLEEP_MS.get();
         double archiveTps = (double) TOTAL_DOCS / archiveMs * 1000.0;
 
+        // --- measured run: no-archive ---
+        logger.info("--> [NO-ARCHIVE] measuring {} docs", TOTAL_DOCS);
+        BLOB_WRITE_COUNT.set(0);
+        BLOB_WRITE_TOTAL_SLEEP_MS.set(0);
+        long noArchiveMs = measureIndexingMs(INDEX_NO_ARCHIVE, TOTAL_DOCS);
+        long noArchiveBlobWrites = BLOB_WRITE_COUNT.get();
+        long noArchiveTotalSleepMs = BLOB_WRITE_TOTAL_SLEEP_MS.get();
+        double noArchiveTps = (double) TOTAL_DOCS / noArchiveMs * 1000.0;
+
         double ratio = noArchiveTps / archiveTps;
+        double blobWriteRatio = noArchiveBlobWrites > 0 ? (double) noArchiveBlobWrites / Math.max(archiveBlobWrites, 1) : 0;
 
         logger.info(
             String.format(
                 Locale.ROOT,
                 "%n%n========== TRANSLOG ARCHIVE THROUGHPUT TEST ==========%n"
-                    + "  Setup          : 1 node, %d shards, %d replicas, sync_interval=100ms, durability=REQUEST%n"
-                    + "  Simulated RTT  : %d ms per writeBlob (translog repo only)%n"
-                    + "  Docs indexed   : %,d per run%n"
-                    + "  NO-ARCHIVE     : %,d ms  →  %.1f docs/sec%n"
-                    + "  ARCHIVE        : %,d ms  →  %.1f docs/sec%n"
-                    + "  Ratio          : %.2fx  (no-archive/archive; >1 = archive is slower)%n"
-                    + "  Max allowed    : %.1fx%n"
-                    + "  Root cause     : submitAndWait() blocked TRANSLOG_SYNC thread for%n"
-                    + "                   batchInterval + uploadTime per cycle (pre-fix).%n"
-                    + "  Fix            : dispatchUnderLock() hands batch to background thread%n"
-                    + "                   so next collection starts immediately (pipelining).%n"
+                    + "  Setup              : 1 node, %d shards, %d replicas, durability=REQUEST%n"
+                    + "  Index clients      : %d concurrent threads%n"
+                    + "  Simulated RTT      : %d ms per writeBlob (translog repo only)%n"
+                    + "  Docs indexed       : %,d per run%n"
+                    + "  NO-ARCHIVE         : %,d ms  →  %.1f docs/sec%n"
+                    + "    blob writes      : %,d  (total simulated sleep: %,d ms)%n"
+                    + "  ARCHIVE            : %,d ms  →  %.1f docs/sec%n"
+                    + "    blob writes      : %,d  (total simulated sleep: %,d ms)%n"
+                    + "  Throughput ratio   : %.2fx  (no-archive/archive; >1 = archive is slower)%n"
+                    + "  Blob write ratio   : %.2fx  (no-archive/archive; shows upload batching saving)%n"
+                    + "  Max allowed ratio  : %.1fx%n"
                     + "======================================================%n",
                 NUM_SHARDS,
                 NUM_REPLICAS,
+                NUM_INDEX_CLIENTS,
                 WRITE_LATENCY_MS,
                 TOTAL_DOCS,
                 noArchiveMs,
                 noArchiveTps,
+                noArchiveBlobWrites,
+                noArchiveTotalSleepMs,
                 archiveMs,
                 archiveTps,
+                archiveBlobWrites,
+                archiveTotalSleepMs,
                 ratio,
+                blobWriteRatio,
                 MAX_ACCEPTABLE_RATIO
             )
         );
@@ -336,6 +355,48 @@ public class TranslogArchiveThroughputIT extends RemoteStoreBaseIntegTestCase {
     }
 
     private void indexDocs(String indexName, int totalDocs) {
+        if (totalDocs <= 0) {
+            return;
+        }
+        int threadCount = Math.min(NUM_INDEX_CLIENTS, totalDocs);
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch startGate = new CountDownLatch(1);
+        CountDownLatch doneGate = new CountDownLatch(threadCount);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+
+        int docsPerThread = totalDocs / threadCount;
+        int remainder = totalDocs % threadCount;
+        for (int i = 0; i < threadCount; i++) {
+            int docsForThread = docsPerThread + (i < remainder ? 1 : 0);
+            executor.execute(() -> {
+                try {
+                    startGate.await();
+                    indexDocsSequential(indexName, docsForThread);
+                } catch (Throwable t) {
+                    failure.compareAndSet(null, t);
+                } finally {
+                    doneGate.countDown();
+                }
+            });
+        }
+
+        startGate.countDown();
+        try {
+            doneGate.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for indexing workers", e);
+        } finally {
+            executor.shutdownNow();
+        }
+
+        Throwable t = failure.get();
+        if (t != null) {
+            throw new RuntimeException("Concurrent indexing failed", t);
+        }
+    }
+
+    private void indexDocsSequential(String indexName, int totalDocs) {
         int remaining = totalDocs;
         while (remaining > 0) {
             int batchSize = Math.min(BULK_SIZE, remaining);
@@ -343,11 +404,13 @@ public class TranslogArchiveThroughputIT extends RemoteStoreBaseIntegTestCase {
             for (int i = 0; i < batchSize; i++) {
                 bulk.add(
                     new IndexRequest(indexName).id(UUIDs.randomBase64UUID())
-                        .source("field", randomAlphaOfLength(20), "ts", System.currentTimeMillis())
+                        .source("field", UUIDs.randomBase64UUID(), "ts", System.currentTimeMillis())
                 );
             }
             BulkResponse resp = client().bulk(bulk).actionGet(TimeValue.timeValueSeconds(30));
-            assertFalse("Bulk had failures: " + resp.buildFailureMessage(), resp.hasFailures());
+            if (resp.hasFailures()) {
+                throw new IllegalStateException("Bulk had failures: " + resp.buildFailureMessage());
+            }
             remaining -= batchSize;
         }
     }

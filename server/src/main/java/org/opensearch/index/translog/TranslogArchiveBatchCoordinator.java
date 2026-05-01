@@ -36,14 +36,21 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Per-index synchronous batch coordinator for translog archive uploads (the "school bus" model).
+ * Per-index synchronous batch coordinator for translog archive uploads (the "shared car" model).
  * <p>
  * Multiple shard sync threads call {@link #submitAndWait} to add their translog data to the current batch.
- * When the batch interval elapses, the coordinator builds a single ZIP from all pending shards and uploads
- * it as a single S3 PUT. All waiting threads are released only after the upload completes, preserving the
+ * The batch dispatches when either:
+ * <ul>
+ *   <li>The number of pending shards reaches {@code archiveThreshold} (car seats full → depart early), or</li>
+ *   <li>{@code archiveMaxWait} has elapsed since the <b>first</b> shard arrived (waiting too long → depart).</li>
+ * </ul>
+ * After each upload the wait clock resets — the next batch starts fresh on the next arriving shard.
+ * All waiting threads are released only after the upload completes, preserving the
  * durability guarantee that the client's indexing response is not sent until data is remotely persisted.
  * <p>
- * <b>Path layout:</b> {@code repoBase/translog/data/{hashTypeIndex}/{genBucket}/{timestamp}.zip}
+ * Bytes-based early dispatch ({@link #MAX_BATCH_BYTES}) is retained as a safety bound against OOM.
+ * <p>
+ * <b>Path layout:</b> {@code repoBase/translog/data/{hashTypeIndex}/{hashNodeId}/{timestamp}.zip}
  *
  * @opensearch.internal
  */
@@ -82,11 +89,6 @@ public class TranslogArchiveBatchCoordinator {
     /**
      * Maximum total uncompressed bytes across all shard entries in one batch.
      * Prevents OOM when many large shards accumulate in a single batch window.
-     * Default: 128 MB — a batch exceeding this triggers an early dispatch before
-     * the interval elapses, bounding heap usage at ~256 MB worst case per batch
-     * (the triggering shard itself can be up to 128 MB; ZIP assembly re-uses
-     * the entry byte arrays via getBackingBytes() so no second copy is made).
-     * This matches the per-shard file size limit (MAX_TRANSLOG_ARCHIVE_ENTRY_BYTES).
      */
     static final long MAX_BATCH_BYTES = 128L * 1024 * 1024;
 
@@ -94,15 +96,15 @@ public class TranslogArchiveBatchCoordinator {
     private final String nodeId;
     private final BlobPath archiveBasePath;
     private final RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm;
-    private final TimeValue batchInterval;
+    private final long archiveMaxWaitMillis;
+    private final int archiveThreshold;
     private final long uploadTimeoutMillis;
 
     // Current batch state — guarded by lock
     private final ReentrantLock lock = new ReentrantLock();
     /**
-     * Condition signalled on a fixed schedule (every batchInterval) by the timer thread.
-     * Regional bus threads (submitAndWait callers) wait on this condition.
-     * When signalled, the first thread to acquire the lock dispatches the batch.
+     * Condition used to wake up waiting shards when: (a) the first-arrival timer fires,
+     * (b) the threshold is reached, or (c) the coordinator closes.
      */
     private final Condition batchReady = lock.newCondition();
     private final Condition batchComplete = lock.newCondition();
@@ -120,11 +122,15 @@ public class TranslogArchiveBatchCoordinator {
     /** Whether this coordinator has been closed. */
     private volatile boolean closed;
     /**
-     * Fixed-schedule timer executor: signals batchReady every batchInterval regardless of arrivals.
-     * This is the "central bus clock" — regional buses wait for up to one full batchInterval.
-     * Uses ScheduledExecutorService for clean shutdown via shutdownNow().
+     * Timer executor used to enforce archiveMaxWait after the first shard arrives.
+     * Replaced per batch — null when no batch is in progress (no shards pending).
      */
     private final ScheduledExecutorService timerExecutor;
+    /**
+     * Whether a per-batch timer task is currently scheduled.
+     * Reset to false on each dispatch so the next batch starts a fresh timer.
+     */
+    private boolean firstArrivalTimerScheduled;
 
     /**
      * Data submitted by one shard for inclusion in the batch ZIP.
@@ -177,38 +183,26 @@ public class TranslogArchiveBatchCoordinator {
         String nodeId,
         BlobPath archiveBasePath,
         RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm,
-        TimeValue batchInterval
+        TimeValue archiveMaxWait,
+        int archiveThreshold
     ) {
         this.indexUUID = indexUUID;
         this.nodeId = nodeId;
         this.archiveBasePath = archiveBasePath;
         this.pathHashAlgorithm = pathHashAlgorithm;
-        this.batchInterval = batchInterval;
-        this.uploadTimeoutMillis = Math.max(batchInterval.millis() * 10, 30_000);
+        this.archiveMaxWaitMillis = archiveMaxWait.millis();
+        this.archiveThreshold = archiveThreshold;
+        this.uploadTimeoutMillis = Math.max(archiveMaxWait.millis() * 10, 30_000);
         this.dispatchLatch = new CountDownLatch(1);
         this.closed = false;
+        this.firstArrivalTimerScheduled = false;
 
-        // Fixed-schedule timer: signals batchReady every batchInterval.
-        // This is the "central bus clock" — it fires on a fixed schedule regardless of
-        // when regional buses (shards) arrive. Regional buses wait on batchReady.await()
-        // for at most one full batchInterval before the central bus departs.
-        // ScheduledExecutorService is used for clean, deterministic shutdown via shutdownNow()
-        // which reliably stops the scheduled task without thread-leak issues.
+        // Shared single-thread scheduler; fires once per batch when the first shard arrives.
         this.timerExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "translog-archive-batch-timer-" + indexUUID);
             t.setDaemon(true);
             return t;
         });
-        this.timerExecutor.scheduleAtFixedRate(() -> {
-            if (closed) return;
-            lock.lock();
-            try {
-                // Signal all waiting regional buses: "central bus is departing now"
-                batchReady.signalAll();
-            } finally {
-                lock.unlock();
-            }
-        }, batchInterval.millis(), batchInterval.millis(), TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -239,6 +233,13 @@ public class TranslogArchiveBatchCoordinator {
      * Submit shard data to the current batch and block until the batch ZIP is uploaded.
      * Called by the shard's sync thread. Returns only after the ZIP is durably persisted in remote store.
      *
+     * <p>Dispatch triggers when either:
+     * <ul>
+     *   <li>Pending shard count reaches {@code archiveThreshold} (seats full → depart immediately), or</li>
+     *   <li>The first-arrival timer expires after {@code archiveMaxWait} ms, or</li>
+     *   <li>Total batch bytes reach {@link #MAX_BATCH_BYTES}.</li>
+     * </ul>
+     *
      * @param shardData the shard's translog data for this batch
      * @param transferService the transfer service to use for upload
      * @throws IOException if the upload fails
@@ -248,34 +249,53 @@ public class TranslogArchiveBatchCoordinator {
 
         lock.lock();
         try {
-            // Add shard data to the current batch (the "regional bus passengers board at central station").
-            // Regional buses arrive at any time within the batchInterval window and wait here until the
-            // fixed-schedule central bus departs (timer signals batchReady every batchInterval).
             pendingShards.put(shardData.getShardId(), shardData);
             long shardBytes = shardData.getEntries().stream().mapToLong(ArchiveBuilder.ArchiveBuildEntry::getSize).sum();
             pendingBatchBytes += shardBytes;
             myLatch = dispatchLatch;
 
-            // If batch size limit reached, dispatch immediately without waiting for the next timer signal.
-            if (pendingBatchBytes >= MAX_BATCH_BYTES) {
-                logger.debug("Batch size limit reached ({} bytes), dispatching early for index {}", pendingBatchBytes, indexUUID);
-                if (!dispatching) {
-                    dispatchUnderLock(transferService);
-                }
+            // Schedule first-arrival timer on the very first shard in this batch.
+            // Subsequent shards in the same batch reuse the already-running timer.
+            if (!firstArrivalTimerScheduled && !dispatching) {
+                firstArrivalTimerScheduled = true;
+                timerExecutor.schedule(() -> {
+                    if (closed) return;
+                    lock.lock();
+                    try {
+                        batchReady.signalAll();
+                    } finally {
+                        lock.unlock();
+                    }
+                }, archiveMaxWaitMillis, TimeUnit.MILLISECONDS);
+                logger.debug(
+                    "First shard arrived for index {}, scheduled batch dispatch in {} ms",
+                    indexUUID,
+                    archiveMaxWaitMillis
+                );
+            }
+
+            // Dispatch early if threshold or byte limit reached
+            boolean thresholdReached = pendingShards.size() >= archiveThreshold;
+            boolean byteLimitReached = pendingBatchBytes >= MAX_BATCH_BYTES;
+            if ((thresholdReached || byteLimitReached) && !dispatching) {
+                logger.debug(
+                    "Dispatching early for index {}: shards={} threshold={} bytes={} byteLimit={}",
+                    indexUUID,
+                    pendingShards.size(),
+                    archiveThreshold,
+                    pendingBatchBytes,
+                    byteLimitReached
+                );
+                dispatchUnderLock(transferService);
             } else {
-                // Wait for the timer thread to signal batchReady (fixed-schedule "central bus departure").
-                // The wait is at most one full batchInterval; the timer fires every batchInterval regardless
-                // of when regional buses arrive (no "first arrival starts the clock" behaviour).
-                // A spurious wakeup or size-limit dispatch may wake us early — the check below handles that.
+                // Wait for the first-arrival timer or an early dispatch signal
                 try {
-                    batchReady.await(batchInterval.millis(), TimeUnit.MILLISECONDS);
+                    batchReady.await(archiveMaxWaitMillis, TimeUnit.MILLISECONDS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while waiting for batch interval", e);
+                    throw new IOException("Interrupted while waiting for batch dispatch", e);
                 }
-                // After wakeup: dispatch only if not already dispatched by another thread.
-                // myLatch == dispatchLatch: latch not yet replaced → batch not yet dispatched → we dispatch.
-                // myLatch != dispatchLatch: another thread already dispatched this batch → we skip.
+                // Dispatch if we are the first to wake and batch not yet dispatched
                 if (myLatch == dispatchLatch && !dispatching && !pendingShards.isEmpty()) {
                     dispatchUnderLock(transferService);
                 }
@@ -284,17 +304,16 @@ public class TranslogArchiveBatchCoordinator {
             lock.unlock();
         }
 
-        // Wait for dispatch to complete
+        // Wait for the background upload thread to complete
         try {
             if (!myLatch.await(uploadTimeoutMillis, TimeUnit.MILLISECONDS)) {
-                throw new IOException("Timed out waiting for archive batch dispatch");
+                throw new IOException("Timed out waiting for archive batch upload");
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while waiting for batch dispatch", e);
+            throw new IOException("Interrupted while waiting for batch upload", e);
         }
 
-        // Check for dispatch error
         IOException error = dispatchError;
         if (error != null) {
             throw new IOException("Archive batch upload failed", error);
@@ -302,27 +321,19 @@ public class TranslogArchiveBatchCoordinator {
     }
 
     /**
-     * Force-dispatch the current batch even if the interval hasn't elapsed.
-     * Called by a scheduled timer to ensure batches don't wait forever.
-     *
-     * @param transferService the transfer service for upload
+     * No-op: kept for API compatibility. Dispatch is now driven by first-arrival timer and threshold.
      */
     public void timerDispatch(TransferService transferService) {
-        lock.lock();
-        try {
-            if (pendingShards.isEmpty() || dispatching) {
-                return;
-            }
-            dispatchUnderLock(transferService);
-        } finally {
-            lock.unlock();
-        }
+        // no-op — dispatch is now triggered inside submitAndWait via first-arrival timer
     }
 
     /**
      * Must be called under lock. Hands the current batch off to a background upload thread and
      * resets the coordinator state immediately so that the next batch can start accumulating
      * without waiting for the upload to complete (pipelining).
+     * <p>
+     * Resets {@code firstArrivalTimerScheduled} so the next batch schedules a fresh timer
+     * when its first shard arrives.
      * <p>
      * Callers still wait for the upload to finish via {@code dispatchLatch.await()} in
      * {@link #submitAndWait}, preserving {@code durability=REQUEST} correctness.
@@ -338,6 +349,7 @@ public class TranslogArchiveBatchCoordinator {
         dispatchError = null;
         dispatchLatch = new CountDownLatch(1);
         dispatching = false;
+        firstArrivalTimerScheduled = false;  // next batch will schedule its own first-arrival timer
         batchComplete.signalAll();
 
         // Hand off upload to a background thread — lock is NOT held during upload.
