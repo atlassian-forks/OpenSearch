@@ -634,14 +634,11 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
 
         assertBusy(() -> {
             List<String> archives = listSegmentArchives();
-            assertTrue(
-                "Expected at least 2 archive blobs but got " + archives.size(),
-                archives.size() >= 2
-            );
+            assertTrue("Expected at least 2 archive blobs but got " + archives.size(), archives.size() >= 2);
         }, 30, TimeUnit.SECONDS);
 
         // Now add a fresh replica node — it has no local segment cache, so it must
-        // download ALL files from remote store.  Files from A1 exercise the
+        // download ALL files from remote store. Files from A1 exercise the
         // readFileFromArchiveBlob() path (the code path that caused the S3
         // ConnectionClosedException due to premature stream close).
         String newReplicaNode = internalCluster().startDataOnlyNode();

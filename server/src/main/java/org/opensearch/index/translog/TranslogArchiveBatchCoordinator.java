@@ -18,7 +18,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
-import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
+
 import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 
 import java.io.IOException;
@@ -142,14 +142,14 @@ public class TranslogArchiveBatchCoordinator {
         private final long primaryTerm;
         private final long generation;
         private final long minTranslogGeneration;
-        private final List<ArchiveBuilder.ArchiveBuildEntry> entries;
+        private final List<TarArchiveBuilder.ArchiveBuildEntry> entries;
 
         public ShardArchiveData(
             int shardId,
             long primaryTerm,
             long generation,
             long minTranslogGeneration,
-            List<ArchiveBuilder.ArchiveBuildEntry> entries
+            List<TarArchiveBuilder.ArchiveBuildEntry> entries
         ) {
             this.shardId = shardId;
             this.primaryTerm = primaryTerm;
@@ -174,7 +174,7 @@ public class TranslogArchiveBatchCoordinator {
             return minTranslogGeneration;
         }
 
-        public List<ArchiveBuilder.ArchiveBuildEntry> getEntries() {
+        public List<TarArchiveBuilder.ArchiveBuildEntry> getEntries() {
             return entries;
         }
     }
@@ -251,7 +251,7 @@ public class TranslogArchiveBatchCoordinator {
         lock.lock();
         try {
             pendingShards.put(shardData.getShardId(), shardData);
-            long shardBytes = shardData.getEntries().stream().mapToLong(ArchiveBuilder.ArchiveBuildEntry::getSize).sum();
+            long shardBytes = shardData.getEntries().stream().mapToLong(TarArchiveBuilder.ArchiveBuildEntry::getSize).sum();
             pendingBatchBytes += shardBytes;
             myLatch = dispatchLatch;
 
@@ -377,7 +377,7 @@ public class TranslogArchiveBatchCoordinator {
      */
     private void uploadBatch(Map<Integer, ShardArchiveData> batch, TransferService transferService) throws IOException {
         // Collect all entries
-        List<ArchiveBuilder.ArchiveBuildEntry> allEntries = new ArrayList<>();
+        List<TarArchiveBuilder.ArchiveBuildEntry> allEntries = new ArrayList<>();
         for (ShardArchiveData data : batch.values()) {
             allEntries.addAll(data.getEntries());
         }

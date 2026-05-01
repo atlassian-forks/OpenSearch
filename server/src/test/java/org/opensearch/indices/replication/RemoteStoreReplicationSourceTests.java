@@ -173,8 +173,7 @@ public class RemoteStoreReplicationSourceTests extends OpenSearchIndexLevelRepli
      * and archiveStateRef.  getSegmentFiles() reuses that state (does NOT call init() again)
      * to avoid a race where the metadata advances between the two calls.
      */
-    public void testGetSegmentFilesReusesMetadataFromGetCheckpointMetadata() throws ExecutionException, InterruptedException,
-        IOException {
+    public void testGetSegmentFilesReusesMetadataFromGetCheckpointMetadata() throws ExecutionException, InterruptedException, IOException {
         replicationSource = new RemoteStoreReplicationSource(primaryShard);
 
         // Step 1: getCheckpointMetadata — calls remoteDirectory.init() and captures current metadata
@@ -239,8 +238,8 @@ public class RemoteStoreReplicationSourceTests extends OpenSearchIndexLevelRepli
 
         // ──────────────────────────────────────────────────────────────────
         // Step 1: getCheckpointMetadata() BEFORE merge — calls init(),
-        //         reads metadata M_N containing both _0.* and _1.* files.
-        //         This populates segmentsUploadedToRemoteStore with M_N.
+        // reads metadata M_N containing both _0.* and _1.* files.
+        // This populates segmentsUploadedToRemoteStore with M_N.
         // ──────────────────────────────────────────────────────────────────
         final ReplicationCheckpoint checkpoint = primaryShard.getLatestReplicationCheckpoint();
         final PlainActionFuture<CheckpointInfoResponse> metaRes = PlainActionFuture.newFuture();
@@ -260,9 +259,9 @@ public class RemoteStoreReplicationSourceTests extends OpenSearchIndexLevelRepli
 
         // ──────────────────────────────────────────────────────────────────
         // Step 2: Force-merge on primary — advances metadata to M_{N+1}.
-        //         Old segments (_0, _1) are merged into _2.  M_{N+1} only
-        //         references _2.* files; _0.* and _1.* are gone from the
-        //         metadata FILE (but the in-memory map is untouched).
+        // Old segments (_0, _1) are merged into _2. M_{N+1} only
+        // references _2.* files; _0.* and _1.* are gone from the
+        // metadata FILE (but the in-memory map is untouched).
         // ──────────────────────────────────────────────────────────────────
         ForceMergeRequest forceMergeRequest = new ForceMergeRequest();
         forceMergeRequest.maxNumSegments(1);
@@ -282,19 +281,22 @@ public class RemoteStoreReplicationSourceTests extends OpenSearchIndexLevelRepli
         boolean someFilesGone = preMergeFileNames.stream().anyMatch(f -> !metadataFileKeys.contains(f));
         assertTrue(
             "Metadata FILE after force-merge must not contain all pre-merge files. "
-                + "Pre-merge: " + preMergeFileNames + ", metadata file keys: " + metadataFileKeys,
+                + "Pre-merge: "
+                + preMergeFileNames
+                + ", metadata file keys: "
+                + metadataFileKeys,
             someFilesGone
         );
 
         // ──────────────────────────────────────────────────────────────────
         // Step 3: getSegmentFiles() with the STALE filesToFetch from M_N.
         //
-        //   WITH FIX: getSegmentFiles() does NOT call init() again.  The
-        //     in-memory map still has M_N (set by getCheckpointMetadata()
-        //     in step 1).  Pre-merge files are present → download succeeds.
+        // WITH FIX: getSegmentFiles() does NOT call init() again. The
+        // in-memory map still has M_N (set by getCheckpointMetadata()
+        // in step 1). Pre-merge files are present → download succeeds.
         //
-        //   WITHOUT FIX: getSegmentFiles() would call init() → read M_{N+1}
-        //     → replace map → pre-merge files gone → NoSuchFileException.
+        // WITHOUT FIX: getSegmentFiles() would call init() → read M_{N+1}
+        // → replace map → pre-merge files gone → NoSuchFileException.
         // ──────────────────────────────────────────────────────────────────
         final PlainActionFuture<GetSegmentFilesResponse> filesRes = PlainActionFuture.newFuture();
         replicationSource.getSegmentFiles(REPLICATION_ID, checkpoint, filesToFetch, replicaShard, (f, b) -> {}, filesRes);
@@ -302,11 +304,7 @@ public class RemoteStoreReplicationSourceTests extends OpenSearchIndexLevelRepli
         // After the fix, getSegmentFiles() must succeed — no NoSuchFileException.
         GetSegmentFilesResponse response = filesRes.get();
         assertFalse("Expected segment files to be fetched successfully", response.files.isEmpty());
-        assertEquals(
-            "All requested files should be in the response",
-            filesToFetch.size(),
-            response.files.size()
-        );
+        assertEquals("All requested files should be in the response", filesToFetch.size(), response.files.size());
     }
 
     private void buildIndexShardBehavior(IndexShard mockShard, IndexShard indexShard) {

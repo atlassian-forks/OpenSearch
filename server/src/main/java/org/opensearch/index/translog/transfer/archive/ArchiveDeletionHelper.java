@@ -103,8 +103,33 @@ public final class ArchiveDeletionHelper {
      * @return empty if path does not match the convention
      */
     public static Optional<ParsedEntry> parsePath(String path) {
-        return ArchivePathParser.parseMemberPath(path)
-            .map(p -> new ParsedEntry(p.getIndexUUID() + "/" + p.getShardId(), p.getPrimaryTerm(), p.getGeneration()));
+        if (path == null || path.isEmpty()) {
+            return Optional.empty();
+        }
+        // Path format: {indexUUID}/{shardId}/{primaryTerm}/translog-{gen}.tlog|.ckp
+        String[] parts = path.split("/");
+        if (parts.length != 4) {
+            return Optional.empty();
+        }
+        try {
+            String indexUUID = parts[0];
+            int shardId = Integer.parseInt(parts[1]);
+            long primaryTerm = Long.parseLong(parts[2]);
+            String filename = parts[3];
+            // Extract generation from translog-{gen}.tlog or translog-{gen}.ckp
+            if (!filename.startsWith("translog-")) {
+                return Optional.empty();
+            }
+            String withoutPrefix = filename.substring("translog-".length());
+            int dotIdx = withoutPrefix.lastIndexOf('.');
+            if (dotIdx < 0) {
+                return Optional.empty();
+            }
+            long generation = Long.parseLong(withoutPrefix.substring(0, dotIdx));
+            return Optional.of(new ParsedEntry(indexUUID + "/" + shardId, primaryTerm, generation));
+        } catch (NumberFormatException e) {
+            return Optional.empty();
+        }
     }
 
     /**

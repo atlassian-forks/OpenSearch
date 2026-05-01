@@ -107,7 +107,7 @@ public class ArchiveDeletionHelperTests extends OpenSearchTestCase {
     }
 
     public void testEffectiveRetentionMinutesDefaultSetting() {
-        // Default setting is 10 minutes (set by INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING)
+        // Tests 10-minute retention (below new default of 2h, but still above safety floor of 5min)
         ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, 10L);
         assertThat(b.getEffectiveRetentionMinutes(), equalTo(10L));
     }

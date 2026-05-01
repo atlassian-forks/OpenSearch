@@ -14,7 +14,8 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
-import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
+import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
+
 import org.junit.After;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -67,9 +68,9 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     private TranslogArchiveBatchCoordinator.ShardArchiveData createShardData(int shardId, String content) {
         String path = "test-index-uuid/" + shardId + "/1/translog-5.tlog";
         String ckpPath = "test-index-uuid/" + shardId + "/1/translog-5.ckp";
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = new ArrayList<>();
-        entries.add(ArchiveBuilder.fromBytes(path, content.getBytes(StandardCharsets.UTF_8)));
-        entries.add(ArchiveBuilder.fromBytes(ckpPath, "ckp".getBytes(StandardCharsets.UTF_8)));
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = new ArrayList<>();
+        entries.add(TarArchiveBuilder.fromBytes(path, content.getBytes(StandardCharsets.UTF_8)));
+        entries.add(TarArchiveBuilder.fromBytes(ckpPath, "ckp".getBytes(StandardCharsets.UTF_8)));
         return new TranslogArchiveBatchCoordinator.ShardArchiveData(shardId, 1L, 5L, 3L, entries);
     }
 
@@ -636,8 +637,8 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
             return null;
         }).when(transferService).uploadBlobStream(any(), anyLong(), any(), anyString(), any(WritePriority.class), any());
 
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = List.of(
-            ArchiveBuilder.fromBytes("shard0/translog-1.tlog", "data".getBytes(StandardCharsets.UTF_8))
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+            TarArchiveBuilder.fromBytes("shard0/translog-1.tlog", "data".getBytes(StandardCharsets.UTF_8))
         );
         TranslogArchiveBatchCoordinator.ShardArchiveData shardData =
             new TranslogArchiveBatchCoordinator.ShardArchiveData(0, 1L, 1L, 0L, entries);
@@ -711,8 +712,8 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
             new Thread(() -> {
                 try {
                     startGate.await();
-                    List<ArchiveBuilder.ArchiveBuildEntry> entries = List.of(
-                        ArchiveBuilder.fromBytes("shard" + shard + "/translog-1.tlog",
+                    List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+                        TarArchiveBuilder.fromBytes("shard" + shard + "/translog-1.tlog",
                             ("data-" + shard).getBytes(StandardCharsets.UTF_8))
                     );
                     TranslogArchiveBatchCoordinator.ShardArchiveData data =

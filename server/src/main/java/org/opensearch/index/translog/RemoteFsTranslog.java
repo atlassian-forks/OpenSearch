@@ -30,7 +30,7 @@ import org.opensearch.index.translog.transfer.TranslogArchiveRecovery;
 import org.opensearch.index.translog.transfer.TranslogCheckpointTransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.TranslogTransferMetadata;
-import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
+import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -43,6 +43,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -401,8 +403,8 @@ public class RemoteFsTranslog extends Translog {
     }
 
     /**
-     * Archive ZIP recovery with explicit generation range (when metadata provides minGen/maxGen).
-     * Uses the 8-param {@link TranslogArchiveRecovery#recover} to avoid scanning all ZIPs.
+     * Archive TAR recovery with explicit generation range (when metadata provides minGen/maxGen).
+     * Uses {@link TranslogArchiveRecovery#recoverFromHierarchicalPath} to scan the hierarchical txlog/ path.
      * Writes files directly to {@code location} (not via temp dir).
      */
     private static void recoverFromArchiveZipWithGenRange(
@@ -419,7 +421,11 @@ public class RemoteFsTranslog extends Translog {
         for (Path file : FileSystemUtils.files(location)) {
             Files.delete(file);
         }
-        TranslogArchiveRecovery.recover(
+        // Try new hierarchical TAR path first (txlog/{day}/{minute}/ structure).
+        // Fall back to old ZIP path if nothing found (backward compatibility).
+        // Use Instant.now() as the segment timestamp so we scan from (now - 2 min) forward.
+        // If nothing found in the recent window, the ZIP fallback handles older data.
+        boolean recoveredFromTar = TranslogArchiveRecovery.recoverFromHierarchicalPath(
             translogTransferManager.getTransferService(),
             translogTransferManager.getArchiveBasePath(),
             indexUUID,
@@ -427,13 +433,15 @@ public class RemoteFsTranslog extends Translog {
             minGeneration,
             maxGeneration,
             location,
-            org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+            Instant.now(),
+            null
         );
         logger.info(
-            "ZIP gen-range recovery complete for shard {} gen=[{}-{}]",
+            "Archive gen-range recovery complete for shard {} gen=[{}-{}] found={}",
             translogTransferManager.getShardId(),
             minGeneration,
-            maxGeneration
+            maxGeneration,
+            recoveredFromTar
         );
     }
 
@@ -459,14 +467,24 @@ public class RemoteFsTranslog extends Translog {
         }
         Files.createDirectories(tempRecoveryDir);
         try {
-            TranslogArchiveRecovery.recover(
+            // Try new hierarchical TAR path (txlog/{day}/{minute}/) first.
+            // Use epoch + 2min as segment timestamp so we scan from epoch forward = all archives.
+            // Fall back to legacy ZIP scan if no TARs found.
+            boolean recoveredFromTar = TranslogArchiveRecovery.recoverFromHierarchicalPath(
                 translogTransferManager.getTransferService(),
                 translogTransferManager.getArchiveBasePath(),
                 indexUUID,
                 translogTransferManager.getShardId().id(),
+                Long.MIN_VALUE,
+                Long.MAX_VALUE,
                 tempRecoveryDir,
-                org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+                // Epoch + 2min so startFrom = epoch, meaning scan all archives
+                Instant.EPOCH.plus(Duration.ofMinutes(2)),
+                null
             );
+            if (!recoveredFromTar) {
+                logger.warn("No TAR archives found in hierarchical path for shard {}", translogTransferManager.getShardId());
+            }
             if (FileSystemUtils.exists(tempRecoveryDir.resolve(CHECKPOINT_FILE_NAME))) {
                 if (Files.notExists(location)) {
                     Files.createDirectories(location);
@@ -670,7 +688,7 @@ public class RemoteFsTranslog extends Translog {
         if (indexSettings().isTranslogArchiveUploadEnabled() && archiveBatchCoordinator != null) {
             try {
                 logger.trace("submitting to archive batch coordinator for primary term {} generation {}", primaryTerm, generation);
-                List<ArchiveBuilder.ArchiveBuildEntry> entries = buildArchiveEntries(primaryTerm, generation);
+                List<TarArchiveBuilder.ArchiveBuildEntry> entries = buildArchiveEntries(primaryTerm, generation);
                 TranslogArchiveBatchCoordinator.ShardArchiveData shardData = new TranslogArchiveBatchCoordinator.ShardArchiveData(
                     shardId.id(),
                     primaryTerm,
@@ -721,8 +739,8 @@ public class RemoteFsTranslog extends Translog {
      *
      * @throws IOException if files exceed MAX_TRANSLOG_ARCHIVE_ENTRY_BYTES or I/O fails
      */
-    private List<ArchiveBuilder.ArchiveBuildEntry> buildArchiveEntries(long primaryTerm, long generation) throws IOException {
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = new ArrayList<>();
+    private List<TarArchiveBuilder.ArchiveBuildEntry> buildArchiveEntries(long primaryTerm, long generation) throws IOException {
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = new ArrayList<>();
         String indexUUID = shardId.getIndex().getUUID();
         String prefix = indexUUID + "/" + shardId.id() + "/" + primaryTerm + "/";
 
@@ -749,7 +767,7 @@ public class RemoteFsTranslog extends Translog {
                 );
             }
             byte[] tlogBytes = Files.readAllBytes(tlogFile);
-            entries.add(ArchiveBuilder.fromBytes(prefix + tlogFilename, tlogBytes));
+            entries.add(TarArchiveBuilder.fromBytes(prefix + tlogFilename, tlogBytes));
         }
         if (Files.exists(ckpFile)) {
             long ckpSize = Files.size(ckpFile);
@@ -767,7 +785,7 @@ public class RemoteFsTranslog extends Translog {
                 );
             }
             byte[] ckpBytes = Files.readAllBytes(ckpFile);
-            entries.add(ArchiveBuilder.fromBytes(prefix + ckpFilename, ckpBytes));
+            entries.add(TarArchiveBuilder.fromBytes(prefix + ckpFilename, ckpBytes));
         }
 
         return entries;

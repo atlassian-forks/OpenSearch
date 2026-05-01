@@ -30,10 +30,10 @@ import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
-import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
+
 import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.index.translog.transfer.archive.ArchiveEntry;
-import org.opensearch.index.translog.transfer.archive.ZipCentralDirectoryParser;
+import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.indices.replication.common.ReplicationType;
@@ -70,92 +70,99 @@ import static org.mockito.Mockito.when;
 public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
 
     /** Count archive blobs only; ignores filesystem metadata (e.g. .DS_Store on macOS). */
-    private static long zipBlobCount(Map<String, BlobMetadata> blobs) {
-        return blobs.keySet().stream().filter(name -> name.endsWith(".zip")).count();
+    private static long archiveBlobCount(Map<String, BlobMetadata> blobs) {
+        return blobs.keySet().stream().filter(name -> name.endsWith(".tar")).count();
     }
 
     public void testBuildArchiveFromEntries() throws IOException {
         TranslogArchiveCollector collector = new TranslogArchiveCollector(mock(IndicesService.class));
         String path = "idx-uuid/0/1/translog-2.tlog";
         byte[] content = "translog bytes".getBytes(StandardCharsets.UTF_8);
-        byte[] zipBytes = collector.buildArchiveFromEntries(Collections.singletonList(ArchiveBuilder.fromBytes(path, content)));
-        assertTrue(zipBytes.length > 0);
-        long tailStart = Math.max(0, zipBytes.length - 4096);
-        byte[] tail = Arrays.copyOfRange(zipBytes, (int) tailStart, zipBytes.length);
-        List<ArchiveEntry> entries = ZipCentralDirectoryParser.parse(tail, tailStart);
-        assertThat(entries, hasSize(1));
-        assertThat(entries.get(0).getPath(), equalTo(path));
-        assertThat(entries.get(0).getDataLength(), equalTo((long) content.length));
+        byte[] tarBytes = collector.buildArchiveFromEntries(Collections.singletonList(TarArchiveBuilder.fromBytes(path, content)));
+        assertTrue("TAR should be non-empty", tarBytes.length > 0);
+
+        // Verify TAR index (first entry is _index, second is the actual entry)
+        List<TarArchiveBuilder.EntryLocation> locations = TarArchiveBuilder.parseIndex(
+            Arrays.copyOfRange(tarBytes, TarArchiveBuilder.TAR_BLOCK, tarBytes.length)
+        );
+        assertThat("TAR index should have one entry", locations, hasSize(1));
+        assertThat(locations.get(0).getPath(), equalTo(path));
+        assertThat(locations.get(0).getDataLength(), equalTo((long) content.length));
+        // Verify actual data at the recorded offset
         byte[] extracted = Arrays.copyOfRange(
-            zipBytes,
-            (int) entries.get(0).getDataOffset(),
-            (int) (entries.get(0).getDataOffset() + entries.get(0).getDataLength())
+            tarBytes,
+            (int) locations.get(0).getDataOffset(),
+            (int) (locations.get(0).getDataOffset() + locations.get(0).getDataLength())
         );
         assertArrayEquals(content, extracted);
     }
 
     /**
-     * Integration-style test: upload archive to real FsBlobStore, then verify blob exists
-     * and central directory at end of blob is parseable (Step 6 plan).
+     * Integration-style test: upload TAR archive to real FsBlobStore, then verify blob exists
+     * and TAR index at head of blob is parseable.
      */
-    public void testUploadArchiveToBlobStoreAndParseCentralDirectory() throws IOException {
+    public void testUploadArchiveToBlobStoreAndParseTarIndex() throws IOException {
         String path = "idx-uuid/0/1/translog-2.tlog";
         byte[] content = "translog bytes".getBytes(StandardCharsets.UTF_8);
         TranslogArchiveCollector collector = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] zipBytes = collector.buildArchiveFromEntries(Collections.singletonList(ArchiveBuilder.fromBytes(path, content)));
-        assertTrue(zipBytes.length > 0);
+        byte[] tarBytes = collector.buildArchiveFromEntries(Collections.singletonList(TarArchiveBuilder.fromBytes(path, content)));
+        assertTrue("TAR should be non-empty", tarBytes.length > 0);
 
         BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
         ThreadPool threadPool = new TestThreadPool(getClass().getName());
         try {
             TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
             String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashPrefix = RemoteStoreEnums.PathHashAlgorithm.hashForTranslogArchive(
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_BASE64,
-                "translog_zip",
-                "idx-uuid",
-                "node-1"
+            // New hierarchical path: txlog/{day}/{minute}/
+            BlobPath archivePath = TranslogArchivePathHelper.tarBlobDir(new BlobPath().add(uniqueBase), java.time.Instant.now());
+            String blobName = TranslogArchivePathHelper.tarBlobName(java.time.Instant.now(), "test-node-1");
+            transferService.uploadBlob(
+                new FileSnapshot.TransferFileSnapshot(blobName, tarBytes, 0L),
+                archivePath,
+                WritePriority.HIGH
             );
-            BlobPath archivePath = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashPrefix).add("0");
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("batch1.zip", zipBytes, 0L), archivePath, WritePriority.HIGH);
 
             BlobContainer container = blobStore.blobContainer(archivePath);
             Map<String, BlobMetadata> blobs = container.listBlobs();
             assertThat(blobs, notNullValue());
-            assertThat("one archive blob", zipBlobCount(blobs), equalTo(1L));
-            String blobName = blobs.keySet().stream().filter(n -> n.endsWith(".zip")).findFirst().orElseThrow();
-            assertThat(blobName, endsWith(".zip"));
+            assertThat("one archive blob", archiveBlobCount(blobs), equalTo(1L));
+            String uploadedBlobName = blobs.keySet().stream().filter(n -> n.endsWith(".tar")).findFirst().orElseThrow();
+            assertThat(uploadedBlobName, endsWith(".tar"));
 
-            long size = blobs.get(blobName).length();
-            int tailLen = (int) Math.min(size, 4096);
-            long tailStartOffset = size - tailLen;
-            byte[] tail;
-            try (InputStream in = container.readBlob(blobName, tailStartOffset, tailLen)) {
-                tail = in.readAllBytes();
+            // Read TAR header and index
+            byte[] header;
+            try (InputStream in = container.readBlob(uploadedBlobName, 0, TarArchiveBuilder.TAR_BLOCK)) {
+                header = in.readAllBytes();
             }
-            List<ArchiveEntry> entries = ZipCentralDirectoryParser.parse(tail, tailStartOffset);
-            assertThat(entries, hasSize(1));
-            assertThat(entries.get(0).getPath(), equalTo(path));
-            assertThat(entries.get(0).getDataLength(), equalTo((long) content.length));
+            // Header contains the index size
+            long indexSize = Long.parseLong(new String(Arrays.copyOfRange(header, 124, 136), StandardCharsets.UTF_8).trim(), 8);
+            byte[] indexBytes;
+            try (InputStream in = container.readBlob(uploadedBlobName, TarArchiveBuilder.TAR_BLOCK, (int) indexSize)) {
+                indexBytes = in.readAllBytes();
+            }
+            List<TarArchiveBuilder.EntryLocation> locations = TarArchiveBuilder.parseIndex(indexBytes);
+            assertThat("TAR index should have one entry", locations, hasSize(1));
+            assertThat(locations.get(0).getPath(), equalTo(path));
+            assertThat(locations.get(0).getDataLength(), equalTo((long) content.length));
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
     }
 
     /**
-     * deleteArchivesOlderThanRetention deletes ZIPs with a timestamp older than the retention cutoff.
+     * deleteArchivesOlderThanRetention deletes TARs with a timestamp older than the retention cutoff.
      * Uses a blob name with a timestamp 1 hour in the past with 5-minute retention → should be deleted.
      */
     public void testDeleteArchivesOlderThanRetentionDeletesWhenPastRetention() throws IOException {
         String pathPrefix = "idx-uuid/0/1/";
         byte[] tlogContent = "tlog".getBytes(StandardCharsets.UTF_8);
         byte[] ckpContent = "ckp".getBytes(StandardCharsets.UTF_8);
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
-            ArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", tlogContent),
-            ArchiveBuilder.fromBytes(pathPrefix + "translog-2.ckp", ckpContent)
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+            TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", tlogContent),
+            TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.ckp", ckpContent)
         );
         TranslogArchiveCollector collector = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] zipBytes = collector.buildArchiveFromEntries(entries);
+        byte[] tarBytes = collector.buildArchiveFromEntries(entries);
 
         BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
         ThreadPool threadPool = new TestThreadPool(getClass().getName());
@@ -167,32 +174,32 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
             );
             String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
+            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
             // Blob name: timestamp 1 hour ago → past 5-minute retention
-            String oldBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(1))) + ".zip";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldBlobName, zipBytes, 0L), zipDir, WritePriority.HIGH);
-            assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
+            String oldBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(1))) + ".tar";
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldBlobName, tarBytes, 0L), tarDir, WritePriority.HIGH);
+            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
 
             long retentionMinutes = 5L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
             assertThat(deleted, equalTo(1));
-            assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(0L));
+            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(0L));
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
     }
 
     /**
-     * deleteArchivesOlderThanRetention keeps ZIPs with a timestamp within the retention window.
+     * deleteArchivesOlderThanRetention keeps TARs with a timestamp within the retention window.
      * Uses a blob name with current timestamp and 60-minute retention → should be kept.
      */
     public void testDeleteArchivesOlderThanRetentionKeepsWhenWithinRetention() throws IOException {
         String pathPrefix = "idx-uuid/0/1/";
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         TranslogArchiveCollector collector = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] zipBytes = collector.buildArchiveFromEntries(
-            Collections.singletonList(ArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", content))
+        byte[] tarBytes = collector.buildArchiveFromEntries(
+            Collections.singletonList(TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", content))
         );
 
         BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
@@ -205,16 +212,16 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
             );
             String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
+            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
             // Blob name: current timestamp → within 60-minute retention
-            String freshBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshBlobName, zipBytes, 0L), zipDir, WritePriority.HIGH);
+            String freshBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshBlobName, tarBytes, 0L), tarDir, WritePriority.HIGH);
 
             long retentionMinutes = 60L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
             assertThat(deleted, equalTo(0));
-            assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
+            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
@@ -365,17 +372,17 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         );
         assertThat(nameCaptor.getValue(), endsWith(".tar"));
         String uploadedPath = pathCaptor.getValue().buildAsString();
-        // Archive is index+node scoped: path must start with repo-root, not contain shardId
-        assertThat(uploadedPath, org.hamcrest.Matchers.startsWith("repo-root/translog/data/"));
+        // New hierarchical path: {base}/txlog/{day}/{minute}/
+        assertThat("archive path must use new txlog/ prefix", uploadedPath, org.hamcrest.Matchers.startsWith("repo-root/txlog/"));
         assertThat(
             "archive path must not contain shard id '0'",
             uploadedPath,
             org.hamcrest.Matchers.not(org.hamcrest.Matchers.matchesRegex(".*repo-root/[^/]+/[^/]+/0/.*"))
         );
-        assertThat(uploadedPath, org.hamcrest.Matchers.containsString("translog"));
-        assertThat(uploadedPath, org.hamcrest.Matchers.containsString("data"));
+        assertThat(uploadedPath, org.hamcrest.Matchers.containsString("txlog"));
+        assertThat(uploadedPath, org.hamcrest.Matchers.containsString("txlog"));
 
-        // No per-shard metadata upload — recovery uses ZIP comment (ArchiveCommentFormat) instead
+        // No per-shard metadata upload — recovery uses TAR _index (TarArchiveBuilder) instead
         verify(transferManager, org.mockito.Mockito.never()).uploadMetadata(any());
 
         // Verify NO individual per-shard translog upload happened
@@ -383,7 +390,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
     }
 
     /**
-     * RunBatch with two contributing shards: one ZIP upload, metadata upload for each shard.
+     * RunBatch with two contributing shards: one TAR upload, metadata upload for each shard.
      * (Code review: verifies metadata upload is invoked after successful archive upload.)
      */
     public void testRunBatchMultiShardOneZipAndMetadataPerShard() throws IOException {
@@ -492,7 +499,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             eq(WritePriority.HIGH),
             eq(null)
         );
-        // No per-shard metadata upload — recovery uses ZIP comment (ArchiveCommentFormat) instead
+        // No per-shard metadata upload — recovery uses TAR _index (TarArchiveBuilder) instead
         verify(transferManager, org.mockito.Mockito.never()).uploadMetadata(any());
 
         // Verify NO individual per-shard translog upload happened
@@ -788,12 +795,12 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         String pathPrefix = indexUuid + "/0/1/";
         byte[] tlogContent = "tlog".getBytes(StandardCharsets.UTF_8);
         byte[] ckpContent = "ckp".getBytes(StandardCharsets.UTF_8);
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
-            ArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", tlogContent),
-            ArchiveBuilder.fromBytes(pathPrefix + "translog-2.ckp", ckpContent)
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+            TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", tlogContent),
+            TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.ckp", ckpContent)
         );
         TranslogArchiveCollector collectorForBuild = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] zipBytes = collectorForBuild.buildArchiveFromEntries(entries);
+        byte[] tarBytes = collectorForBuild.buildArchiveFromEntries(entries);
 
         BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
         ThreadPool threadPool = new TestThreadPool(getClass().getName());
@@ -801,16 +808,14 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
             String uniqueBase = "base-" + randomAlphaOfLength(12);
             BlobPath baseTranslogPath = new BlobPath().add(uniqueBase);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
-                indexUuid,
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-            );
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = baseTranslogPath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
-            // Blob name: 2 hours ago → past any reasonable retention
-            String oldBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(2))) + ".zip";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldBlobName, zipBytes, 0L), zipDir, WritePriority.HIGH);
-            assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
+
+            // Upload old blob at the NEW hierarchical path (txlog/day/minute/)
+            // Timestamp: 2 hours ago → past any reasonable retention
+            Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
+            BlobPath oldBlobDir = TranslogArchivePathHelper.tarBlobDir(baseTranslogPath, twoHoursAgo);
+            String oldBlobName = TranslogArchivePathHelper.tarBlobName(twoHoursAgo, "node-1");
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldBlobName, tarBytes, 0L), oldBlobDir, WritePriority.HIGH);
+            assertThat(archiveBlobCount(blobStore.blobContainer(oldBlobDir).listBlobs()), equalTo(1L));
 
             TranslogTransferManager transferManager = mock(TranslogTransferManager.class);
             when(transferManager.getTransferService()).thenReturn(transferService);
@@ -840,8 +845,8 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
             collector.runRetentionForTesting();
 
-            Map<String, BlobMetadata> after = blobStore.blobContainer(zipDir).listBlobs();
-            assertThat("archive past retention should be deleted by runArchiveRetention", zipBlobCount(after), equalTo(0L));
+            Map<String, BlobMetadata> after = blobStore.blobContainer(oldBlobDir).listBlobs();
+            assertThat("archive past retention should be deleted by runArchiveRetention", archiveBlobCount(after), equalTo(0L));
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
@@ -1002,12 +1007,12 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(snapshot.getTranslogFileSnapshotWithMetadata()).thenReturn(java.util.Collections.singleton(tlogSnapshot));
         when(snapshot.getCheckpointFileSnapshots()).thenReturn(java.util.Collections.singleton(ckpSnapshot));
 
-        java.util.List<ArchiveBuilder.ArchiveBuildEntry> entries = TranslogArchiveCollector.snapshotToEntries(snapshot, "idx-uuid/0");
+        java.util.List<TarArchiveBuilder.ArchiveBuildEntry> entries = TranslogArchiveCollector.snapshotToEntries(snapshot, "idx-uuid/0");
 
         assertThat(entries, hasSize(2));
         // Verify paths include pathPrefix/primaryTerm/filename
         java.util.Set<String> paths = new java.util.HashSet<>();
-        for (ArchiveBuilder.ArchiveBuildEntry entry : entries) {
+        for (TarArchiveBuilder.ArchiveBuildEntry entry : entries) {
             paths.add(entry.getPath());
         }
         assertTrue("should contain tlog path", paths.stream().anyMatch(p -> p.startsWith("idx-uuid/0/3/") && p.endsWith(".tlog")));
@@ -1018,15 +1023,15 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
      * deleteArchivesOlderThanRetentionNewPath with empty retention bounds map: no-op, no archives deleted.
      */
     /**
-     * deleteArchivesOlderThanRetention with a fresh ZIP (current timestamp) and long retention → no deletion.
-     * Verifies that ZIPs within the retention window are not touched.
+     * deleteArchivesOlderThanRetention with a fresh TAR (current timestamp) and long retention → no deletion.
+     * Verifies that TARs within the retention window are not touched.
      */
     public void testDeleteArchivesWithFreshZipIsNoOp() throws IOException {
         String pathPrefix = "idx-uuid/0/1/";
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         TranslogArchiveCollector collectorForBuild = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] zipBytes = collectorForBuild.buildArchiveFromEntries(
-            Collections.singletonList(ArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", content))
+        byte[] tarBytes = collectorForBuild.buildArchiveFromEntries(
+            Collections.singletonList(TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", content))
         );
 
         BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
@@ -1039,56 +1044,56 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
             );
             String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
+            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
-            // Fresh ZIP → within 60-minute retention window
-            String freshName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshName, zipBytes, 0L), zipDir, WritePriority.HIGH);
-            assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
+            // Fresh TAR → within 60-minute retention window
+            String freshName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshName, tarBytes, 0L), tarDir, WritePriority.HIGH);
+            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
 
             long retentionMinutes = 60L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
-            assertThat("fresh ZIP within retention should not be deleted", deleted, equalTo(0));
-            assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
+            assertThat("fresh TAR within retention should not be deleted", deleted, equalTo(0));
+            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
     }
 
     /**
-     * Retention with mixed old/new ZIPs by timestamp: old ZIPs (past retention) are deleted, new ZIPs kept.
+     * Retention with mixed old/new TARs by timestamp: old TARs (past retention) are deleted, new TARs kept.
      */
     public void testRetentionWithMixedOldNewZips() throws IOException {
         String indexUuid = "idx-uuid";
         String pathPrefix0 = indexUuid + "/0/1/";
         String pathPrefix1 = indexUuid + "/1/1/";
 
-        // Old ZIP: gen 2 (past retention bounds of minGen=1, maxGen=3)
+        // Old TAR: gen 2 (past retention bounds of minGen=1, maxGen=3)
         byte[] oldContent = "old".getBytes(StandardCharsets.UTF_8);
         TranslogArchiveCollector collectorForBuild = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] oldZipBytes = collectorForBuild.buildArchiveFromEntries(
+        byte[] oldTarBytes = collectorForBuild.buildArchiveFromEntries(
             Arrays.asList(
-                ArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.tlog", oldContent),
-                ArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.ckp", oldContent)
+                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.tlog", oldContent),
+                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.ckp", oldContent)
             )
         );
 
-        // New ZIP: gen 10 (well beyond retention bounds, should be kept because it's newer)
+        // New TAR: gen 10 (well beyond retention bounds, should be kept because it's newer)
         byte[] newContent = "new".getBytes(StandardCharsets.UTF_8);
-        byte[] newZipBytes = collectorForBuild.buildArchiveFromEntries(
+        byte[] newTarBytes = collectorForBuild.buildArchiveFromEntries(
             Arrays.asList(
-                ArchiveBuilder.fromBytes(pathPrefix0 + "translog-10.tlog", newContent),
-                ArchiveBuilder.fromBytes(pathPrefix0 + "translog-10.ckp", newContent)
+                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-10.tlog", newContent),
+                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-10.ckp", newContent)
             )
         );
 
-        // Mixed ZIP: gen 2 for shard 0 (past retention for shard 0) AND gen 10 for shard 1 (kept)
-        byte[] mixedZipBytes = collectorForBuild.buildArchiveFromEntries(
+        // Mixed TAR: gen 2 for shard 0 (past retention for shard 0) AND gen 10 for shard 1 (kept)
+        byte[] mixedTarBytes = collectorForBuild.buildArchiveFromEntries(
             Arrays.asList(
-                ArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.tlog", oldContent),
-                ArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.ckp", oldContent),
-                ArchiveBuilder.fromBytes(pathPrefix1 + "translog-10.tlog", newContent),
-                ArchiveBuilder.fromBytes(pathPrefix1 + "translog-10.ckp", newContent)
+                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.tlog", oldContent),
+                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.ckp", oldContent),
+                TarArchiveBuilder.fromBytes(pathPrefix1 + "translog-10.tlog", newContent),
+                TarArchiveBuilder.fromBytes(pathPrefix1 + "translog-10.ckp", newContent)
             )
         );
 
@@ -1102,26 +1107,26 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
             );
             String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
+            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
-            // Old ZIPs: timestamps 2 hours ago — past 5-minute retention
+            // Old TARs: timestamps 2 hours ago — past 5-minute retention
             Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
-            String oldName1 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo) + ".zip";
-            String oldName2 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(1)) + ".zip";
-            // New ZIP: current timestamp — within retention
-            String newName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
+            String oldName1 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo) + ".tar";
+            String oldName2 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(1)) + ".tar";
+            // New TAR: current timestamp — within retention
+            String newName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
 
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldName1, oldZipBytes, 0L), zipDir, WritePriority.HIGH);
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldName2, mixedZipBytes, 0L), zipDir, WritePriority.HIGH);
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(newName, newZipBytes, 0L), zipDir, WritePriority.HIGH);
-            assertThat("should have 3 ZIPs before retention", zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(3L));
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldName1, oldTarBytes, 0L), tarDir, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldName2, mixedTarBytes, 0L), tarDir, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(newName, newTarBytes, 0L), tarDir, WritePriority.HIGH);
+            assertThat("should have 3 TARs before retention", archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(3L));
 
-            // 5-minute retention: 2 old ZIPs deleted, 1 new ZIP kept
+            // 5-minute retention: 2 old TARs deleted, 1 new TAR kept
             long retentionMinutes = 5L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
-            assertThat("2 old ZIPs should be deleted", deleted, equalTo(2));
-            assertThat("1 new ZIP should remain", zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
-            assertThat("new ZIP should still be present", blobStore.blobContainer(zipDir).listBlobs().containsKey(newName), equalTo(true));
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
+            assertThat("2 old TARs should be deleted", deleted, equalTo(2));
+            assertThat("1 new TAR should remain", archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
+            assertThat("new TAR should still be present", blobStore.blobContainer(tarDir).listBlobs().containsKey(newName), equalTo(true));
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
@@ -1220,20 +1225,23 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             String uniqueBase = "base-" + randomAlphaOfLength(12);
             BlobPath basePath = new BlobPath().add(uniqueBase);
 
-            // Deleted index — upload ZIPs to its archive dir
-            String deletedIndexUUID = "deleted-" + randomAlphaOfLength(6);
+            // Deleted index — upload TARs using the new hierarchical txlog path.
+            // Since new GC scans txlog/ root and deletes by timestamp, orphaned blobs are cleaned up
+            // purely by age regardless of which index they belonged to.
             String nodeId = "node-1";
-            String deletedHashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(deletedIndexUUID, hashAlgo);
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, hashAlgo);
-            BlobPath deletedZipDir = basePath.add("translog").add("data").add(deletedHashTypeIndex).add(hashNodeId);
-            byte[] zipBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(Collections.emptyList());
-            // Both timestamps are well past the 5-minute safety-floor retention so they will both
-            // be deleted by the pure-timestamp GC pass on this orphaned dir.
-            String blob1 = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(2))) + ".zip";
-            String blob2 = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(1))) + ".zip";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blob1, zipBytes, 0L), deletedZipDir, WritePriority.HIGH);
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blob2, zipBytes, 0L), deletedZipDir, WritePriority.HIGH);
-            assertThat(zipBlobCount(blobStore.blobContainer(deletedZipDir).listBlobs()), equalTo(2L));
+            byte[] tarBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(Collections.emptyList());
+            // Both timestamps are well past the 2h retention window so they will both be deleted.
+            Instant threeHoursAgo = Instant.now().minus(Duration.ofHours(3));
+            Instant twoAndHalfHoursAgo = Instant.now().minus(Duration.ofMinutes(150));
+            BlobPath deletedBlobDir1 = TranslogArchivePathHelper.tarBlobDir(basePath, threeHoursAgo);
+            BlobPath deletedBlobDir2 = TranslogArchivePathHelper.tarBlobDir(basePath, twoAndHalfHoursAgo);
+            String blob1 = TranslogArchivePathHelper.tarBlobName(threeHoursAgo, "deleted-node");
+            String blob2 = TranslogArchivePathHelper.tarBlobName(twoAndHalfHoursAgo, "deleted-node");
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blob1, tarBytes, 0L), deletedBlobDir1, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blob2, tarBytes, 0L), deletedBlobDir2, WritePriority.HIGH);
+            assertThat(archiveBlobCount(blobStore.blobContainer(deletedBlobDir1).listBlobs()), equalTo(1L));
+            assertThat(archiveBlobCount(blobStore.blobContainer(deletedBlobDir2).listBlobs()), equalTo(1L));
+            // (deletedBlobDir1 and deletedBlobDir2 are used directly in assertions below)
 
             // Live index — needs a shard with TranslogTransferManager to provide transferService + basePath
             IndexMetadata metadata = IndexMetadata.builder("live-index")
@@ -1284,8 +1292,13 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
 
             // Orphaned ZIPs for the deleted index should all be gone
             assertThat(
-                "Orphaned ZIPs for deleted index should be removed by S3 scan",
-                zipBlobCount(blobStore.blobContainer(deletedZipDir).listBlobs()),
+                "Orphaned TAR at 2h-old minute-dir should be removed by S3 scan",
+                archiveBlobCount(blobStore.blobContainer(deletedBlobDir1).listBlobs()),
+                equalTo(0L)
+            );
+            assertThat(
+                "Orphaned TAR at 1h-old minute-dir should be removed by S3 scan",
+                archiveBlobCount(blobStore.blobContainer(deletedBlobDir2).listBlobs()),
                 equalTo(0L)
             );
         } finally {
@@ -1294,12 +1307,12 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
     }
 
     /**
-     * Fix: early-exit in deleteArchivesOlderThanRetention when a fresh ZIP is encountered.
+     * Fix: early-exit in deleteArchivesOlderThanRetention when a fresh TAR is encountered.
      * Verifies that once a ZIP within retention is encountered, pagination stops immediately —
      * remaining ZIPs (also within retention, sorted after) are not listed or deleted.
      *
-     * Scenario: 2 old ZIPs (past retention) + 1 fresh ZIP → early-exit after deleting 2 old ones.
-     * The fresh ZIP being encountered should prevent checking any further pages.
+     * Scenario: 2 old TARs (past retention) + 1 fresh TAR → early-exit after deleting 2 old ones.
+     * The fresh TAR being encountered should prevent checking any further pages.
      */
     public void testDeleteArchivesEarlyExitOnFreshZip() throws IOException {
         BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
@@ -1312,41 +1325,41 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
             );
             String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
+            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
-            byte[] zipBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(
-                Collections.singletonList(ArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8)))
+            byte[] tarBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(
+                Collections.singletonList(TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8)))
             );
 
-            // Two old ZIPs: past 5-minute retention → should be deleted
+            // Two old TARs: past 5-minute retention → should be deleted
             Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
-            String old1 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo) + ".zip";
-            String old2 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(1)) + ".zip";
-            // One fresh ZIP: within retention → should stop further pagination
-            String fresh = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
+            String old1 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo) + ".tar";
+            String old2 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(1)) + ".tar";
+            // One fresh TAR: within retention → should stop further pagination
+            String fresh = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
 
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(old1, zipBytes, 0L), zipDir, WritePriority.HIGH);
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(old2, zipBytes, 0L), zipDir, WritePriority.HIGH);
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(fresh, zipBytes, 0L), zipDir, WritePriority.HIGH);
-            assertThat(zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(3L));
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(old1, tarBytes, 0L), tarDir, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(old2, tarBytes, 0L), tarDir, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(fresh, tarBytes, 0L), tarDir, WritePriority.HIGH);
+            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(3L));
 
             long retentionMinutes = 5L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, retentionMinutes);
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
 
-            assertThat("2 old ZIPs should be deleted, fresh ZIP should stop further iteration", deleted, equalTo(2));
-            assertThat("fresh ZIP should still be present", zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()), equalTo(1L));
-            assertThat("fresh ZIP should not be deleted", blobStore.blobContainer(zipDir).listBlobs().containsKey(fresh), equalTo(true));
+            assertThat("2 old TARs should be deleted, fresh TAR should stop further iteration", deleted, equalTo(2));
+            assertThat("fresh TAR should still be present", archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
+            assertThat("fresh TAR should not be deleted", blobStore.blobContainer(tarDir).listBlobs().containsKey(fresh), equalTo(true));
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
     }
 
     /**
-     * When there are more than MAX_ARCHIVE_BLOBS_PER_NODE (500) expired ZIPs, the loop must
+     * When there are more than MAX_ARCHIVE_BLOBS_PER_NODE (500) expired TARs, the loop must
      * re-list after each batch of deletions until all expired ZIPs are gone.
      *
-     * Scenario: 600 old ZIPs (all past retention) + 1 fresh ZIP.
-     * Expected: all 600 old ZIPs deleted in one GC cycle (2 re-list passes), fresh ZIP kept.
+     * Scenario: 600 old TARs (all past retention) + 1 fresh TAR.
+     * Expected: all 600 old TARs deleted in one GC cycle (2 re-list passes), fresh TAR kept.
      */
     public void testDeleteArchivesMoreThan500ExpiredZipsDeletedInOneGcCycle() throws IOException {
         BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
@@ -1359,42 +1372,42 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
                 RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
             );
             String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath zipDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
+            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
-            byte[] zipBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(
-                Collections.singletonList(ArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8)))
+            byte[] tarBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(
+                Collections.singletonList(TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8)))
             );
 
             // Upload 600 expired ZIPs (sorted ascending: each 1ms apart, all > 2h ago)
             int expiredCount = 600;
             Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
             for (int i = 0; i < expiredCount; i++) {
-                String name = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(i)) + ".zip";
-                transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(name, zipBytes, 0L), zipDir, WritePriority.HIGH);
+                String name = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(i)) + ".tar";
+                transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(name, tarBytes, 0L), tarDir, WritePriority.HIGH);
             }
 
-            // Upload 1 fresh ZIP (within retention)
-            String freshName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".zip";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshName, zipBytes, 0L), zipDir, WritePriority.HIGH);
+            // Upload 1 fresh TAR (within retention)
+            String freshName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshName, tarBytes, 0L), tarDir, WritePriority.HIGH);
 
             assertThat(
                 "Should have 601 ZIPs before GC",
-                zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()),
+                archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()),
                 equalTo((long) expiredCount + 1)
             );
 
-            // Run GC with 5-minute retention: all 600 old ZIPs should be deleted in one cycle
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, zipDir, 5L);
+            // Run GC with 5-minute retention: all 600 old TARs should be deleted in one cycle
+            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, 5L);
 
             assertThat("All 600 expired ZIPs should be deleted in one GC cycle", deleted, equalTo(expiredCount));
             assertThat(
-                "Only 1 fresh ZIP should remain",
-                zipBlobCount(blobStore.blobContainer(zipDir).listBlobs()),
+                "Only 1 fresh TAR should remain",
+                archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()),
                 equalTo(1L)
             );
             assertThat(
                 "Fresh ZIP should still be present",
-                blobStore.blobContainer(zipDir).listBlobs().containsKey(freshName),
+                blobStore.blobContainer(tarDir).listBlobs().containsKey(freshName),
                 equalTo(true)
             );
         } finally {
@@ -1487,11 +1500,11 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
      * Fix: gc_interval default is 5 minutes.
      * Verifies the setting default is 5m so that the retention GC doesn't run too frequently.
      */
-    public void testTranslogArchiveGcIntervalDefaultIsOneMinute() {
-        // The default gc_interval should be 5 minutes (not 1 minute) to reduce S3 LIST storms.
+    public void testTranslogArchiveGcIntervalDefaultIsTenMinutes() {
+        // The default gc_interval was changed to 10 minutes to reduce S3 LIST storms.
         TimeValue defaultInterval = RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.getDefault(
             org.opensearch.common.settings.Settings.EMPTY
         );
-        assertThat("gc_interval default should be 1 minute", defaultInterval, equalTo(TimeValue.timeValueMinutes(1)));
+        assertThat("gc_interval default should be 10 minutes", defaultInterval, equalTo(TimeValue.timeValueMinutes(10)));
     }
 }

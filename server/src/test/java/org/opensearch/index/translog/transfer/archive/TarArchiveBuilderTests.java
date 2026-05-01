@@ -25,8 +25,8 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
 
     // ---- helpers ----
 
-    private static ArchiveBuilder.ArchiveBuildEntry entry(String path, byte[] content) {
-        return ArchiveBuilder.fromBytes(path, content);
+    private static TarArchiveBuilder.ArchiveBuildEntry entry(String path, byte[] content) {
+        return TarArchiveBuilder.fromBytes(path, content);
     }
 
     private static byte[] extract(byte[] tarBytes, long dataOffset, long dataLength) {
@@ -43,7 +43,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
 
     public void testComputeLayoutSingleEntry() throws IOException {
         byte[] content = "hello translog".getBytes(StandardCharsets.UTF_8);
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = List.of(entry("shard/0/1/translog-1.tlog", content));
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(entry("shard/0/1/translog-1.tlog", content));
 
         TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(entries);
 
@@ -65,7 +65,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
         byte[] c2 = "second content longer".getBytes(StandardCharsets.UTF_8);
         byte[] c3 = new byte[1000];
 
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
             entry("uuid/0/1/translog-1.tlog", c1),
             entry("uuid/0/1/translog-1.ckp", c2),
             entry("uuid/0/1/translog-2.tlog", c3)
@@ -94,7 +94,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
         byte[] c1 = "translog data here".getBytes(StandardCharsets.UTF_8);
         byte[] c2 = "checkpoint data".getBytes(StandardCharsets.UTF_8);
 
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
             entry("uuid/0/1/translog-3.tlog", c1),
             entry("uuid/0/1/translog-3.ckp", c2)
         );
@@ -127,7 +127,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
         byte[] c1 = "the actual translog bytes go here".getBytes(StandardCharsets.UTF_8);
         byte[] c2 = "checkpoint bytes".getBytes(StandardCharsets.UTF_8);
 
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
             entry("uuid/0/1/translog-5.tlog", c1),
             entry("uuid/0/1/translog-5.ckp", c2)
         );
@@ -148,7 +148,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
     public void testLayoutIsDeterministic() throws IOException {
         byte[] c1 = new byte[100];
         byte[] c2 = new byte[200];
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
             entry("a/b/c.tlog", c1),
             entry("a/b/c.ckp", c2)
         );
@@ -179,7 +179,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
     public void testLargeFile() throws IOException {
         byte[] largeContent = randomBytes(100 * 1024); // 100 KB
 
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = List.of(entry("uuid/0/1/translog-big.tlog", largeContent));
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(entry("uuid/0/1/translog-big.tlog", largeContent));
         TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(entries);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         TarArchiveBuilder.build(out, layout, entries);
@@ -195,7 +195,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
         byte[] c2 = randomBytes(randomIntBetween(1, 2000));
         byte[] c3 = randomBytes(randomIntBetween(1, 2000));
 
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
             entry("s/0/1/t-1.tlog", c1),
             entry("s/0/1/t-1.ckp", c2),
             entry("s/0/1/t-2.tlog", c3)
@@ -213,7 +213,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
         // Verify parsed index offsets point to exact byte positions in the TAR
         byte[] c1 = randomBytes(randomIntBetween(50, 500));
         byte[] c2 = randomBytes(randomIntBetween(50, 500));
-        List<ArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
             entry("x/0/1/t.tlog", c1),
             entry("x/0/1/t.ckp", c2)
         );

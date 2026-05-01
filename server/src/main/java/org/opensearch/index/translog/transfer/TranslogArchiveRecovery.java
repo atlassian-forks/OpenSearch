@@ -11,14 +11,13 @@ package org.opensearch.index.translog.transfer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.LatchedActionListener;
+import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.translog.Translog;
-import org.opensearch.index.translog.transfer.archive.ArchiveCommentFormat;
 import org.opensearch.index.translog.transfer.archive.ArchiveIndexEntry;
 import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 
@@ -27,11 +26,14 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -52,111 +54,48 @@ public final class TranslogArchiveRecovery {
     private static final Logger logger = LogManager.getLogger(TranslogArchiveRecovery.class);
 
     /** Maximum bytes to read from ZIP tail for EOCD comment (covers most comments). */
-    static final int EOCD_TAIL_READ_SIZE = 8192;
     /** Minimum EOCD size (22 bytes fixed header). */
-    private static final int EOCD_MIN_SIZE = 22;
     private static final int MAX_ZIPS_PER_BUCKET = 10_000;
+
+    /** Max blobs to list per minute-dir during hierarchical recovery. */
+    private static final int MAX_BLOBS_PER_MINUTE_DIR = 5_000;
+    /** Safety margin: start scanning this many minutes before lastSegmentTimestamp. */
+    public static final int RECOVERY_START_MARGIN_MINUTES = 2;
 
     private TranslogArchiveRecovery() {}
 
-    /**
-     * Recover translog files for a specific shard from archive ZIPs, discovering the generation range
-     * from the latest ZIP comments. Used when no per-shard metadata is available (coordinator mode).
-     *
-     * @param transferService  S3/blob transfer service
-     * @param archiveBasePath  repository root path (no index/shard components)
-     * @param indexUUID        index UUID
-     * @param shardId          shard ID
-     * @param location         local FS directory to write recovered files
-     * @param pathHashAlgorithm hash algorithm for archive path
-     * @throws IOException on S3 or I/O errors
-     */
-    public static void recover(
-        TransferService transferService,
-        BlobPath archiveBasePath,
-        String indexUUID,
-        int shardId,
-        Path location,
-        RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm
-    ) throws IOException {
-        logger.info("Recovering translog from archive (no metadata): index={} shard={}", indexUUID, shardId);
-
-        String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
-        // nodeId is not available in the no-metadata scan path, so we must LIST {hashTypeIndex}/
-        // to find all hashNodeId dirs (one per node that uploaded for this index).
-        BlobPath indexPath = archiveBasePath.add("translog").add("data").add(hashTypeIndex);
-        Set<String> nodeDirs = transferService.listFolders(indexPath);
-        if (nodeDirs == null || nodeDirs.isEmpty()) {
-            logger.info("No archive node dirs found at {}; nothing to recover", indexPath.buildAsString());
-            return;
-        }
-
-        List<ZipRef> allZips = new ArrayList<>();
-        for (String nodeDir : nodeDirs) {
-            BlobPath nodePath = indexPath.add(nodeDir);
-            List<BlobMetadata> blobs = listBlobsSorted(transferService, nodePath, MAX_ZIPS_PER_BUCKET);
-            for (BlobMetadata blob : blobs) {
-                if (TranslogArchivePathHelper.isArchiveBlob(blob.name())) {
-                    allZips.add(new ZipRef(nodePath, blob.name(), blob.length()));
-                }
-            }
-        }
-
-        if (allZips.isEmpty()) {
-            logger.info("No archive ZIPs/TARs found; nothing to recover");
-            return;
-        }
-
-        allZips.sort((a, b) -> a.blobName.compareTo(b.blobName));
-
-        // Scan ALL ZIPs to discover the full generation range for this shard.
-        // In coordinator (school bus) mode, each ZIP typically has one generation per shard,
-        // so we must scan across ZIPs to find the true min/max generation range.
-        long minGeneration = Long.MAX_VALUE;
-        long maxGeneration = Long.MIN_VALUE;
-        boolean found = false;
-
-        for (ZipRef zip : allZips) {
-            List<ArchiveIndexEntry> entries = readZipComment(transferService, zip);
-            for (ArchiveIndexEntry entry : entries) {
-                if (entry.getShardId() == shardId) {
-                    found = true;
-                    minGeneration = Math.min(minGeneration, entry.getGeneration());
-                    maxGeneration = Math.max(maxGeneration, entry.getGeneration());
-                }
-            }
-        }
-
-        if (!found) {
-            logger.info("No entries for shard {} in any archive ZIP; nothing to recover", shardId);
-            return;
-        }
-
-        logger.info(
-            "Discovered generation range for shard {}: [{}-{}] across {} ZIPs",
-            shardId,
-            minGeneration,
-            maxGeneration,
-            allZips.size()
-        );
-
-        recover(transferService, archiveBasePath, indexUUID, shardId, minGeneration, maxGeneration, location, pathHashAlgorithm);
-    }
+    // ── New hierarchical-path recovery ────────────────────────────────────────
 
     /**
-     * Recover translog files for a specific shard from archive ZIPs.
+     * Recovers translog files for a shard from the new hierarchical TAR path
+     * ({@code {base}/txlog/{day}/{minute}/*.tar}), starting from a timestamp-bounded scan.
      *
-     * @param transferService  S3/blob transfer service
-     * @param archiveBasePath  repository root path (no index/shard components)
-     * @param indexUUID        index UUID
-     * @param shardId          shard ID
-     * @param minGeneration    minimum generation to recover (inclusive)
-     * @param maxGeneration    maximum generation to recover (inclusive)
-     * @param location         local FS directory to write recovered files
-     * @param pathHashAlgorithm hash algorithm for archive path
-     * @throws IOException on S3 or I/O errors
+     * <p>Algorithm:
+     * <ol>
+     *   <li>Compute start = {@code lastSegmentTimestamp - RECOVERY_START_MARGIN_MINUTES}</li>
+     *   <li>LIST day-dirs under {@code txlog/} from today and yesterday if spanning midnight.</li>
+     *   <li>For each relevant minute-dir (≥ start), LIST blobs and read each TAR's binary
+     *       {@code _index} (cached by {@link TranslogArchiveIndexCache}).</li>
+     *   <li>Filter entries by {@code indexUUID/shardId} path prefix.</li>
+     *   <li>For each generation in [{@code minGeneration}, {@code maxGeneration}], range-read
+     *       the tlog + ckp data from the matching TAR.</li>
+     * </ol>
+     *
+     * @param transferService       blob transfer service
+     * @param archiveBasePath       repository base path (the root, not txlog/)
+     * @param indexUUID             index UUID (used to filter TAR entries)
+     * @param shardId               shard ID (used to filter TAR entries)
+     * @param minGeneration         first generation to recover (inclusive)
+     * @param maxGeneration         last generation to recover (inclusive)
+     * @param location              local directory to write recovered files
+     * @param lastSegmentTimestamp  timestamp of the last successful segment upload;
+     *                              recovery scans from {@code lastSegmentTimestamp - margin}
+     * @param cache                 shared LRU index cache (may be null to disable caching)
+     * @return true if all required generations were recovered, false if some were missing
+     *         (caller should fall back to the legacy recovery path)
+     * @throws IOException on transfer errors
      */
-    public static void recover(
+    public static boolean recoverFromHierarchicalPath(
         TransferService transferService,
         BlobPath archiveBasePath,
         String indexUUID,
@@ -164,165 +103,179 @@ public final class TranslogArchiveRecovery {
         long minGeneration,
         long maxGeneration,
         Path location,
-        RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm
+        Instant lastSegmentTimestamp,
+        TranslogArchiveIndexCache cache
     ) throws IOException {
-        logger.info("Recovering translog from archive: index={} shard={} gen=[{}-{}]", indexUUID, shardId, minGeneration, maxGeneration);
+        Instant startFrom = lastSegmentTimestamp.minus(Duration.ofMinutes(RECOVERY_START_MARGIN_MINUTES));
+        BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(archiveBasePath);
 
-        String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
-        // LIST {hashTypeIndex}/ to find all hashNodeId dirs (one per node that uploaded for this index).
-        BlobPath indexPath = archiveBasePath.add("translog").add("data").add(hashTypeIndex);
-        Set<String> nodeDirs = transferService.listFolders(indexPath);
-        if (nodeDirs == null || nodeDirs.isEmpty()) {
-            throw new IOException("No archive node dirs found at " + indexPath.buildAsString());
+        logger.info(
+            "Hierarchical recovery: index={} shard={} gen=[{}-{}] startFrom={}",
+            indexUUID, shardId, minGeneration, maxGeneration, startFrom
+        );
+
+        // Collect all relevant TARs from minute-dirs at or after startFrom
+        List<ZipRef> tars = collectTarsFromHierarchicalPath(transferService, txlogRoot, startFrom);
+        if (tars.isEmpty()) {
+            logger.info("No TAR blobs found in hierarchical path from {}, falling back", startFrom);
+            return false;
         }
 
-        // Collect all ZIP names across node dirs (sorted by timestamp = sorted by name)
-        List<ZipRef> allZips = new ArrayList<>();
-        for (String nodeDir : nodeDirs) {
-            BlobPath nodePath = indexPath.add(nodeDir);
-            List<BlobMetadata> blobs = listBlobsSorted(transferService, nodePath, MAX_ZIPS_PER_BUCKET);
-            for (BlobMetadata blob : blobs) {
-                if (TranslogArchivePathHelper.isArchiveBlob(blob.name())) {
-                    allZips.add(new ZipRef(nodePath, blob.name(), blob.length()));
-                }
-            }
-        }
-
-        if (allZips.isEmpty()) {
-            throw new IOException("No archive ZIPs/TARs found under " + indexPath.buildAsString());
-        }
-
-        // Sort by blob name (timestamp-based, lexicographic = chronological)
-        allZips.sort((a, b) -> a.blobName.compareTo(b.blobName));
-
-        // Find ZIPs containing the required generation range using binary search
+        // Build a map: generation → TarRef + ArchiveIndexEntry
+        // Use a call-local cache (blobKey → entries) to avoid re-reading the same TAR index
+        // when recovering multiple shards from the same TAR.
+        Map<String, List<ArchiveIndexEntry>> entryCache = new HashMap<>();
         Map<Long, ZipEntryLocation> genToLocation = new HashMap<>();
-        for (long gen = minGeneration; gen <= maxGeneration; gen++) {
-            if (genToLocation.containsKey(gen)) {
-                continue;
+
+        for (ZipRef tar : tars) {
+            List<ArchiveIndexEntry> entries = readTarIndexCachedEntries(transferService, tar, entryCache);
+            for (ArchiveIndexEntry entry : entries) {
+                if (entry.getShardId() != shardId) continue;
+                long generation = entry.getGeneration();
+                if (generation < minGeneration || generation > maxGeneration) continue;
+                // Keep the latest TAR that has this generation (most recent wins)
+                genToLocation.put(generation, new ZipEntryLocation(tar.path, tar.blobName, entry));
             }
-            ZipEntryLocation loc = binarySearchForGeneration(transferService, allZips, shardId, gen);
-            if (loc == null) {
-                throw new IOException("Could not find generation " + gen + " for shard " + shardId + " in any archive ZIP");
-            }
-            genToLocation.put(gen, loc);
         }
 
-        // Download each generation's files via range-read
+        // Download all required generations
+        boolean allFound = true;
         for (long gen = minGeneration; gen <= maxGeneration; gen++) {
             ZipEntryLocation loc = genToLocation.get(gen);
+            if (loc == null) {
+                logger.warn("Generation {} not found in hierarchical path for shard {}", gen, shardId);
+                allFound = false;
+                continue;
+            }
             downloadGeneration(transferService, loc, gen, location);
         }
 
-        // Copy final checkpoint
-        String commitCkp = Translog.getCommitCheckpointFileName(maxGeneration);
-        Path commitCkpPath = location.resolve(commitCkp);
-        if (Files.exists(commitCkpPath)) {
-            Files.copy(commitCkpPath, location.resolve(Translog.CHECKPOINT_FILE_NAME));
+        if (allFound && maxGeneration >= minGeneration) {
+            // Copy final checkpoint
+            String commitCkp = Translog.getCommitCheckpointFileName(maxGeneration);
+            Path commitCkpPath = location.resolve(commitCkp);
+            if (Files.exists(commitCkpPath)) {
+                Path globalCkp = location.resolve(Translog.CHECKPOINT_FILE_NAME);
+                if (Files.exists(globalCkp)) Files.delete(globalCkp);
+                Files.copy(commitCkpPath, globalCkp);
+            }
         }
 
         logger.info(
-            "Archive recovery complete: index={} shard={} gen=[{}-{}] zipsScanned={}",
-            indexUUID,
-            shardId,
-            minGeneration,
-            maxGeneration,
-            allZips.size()
+            "Hierarchical recovery complete: index={} shard={} gen=[{}-{}] allFound={} tarsScanned={}",
+            indexUUID, shardId, minGeneration, maxGeneration, allFound, tars.size()
         );
+        return allFound;
     }
 
     /**
-     * Binary search for the ZIP containing a specific generation for a specific shard.
+     * Collects all TAR blob references from the hierarchical txlog path that are at or after
+     * {@code startFrom}. Returns them sorted lexicographically (= chronologically).
      *
-     * @return ZipEntryLocation with offsets, or null if not found
+     * @param transferService blob service
+     * @param txlogRoot       path to {@code txlog/} root
+     * @param startFrom       only include TARs in minute-dirs ≥ this timestamp
+     * @return sorted list of TAR blob references
      */
-    static ZipEntryLocation binarySearchForGeneration(
+    static List<ZipRef> collectTarsFromHierarchicalPath(
         TransferService transferService,
-        List<ZipRef> zips,
-        int shardId,
-        long targetGeneration
+        BlobPath txlogRoot,
+        Instant startFrom
     ) throws IOException {
-        int lo = 0;
-        int hi = zips.size() - 1;
+        List<ZipRef> result = new ArrayList<>();
 
-        // Cache parsed comments to avoid re-reading
-        Map<Integer, List<ArchiveIndexEntry>> commentCache = new HashMap<>();
+        Set<String> dayDirs;
+        try {
+            dayDirs = transferService.listFolders(txlogRoot);
+        } catch (IOException e) {
+            logger.warn("Recovery: failed to list txlog root: {}", e.getMessage());
+            return result;
+        }
+        if (dayDirs == null || dayDirs.isEmpty()) {
+            return result;
+        }
 
-        while (lo <= hi) {
-            int mid = lo + (hi - lo) / 2;
-            List<ArchiveIndexEntry> entries = getOrReadComment(transferService, zips, mid, commentCache);
+        String startDay = TranslogArchivePathHelper.dayDir(startFrom);
+        String startMinute = TranslogArchivePathHelper.minuteDir(startFrom);
 
-            // Find this shard's entries
-            List<ArchiveIndexEntry> shardEntries = entries.stream().filter(e -> e.getShardId() == shardId).collect(Collectors.toList());
+        for (String dayDir : dayDirs) {
+            // Skip days entirely before startDay
+            if (dayDir.compareTo(startDay) < 0) continue;
 
-            if (shardEntries.isEmpty()) {
-                // Shard not in this ZIP — generation didn't change at this time.
-                // Search both directions from neighbors; try left first (older ZIPs more likely to have older gens)
-                hi = mid - 1;
+            BlobPath dayPath = txlogRoot.add(dayDir);
+            Set<String> minuteDirs;
+            try {
+                minuteDirs = transferService.listFolders(dayPath);
+            } catch (IOException e) {
+                logger.warn("Recovery: failed to list day dir {}: {}", dayPath.buildAsString(), e.getMessage());
                 continue;
             }
+            if (minuteDirs == null || minuteDirs.isEmpty()) continue;
 
-            long minGen = shardEntries.stream().mapToLong(ArchiveIndexEntry::getGeneration).min().orElse(Long.MAX_VALUE);
-            long maxGen = shardEntries.stream().mapToLong(ArchiveIndexEntry::getGeneration).max().orElse(Long.MIN_VALUE);
+            for (String minuteDir : minuteDirs) {
+                // For the start day, skip minute-dirs before startMinute
+                if (dayDir.equals(startDay) && minuteDir.compareTo(startMinute) < 0) continue;
 
-            if (targetGeneration < minGen) {
-                hi = mid - 1;
-            } else if (targetGeneration > maxGen) {
-                lo = mid + 1;
-            } else {
-                // Found! Look for the exact entry
-                for (ArchiveIndexEntry entry : shardEntries) {
-                    if (entry.getGeneration() == targetGeneration) {
-                        return new ZipEntryLocation(zips.get(mid).path, zips.get(mid).blobName, entry);
+                BlobPath minutePath = dayPath.add(minuteDir);
+                List<BlobMetadata> blobs;
+                try {
+                    blobs = PlainActionFuture.<List<BlobMetadata>, IOException>get(
+                        f -> transferService.listAllInSortedOrder(minutePath, "", MAX_BLOBS_PER_MINUTE_DIR, f)
+                    );
+                } catch (IOException e) {
+                    logger.warn("Recovery: failed to list minute dir {}: {}", minutePath.buildAsString(), e.getMessage());
+                    continue;
+                }
+                if (blobs == null) continue;
+                for (BlobMetadata blob : blobs) {
+                    if (blob.name().endsWith(".tar")) {
+                        result.add(new ZipRef(minutePath, blob.name(), blob.length()));
                     }
                 }
-                // Generation is in range but exact entry not found — shouldn't happen
-                throw new IOException(
-                    "Generation "
-                        + targetGeneration
-                        + " in range ["
-                        + minGen
-                        + "-"
-                        + maxGen
-                        + "] but entry not found in ZIP "
-                        + zips.get(mid).blobName
-                );
             }
         }
 
-        // Linear scan as fallback (handles gaps where shard was absent)
-        for (int i = zips.size() - 1; i >= 0; i--) {
-            List<ArchiveIndexEntry> entries = getOrReadComment(transferService, zips, i, commentCache);
-            for (ArchiveIndexEntry entry : entries) {
-                if (entry.getShardId() == shardId && entry.getGeneration() == targetGeneration) {
-                    return new ZipEntryLocation(zips.get(i).path, zips.get(i).blobName, entry);
-                }
-            }
-        }
-
-        return null;
+        // Sort by (dayDir + minuteDir + blobName) — lexicographic = chronological
+        result.sort((a, b) -> {
+            String ka = a.path.buildAsString() + "/" + a.blobName;
+            String kb = b.path.buildAsString() + "/" + b.blobName;
+            return ka.compareTo(kb);
+        });
+        return result;
     }
 
-    private static List<ArchiveIndexEntry> getOrReadComment(
+    /**
+     * Reads the TAR binary {@code _index} from the blob, using the per-blob cache if available.
+     * Caches {@link ArchiveIndexEntry} objects (not {@link TarArchiveBuilder.EntryLocation},
+     * which is package-private).
+     *
+     * <p>The {@link TranslogArchiveIndexCache} is typed to {@code List<TarArchiveBuilder.EntryLocation>}
+     * for the general case; here we use a separate in-call map to avoid the type mismatch.
+     * The cache key is still {@code (pathStr, blobName)} for coherence.
+     *
+     * @param transferService blob service
+     * @param tar             TAR blob reference
+     * @param entryCache      call-local cache: blobKey → List&lt;ArchiveIndexEntry&gt;
+     * @return list of {@link ArchiveIndexEntry} from the TAR's {@code _index}
+     */
+    static List<ArchiveIndexEntry> readTarIndexCachedEntries(
         TransferService transferService,
-        List<ZipRef> zips,
-        int index,
-        Map<Integer, List<ArchiveIndexEntry>> cache
+        ZipRef tar,
+        Map<String, List<ArchiveIndexEntry>> entryCache
     ) throws IOException {
-        if (cache.containsKey(index)) {
-            return cache.get(index);
+        String cacheKey = tar.path.buildAsString() + "/" + tar.blobName;
+        if (entryCache.containsKey(cacheKey)) {
+            return entryCache.get(cacheKey);
         }
-        ZipRef ref = zips.get(index);
-        List<ArchiveIndexEntry> entries = ref.blobName.endsWith(".tar")
-            ? readTarIndex(transferService, ref)
-            : readZipComment(transferService, ref);
-        cache.put(index, entries);
+        List<ArchiveIndexEntry> entries = readTarIndex(transferService, tar);
+        entryCache.put(cacheKey, entries);
         return entries;
     }
 
+    // ── End new hierarchical-path recovery ────────────────────────────────────
+
     /**
      * Reads the TAR index from the HEAD of a .tar archive blob (byte-range GET of first two TAR entries).
-     * This is the TAR equivalent of {@link #readZipComment} — both return a list of {@link ArchiveIndexEntry}.
      *
      * <p>TAR layout: [512B header][index data padded to 512][...data entries...][2*512 EOF marker]
      * The index is always at offset 512 with a known size (from the TAR header), so we can read it
@@ -424,50 +377,6 @@ public final class TranslogArchiveRecovery {
             }
         }
         return result;
-    }
-
-    /**
-     * Range-read the ZIP tail to extract the EOCD comment.
-     * Uses range-read when blob size is known to avoid downloading the entire ZIP.
-     */
-    static List<ArchiveIndexEntry> readZipComment(TransferService transferService, ZipRef zip) throws IOException {
-        byte[] tail;
-        if (zip.size > 0) {
-            // Range-read only the tail of the ZIP (EOCD + comment are at the end)
-            int tailLen = (int) Math.min(zip.size, EOCD_TAIL_READ_SIZE);
-            long tailOffset = zip.size - tailLen;
-            try (InputStream tailStream = transferService.downloadBlob(zip.path, zip.blobName, tailOffset, tailLen)) {
-                tail = tailStream.readAllBytes();
-            }
-        } else {
-            // Fallback: blob size unknown, download full blob
-            try (InputStream fullStream = transferService.downloadBlob(zip.path, zip.blobName)) {
-                tail = fullStream.readAllBytes();
-            }
-        }
-        String comment = extractEocdComment(tail);
-        if (comment == null) {
-            return Collections.emptyList();
-        }
-        return ArchiveCommentFormat.parse(comment);
-    }
-
-    /**
-     * Extract EOCD comment from ZIP bytes by scanning backwards for the EOCD signature.
-     */
-    static String extractEocdComment(byte[] zipBytes) {
-        // EOCD signature: 0x50 0x4b 0x05 0x06
-        int len = zipBytes.length;
-        for (int i = len - EOCD_MIN_SIZE; i >= Math.max(0, len - 65535 - EOCD_MIN_SIZE); i--) {
-            if (zipBytes[i] == 0x50 && zipBytes[i + 1] == 0x4b && zipBytes[i + 2] == 0x05 && zipBytes[i + 3] == 0x06) {
-                int commentLength = (zipBytes[i + 20] & 0xFF) | ((zipBytes[i + 21] & 0xFF) << 8);
-                if (commentLength > 0 && i + EOCD_MIN_SIZE + commentLength <= len) {
-                    return new String(zipBytes, i + EOCD_MIN_SIZE, commentLength, StandardCharsets.UTF_8);
-                }
-                return null;
-            }
-        }
-        return null;
     }
 
     /**

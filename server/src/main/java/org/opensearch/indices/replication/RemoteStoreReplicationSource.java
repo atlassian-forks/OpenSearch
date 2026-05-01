@@ -110,9 +110,9 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
             }
             logger.debug("Downloading segment files from remote store {}", filesToFetch);
 
-            // Do NOT call remoteDirectory.init() here.  getCheckpointMetadata() already
+            // Do NOT call remoteDirectory.init() here. getCheckpointMetadata() already
             // called init() which populated segmentsUploadedToRemoteStore and archiveStateRef
-            // from the same metadata version used to compute filesToFetch.  A second init()
+            // from the same metadata version used to compute filesToFetch. A second init()
             // would read the LATEST metadata file, which may have advanced (e.g. due to a
             // merge on the primary) and no longer contain entries for files in filesToFetch,
             // causing NoSuchFileException during download.
@@ -150,7 +150,6 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
     public String getDescription() {
         return "RemoteStoreReplicationSource";
     }
-
 
     private RemoteSegmentMetadata getRemoteSegmentMetadata() throws IOException {
         AtomicReference<RemoteSegmentMetadata> mdFile = new AtomicReference<>();

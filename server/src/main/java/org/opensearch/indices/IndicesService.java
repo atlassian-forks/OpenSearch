@@ -510,7 +510,7 @@ public class IndicesService extends AbstractLifecycleComponent
             .addSettingsUpdateConsumer(CLUSTER_DEFAULT_INDEX_REFRESH_INTERVAL_SETTING, this::onRefreshIntervalUpdate);
         this.recoverySettings = recoverySettings;
         this.remoteStoreSettings = remoteStoreSettings;
-        this.translogArchiveCollector = new TranslogArchiveCollector(this, threadPool, remoteStoreSettings);
+        this.translogArchiveCollector = new TranslogArchiveCollector(this, threadPool, remoteStoreSettings, clusterService);
         this.compositeIndexSettings = compositeIndexSettings;
         this.fileCache = fileCache;
         this.replicator = replicator;

@@ -453,23 +453,25 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
     }
 
     /**
-     * Wait until at least one translog archive ZIP appears in the translog repo and has been
-     * present for at least 1 second, so the collector has time to include the latest ops.
-     * Checks path translog/data/{hashPrefix}/{genBucket}/*.zip.
+     * Wait until at least one translog archive TAR appears in the translog repo.
+     * New path layout: txlog/{yyyyMMdd}/{HHmm}/*.tar
      */
     private void waitForTranslogArchiveUpload() throws Exception {
-        // assertBusy polls until at least one ZIP appears — no artificial 1s stability window needed.
         assertBusy(
             () -> assertTrue(
-                "expected at least one archive ZIP under translog repo " + translogRepoPath,
-                hasArchiveZipUnderRepo(translogRepoPath)
+                "expected at least one archive TAR under translog repo " + translogRepoPath,
+                hasArchiveUnderRepo(translogRepoPath)
             ),
             30,
             TimeUnit.SECONDS
         );
     }
 
-    private static boolean hasArchiveZipUnderRepo(Path repoRoot) {
+    /**
+     * Searches the repo root for any archive file (.tar or .zip) under the txlog/ directory.
+     * New path: txlog/{day}/{minute}/*.tar
+     */
+    private static boolean hasArchiveUnderRepo(Path repoRoot) {
         AtomicBoolean found = new AtomicBoolean(false);
         try {
             Files.walkFileTree(repoRoot, Set.of(FileVisitOption.FOLLOW_LINKS), Integer.MAX_VALUE, new SimpleFileVisitor<>() {
@@ -479,8 +481,9 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
                         return FileVisitResult.TERMINATE;
                     }
                     String name = dir.getFileName().toString();
-                    if ("data".equals(name)) {
-                        if (hasZipInDirOrChildren(dir, 2)) {
+                    // New path: txlog/{day}/{minute}/*.tar  (2 levels deep from txlog)
+                    if ("txlog".equals(name)) {
+                        if (hasArchiveInDirOrChildren(dir, 2)) {
                             found.set(true);
                             return FileVisitResult.TERMINATE;
                         }
@@ -494,23 +497,34 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
         return found.get();
     }
 
+    // Keep legacy name for backward compat with any callers
+    private static boolean hasArchiveZipUnderRepo(Path repoRoot) {
+        return hasArchiveUnderRepo(repoRoot);
+    }
+
     /**
-     * Check for any *.zip under dir. Path translog/data has 2 levels to zip: {hashPrefix}/{genBucket}/*.zip.
+     * Check for any *.tar or *.zip archive under dir, recursing {@code levelsDeep} levels.
      *
-     * @param dir          directory to search (e.g. translog/data)
-     * @param levelsToZip  2 for data/{hashPrefix}/{genBucket}/*.zip
+     * @param dir        directory to search
+     * @param levelsDeep number of directory levels to descend before looking for blobs
      */
-    private static boolean hasZipInDirOrChildren(Path dir, int levelsToZip) {
-        if (levelsToZip <= 0) {
-            try (DirectoryStream<Path> blobs = Files.newDirectoryStream(dir, "*.zip")) {
-                return blobs.iterator().hasNext();
+    private static boolean hasArchiveInDirOrChildren(Path dir, int levelsDeep) {
+        if (levelsDeep <= 0) {
+            try (DirectoryStream<Path> blobs = Files.newDirectoryStream(dir, "*.tar")) {
+                if (blobs.iterator().hasNext()) return true;
             } catch (IOException e) {
                 return false;
             }
+            try (DirectoryStream<Path> blobs = Files.newDirectoryStream(dir, "*.zip")) {
+                if (blobs.iterator().hasNext()) return true;
+            } catch (IOException e) {
+                return false;
+            }
+            return false;
         }
         try (DirectoryStream<Path> childDirs = Files.newDirectoryStream(dir)) {
             for (Path child : childDirs) {
-                if (Files.isDirectory(child) && hasZipInDirOrChildren(child, levelsToZip - 1)) {
+                if (Files.isDirectory(child) && hasArchiveInDirOrChildren(child, levelsDeep - 1)) {
                     return true;
                 }
             }
@@ -518,5 +532,12 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
             return false;
         }
         return false;
+    }
+
+    /**
+     * Legacy: check for any *.zip under dir (kept for backward compat with old test helpers).
+     */
+    private static boolean hasZipInDirOrChildren(Path dir, int levelsToZip) {
+        return hasArchiveInDirOrChildren(dir, levelsToZip);
     }
 }

@@ -9,7 +9,7 @@
 package org.opensearch.index.translog.transfer.archive;
 
 import org.opensearch.common.annotation.ExperimentalApi;
-import org.opensearch.index.translog.transfer.archive.ArchiveBuilder.ArchiveBuildEntry;
+import java.io.ByteArrayInputStream;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -333,5 +333,63 @@ public final class TarArchiveBuilder {
         int start = off + digits - octalBytes.length;
         System.arraycopy(octalBytes, 0, buf, start, octalBytes.length);
         buf[off + len - 1] = 0; // null-terminate
+    }
+
+    // ── Entry model ──────────────────────────────────────────────────────────
+
+    /**
+     * A single entry to be packed into a TAR archive.
+     * Each entry provides a path (name), content stream, and byte length.
+     */
+    @ExperimentalApi
+    public interface ArchiveBuildEntry {
+
+        /** Entry path inside the archive (e.g. {@code "indexUUID/shardId/1/translog-3.tlog"}). */
+        String getPath();
+
+        /** Opens a fresh stream over the entry's content. */
+        InputStream getContent() throws IOException;
+
+        /** Byte length of the content. */
+        long getSize();
+
+        /**
+         * Returns the raw backing bytes for this entry, or {@code null} if not available.
+         * When non-null, builders may reuse this array directly to avoid an extra allocation.
+         */
+        default byte[] getBackingBytes() {
+            return null;
+        }
+    }
+
+    /**
+     * Creates an {@link ArchiveBuildEntry} from a path and a pre-loaded byte array.
+     *
+     * @param path    entry path inside the archive
+     * @param content raw bytes
+     * @return an immutable entry backed by {@code content}
+     */
+    public static ArchiveBuildEntry fromBytes(String path, byte[] content) {
+        return new ArchiveBuildEntry() {
+            @Override
+            public String getPath() {
+                return path;
+            }
+
+            @Override
+            public InputStream getContent() {
+                return new ByteArrayInputStream(content);
+            }
+
+            @Override
+            public long getSize() {
+                return content.length;
+            }
+
+            @Override
+            public byte[] getBackingBytes() {
+                return content;
+            }
+        };
     }
 }
