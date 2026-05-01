@@ -19,6 +19,7 @@ import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.archive.ArchiveBuilder;
+import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 
 import java.io.IOException;
 import java.io.PipedInputStream;
@@ -391,13 +392,13 @@ public class TranslogArchiveBatchCoordinator {
         String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, pathHashAlgorithm);
         BlobPath archivePath = archiveBasePath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
 
-        // Compute size (deterministic because ZIP uses STORED)
-        ArchiveBuilder.SizeAndOffsets sizeAndOffsets = ArchiveBuilder.computeSizeAndOffsetsWithComment(allEntries);
-        long contentLength = sizeAndOffsets.getSize();
+        // Compute TAR layout (deterministic from file sizes alone — no content reads needed)
+        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(allEntries);
+        long contentLength = layout.getTotalSize();
 
         IOException lastFailure = null;
         for (int attempt = 0; attempt < UPLOAD_RETRY_MAX_ATTEMPTS; attempt++) {
-            String blobName = TranslogArchivePathHelper.blobNameFromCurrentTime();
+            String blobName = TranslogArchivePathHelper.tarBlobNameFromCurrentTime();
             try (PipedOutputStream pos = new PipedOutputStream(); PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)) {
                 AtomicReference<IOException> uploadError = new AtomicReference<>();
                 java.util.concurrent.CountDownLatch uploadLatch = new java.util.concurrent.CountDownLatch(1);
@@ -416,7 +417,7 @@ public class TranslogArchiveBatchCoordinator {
                     }
                 });
 
-                ArchiveBuilder.buildWithComment(pos, allEntries);
+                TarArchiveBuilder.build(pos, layout, allEntries);
                 pos.close();
 
                 if (!uploadLatch.await(uploadTimeoutMillis, TimeUnit.MILLISECONDS)) {

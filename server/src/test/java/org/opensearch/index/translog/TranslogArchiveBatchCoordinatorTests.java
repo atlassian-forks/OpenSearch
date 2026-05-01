@@ -136,7 +136,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         assertTrue("Both threads should complete", bothSubmitted.await(5, TimeUnit.SECONDS));
         assertNull("No errors expected", error.get());
 
-        // Only ONE zip upload should have happened (both shards bundled)
+        // Only ONE tar upload should have happened (both shards bundled)
         verify(transferService, times(1)).uploadBlobStream(
             any(InputStream.class),
             anyLong(),
@@ -201,7 +201,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
         String path = pathCaptor.getValue().buildAsString();
         assertThat(path, org.hamcrest.Matchers.startsWith("repo-root/translog/data/"));
-        assertThat(nameCaptor.getValue(), org.hamcrest.Matchers.endsWith(".zip"));
+        assertThat(nameCaptor.getValue(), org.hamcrest.Matchers.endsWith(".tar"));
 
         // Verify the second path component is hashTypeIndex and third is hashNodeId.
         String expectedHashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
