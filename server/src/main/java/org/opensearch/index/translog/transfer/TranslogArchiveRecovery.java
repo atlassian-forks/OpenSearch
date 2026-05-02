@@ -302,8 +302,9 @@ public final class TranslogArchiveRecovery {
             return Collections.emptyList();
         }
 
-        if (indexDataSize <= 0 || indexDataSize > 65536) {
-            // Sanity check: index should be small
+        // Sanity check: index = GC prefix (up to 2 + 4096*32 = ~128KB) + entry index (~312KB max at 2000 shards).
+        // Allow up to 512KB to be safe. Values far below 512 or above 512KB indicate corruption.
+        if (indexDataSize <= 0 || indexDataSize > 512 * 1024) {
             logger.warn("TAR {} index size {} out of expected range", ref.blobName, indexDataSize);
             return Collections.emptyList();
         }

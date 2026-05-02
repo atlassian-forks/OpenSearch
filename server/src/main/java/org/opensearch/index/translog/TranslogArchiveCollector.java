@@ -29,8 +29,9 @@ import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
-import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
+import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
+import org.opensearch.index.translog.transfer.archive.TranslogArchiveGcScanner;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -46,6 +47,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -96,6 +98,11 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
     private volatile Scheduler.Cancellable scheduledTask;
     /** Retention GC task — only runs when this node is the elected cluster-manager. */
     private volatile Scheduler.Cancellable retentionScheduledTask;
+    /**
+     * Checkpoint-aware GC scanner — lazily created when this node becomes cluster-manager.
+     * Null when not the cluster-manager.
+     */
+    private volatile TranslogArchiveGcScanner gcScanner;
     /** Set of index UUIDs that use coordinator-based (school bus) uploads. */
     private final Set<String> coordinatorEnabledIndices = ConcurrentHashMap.newKeySet();
 
@@ -236,6 +243,11 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
     @Override
     public void onClusterManager() {
         if (threadPool != null && remoteStoreSettings != null && retentionScheduledTask == null) {
+            // Initialise the checkpoint-aware GC scanner.
+            // We bootstrap it eagerly with any available transfer service so it can load
+            // persisted .idx state before the first GC cycle runs.
+            initGcScannerIfNeeded();
+
             TimeValue gcInterval = remoteStoreSettings.getTranslogArchiveGcInterval();
             logger.info("Became cluster-manager: starting translog archive GC (interval={})", gcInterval);
             retentionScheduledTask = threadPool.scheduleWithFixedDelay(
@@ -248,7 +260,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
 
     /**
      * Called when this node loses cluster-manager status.
-     * Stops the archive retention GC scheduled task.
+     * Stops the archive retention GC scheduled task and clears the GC scanner.
      */
     @Override
     public void offClusterManager() {
@@ -257,6 +269,37 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             retentionScheduledTask.cancel();
             retentionScheduledTask = null;
         }
+        gcScanner = null;
+    }
+
+    /**
+     * Initialises {@link #gcScanner} from any available shard's transfer service.
+     * Synchronized to prevent a check-then-act race when called concurrently
+     * (e.g. from onClusterManager and runArchiveRetention at the same time).
+     */
+    private synchronized void initGcScannerIfNeeded() {
+        if (gcScanner != null) return;
+        for (ShardId sid : getEligibleShardIds()) {
+            IndexService indexService = indicesService.indexService(sid.getIndex());
+            if (indexService == null) continue;
+            IndexShard shard = indexService.getShardOrNull(sid.id());
+            if (shard == null) continue;
+            Optional<TranslogTransferManager> tmOpt = shard.getTranslogTransferManager();
+            if (tmOpt.isPresent()) {
+                TransferService ts = tmOpt.get().getTransferService();
+                BlobPath base = tmOpt.get().getArchiveBasePath();
+                TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(ts, base);
+                try {
+                    scanner.loadFromPersisted();
+                } catch (Exception e) {
+                    logger.warn("GC scanner: failed to load persisted state: {}", e.getMessage());
+                }
+                gcScanner = scanner;
+                logger.info("GC scanner initialised from shard {}", sid);
+                return;
+            }
+        }
+        logger.debug("GC scanner: no eligible shard with transfer service found yet");
     }
 
     private void runBatch() {
@@ -321,15 +364,36 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             return;
         }
         List<TarArchiveBuilder.ArchiveBuildEntry> allEntries = new ArrayList<>();
+        List<TarArchiveBuilder.GcShardEntry> gcEntries = new ArrayList<>(contributingShards.size());
         try {
             for (int i = 0; i < snapshots.size(); i++) {
                 allEntries.addAll(snapshotToEntries(snapshots.get(i), pathPrefixes.get(i)));
+
+                // Build GC summary entry for this shard embedding seqNo range + last synced global checkpoint.
+                //
+                // IMPORTANT: All values are in sequence number (seqNo) space — NOT translog generation space.
+                // Translog generation numbers are file counters and are NOT comparable to seqNos.
+                //
+                // We embed getLastSyncedGlobalCheckpoint() (the globalCheckpoint from the last Lucene
+                // segment commit / translog sync), NOT getLastKnownGlobalCheckpoint() (the in-memory
+                // replicated checkpoint). The synced checkpoint is what the remote segment store has
+                // committed — if checkpoint >= maxSeqNo, the ops are in uploaded segments and the translog
+                // is no longer needed for recovery (two-phase isSafeToDelete Phase 1 check).
+                IndexShard shard = contributingShards.get(i);
+                org.opensearch.index.seqno.SeqNoStats seqNoStats = shard.seqNoStats();
+                long minSeqNo = seqNoStats.getLocalCheckpoint();   // local checkpoint: ops confirmed processed
+                long maxSeqNo = seqNoStats.getMaxSeqNo();          // highest seqNo assigned in this batch
+                // Use last SYNCED checkpoint: the checkpoint written to the last committed Lucene segment.
+                // This is the checkpoint the remote segment store has durably uploaded — safe for GC decisions.
+                long syncedGlobalCheckpoint = shard.getLastSyncedGlobalCheckpoint();
+                int uuidHash = shard.indexSettings().getIndexMetadata().getIndexUUID().hashCode();
+                gcEntries.add(new TarArchiveBuilder.GcShardEntry(shard.shardId().id(), minSeqNo, maxSeqNo, uuidHash, syncedGlobalCheckpoint));
             }
             if (allEntries.isEmpty()) {
                 logger.debug("Skipping translog archive upload: all snapshots are empty (no translog files to archive)");
                 return;
             }
-            uploadArchiveNewPath(transferService, basePath, nodeId, snapshots, contributingShards, allEntries);
+            uploadArchiveNewPath(transferService, basePath, nodeId, snapshots, contributingShards, allEntries, gcEntries);
         } catch (Exception ex) {
             logger.error(() -> new ParameterizedMessage("Failed to build or upload translog archive for node {}", nodeId), ex);
             runFallbackIfEnabled(contributingShards, snapshots);
@@ -339,43 +403,39 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
     }
 
     /**
-     * Pure-timestamp-based archive GC using the new hierarchical path.
+     * Checkpoint-aware archive GC using the hierarchical txlog path.
+     *
+     * <p>The checkpoint gate is the primary safety mechanism — a minute-dir is deleted only when
+     * all shard seqNos in that minute are confirmed committed to remote segments (via the two-phase
+     * {@link TranslogArchiveGcScanner#isSafeToDelete} check). No configurable retention window is
+     * needed; instead a minimal safety buffer ({@link ArchiveDeletionHelper#MIN_RETENTION_SAFETY_BUFFER_MINUTES}
+     * minutes) protects data that was just uploaded and hasn't been scanned yet.
      *
      * <p>Algorithm (only runs on the elected cluster-manager):
      * <ol>
-     *   <li>LIST {@code {base}/txlog/} → day directories.</li>
-     *   <li>For each day dir: if the entire day is newer than the retention cutoff → skip (bail out).</li>
-     *   <li>If the entire day is older → delete the day directory entirely.</li>
-     *   <li>If it's the boundary day → LIST minute-dirs, apply the same bail-out logic per minute.</li>
-     *   <li>Delete expired minute-dirs entirely; for the boundary minute, delete individual blobs.</li>
+     *   <li>Resolve transfer service + base path from any eligible shard.</li>
+     *   <li>Ensure {@link #gcScanner} is initialised; run {@code scanner.scan()} to index new minute-dirs.</li>
+     *   <li>For every minute-dir in txlog/ that is older than the minimal safety buffer:
+     *       ask {@code scanner.isSafeToDelete()} — delete only if checkpoint gate passes.</li>
+     *   <li>On successful deletion: evict the minute-key from the scanner's in-memory index.</li>
      * </ol>
-     *
-     * <p>This is O(directories) not O(files): at steady state with 2h retention only ~120 minute-dirs
-     * exist, fitting in 1 LIST page.
      */
     private void runArchiveRetention() {
-        // Determine the retention duration from any live shard's config.
+        // Resolve transfer service + base path from any eligible shard.
         TransferService anyTransferService = null;
         BlobPath anyBasePath = null;
-        long retentionMinutes = ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES;
 
         for (ShardId sid : getEligibleShardIds()) {
             IndexService indexService = indicesService.indexService(sid.getIndex());
             if (indexService == null) continue;
             IndexShard shard = indexService.getShardOrNull(sid.id());
             if (shard == null) continue;
-            long shardRetention = Math.max(
-                shard.indexSettings().getTranslogArchiveRetention().getMinutes(),
-                ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES
-            );
-            if (shardRetention > retentionMinutes) {
-                retentionMinutes = shardRetention;
-            }
             if (anyTransferService == null) {
                 Optional<TranslogTransferManager> tmOpt = shard.getTranslogTransferManager();
                 if (tmOpt.isPresent()) {
                     anyTransferService = tmOpt.get().getTransferService();
                     anyBasePath = tmOpt.get().getArchiveBasePath();
+                    break;
                 }
             }
         }
@@ -384,11 +444,28 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             return;
         }
 
-        Instant cutoff = Instant.now().minus(Duration.ofMinutes(retentionMinutes));
+        // Ensure the GC scanner is ready (may be null if no shards existed at onClusterManager time).
+        initGcScannerIfNeeded();
+        TranslogArchiveGcScanner scanner = gcScanner;
+
+        // Run the scanner to index any new minute-dirs before making deletion decisions.
+        // Checkpoints are embedded in each TAR's GC summary — no need to query local shards here.
+        if (scanner != null) {
+            try {
+                scanner.scan(Instant.now());
+            } catch (Exception e) {
+                logger.warn("GC scanner: scan failed: {}", e.getMessage());
+            }
+        }
+
+        // Safety buffer: never delete a minute-dir that was uploaded less than MIN_RETENTION_SAFETY_BUFFER_MINUTES
+        // ago, regardless of checkpoint state. This protects against edge cases where a minute-dir is
+        // brand-new and the scanner hasn't had time to index it yet.
+        Instant safetyCutoff = Instant.now().minus(Duration.ofMinutes(ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES));
         BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(anyBasePath);
 
         try {
-            deleteHierarchicalArchivesOlderThan(anyTransferService, txlogRoot, cutoff);
+            deleteHierarchicalArchivesOlderThan(anyTransferService, txlogRoot, safetyCutoff, scanner);
         } catch (IOException ex) {
             logger.warn("Archive retention GC failed: {}", ex.getMessage());
         }
@@ -396,22 +473,30 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
 
     /**
      * Hierarchical GC for {@code txlog/{day}/{minute}/} path structure.
-     * Deletes entire day/minute directories if all their content is older than {@code cutoff}.
-     * For the boundary minute, deletes individual blob files older than {@code cutoff}.
+     *
+     * <p>For each expired minute-dir (older than {@code cutoff}):
+     * <ol>
+     *   <li>Ask {@code scanner.isSafeToDelete(minuteKey)}: the scanner uses its rolling
+     *       per-shard checkpoint map (populated from embedded GC summaries in TARs) to verify
+     *       all shard generations are covered. If scanner is null or not yet indexed → skip.</li>
+     *   <li>Delete all blobs in the minute-dir (or just blobs older than cutoff for boundary minute).</li>
+     *   <li>Evict from scanner's in-memory index.</li>
+     * </ol>
      *
      * @param transferService blob service
      * @param txlogRoot       path to the {@code txlog/} root
      * @param cutoff          delete blobs/dirs with timestamp before this instant
+     * @param scanner         checkpoint-aware GC scanner; may be null (skips checkpoint gate)
      * @return total number of blobs deleted
      */
     static int deleteHierarchicalArchivesOlderThan(
         TransferService transferService,
         BlobPath txlogRoot,
-        Instant cutoff
+        Instant cutoff,
+        TranslogArchiveGcScanner scanner
     ) throws IOException {
         int deleted = 0;
 
-        // List day directories under txlog/
         Set<String> dayDirs;
         try {
             dayDirs = transferService.listFolders(txlogRoot);
@@ -423,24 +508,16 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             return deleted;
         }
 
+        String cutoffDay = TranslogArchivePathHelper.dayDir(cutoff);
+        String cutoffMinute = TranslogArchivePathHelper.minuteDir(cutoff);
+
         for (String dayDir : dayDirs) {
-            // Day dir format: yyyyMMdd — end of day = dayDir + "2359"
-            // If the start of the day is newer than cutoff (dayDir >= cutoffDay), bail out.
-            // If the end of the day is older than cutoff (dayDir < cutoffDay), delete entire day dir.
-            String cutoffDay = TranslogArchivePathHelper.dayDir(cutoff);
             int dayCmp = dayDir.compareTo(cutoffDay);
             if (dayCmp > 0) {
-                // Entire day is newer than cutoff — skip
-                continue;
-            }
-            BlobPath dayPath = txlogRoot.add(dayDir);
-            if (dayCmp < 0) {
-                // Entire day is before the cutoff day — delete all minute-dirs in it
-                deleted += deleteAllMinuteDirs(transferService, dayPath);
-                continue;
+                continue; // Entire day is newer than cutoff — skip
             }
 
-            // Boundary day (dayCmp == 0): enumerate minute-dirs and apply per-minute logic
+            BlobPath dayPath = txlogRoot.add(dayDir);
             Set<String> minuteDirs;
             try {
                 minuteDirs = transferService.listFolders(dayPath);
@@ -452,44 +529,139 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
                 continue;
             }
 
-            String cutoffMinute = TranslogArchivePathHelper.minuteDir(cutoff);
             for (String minuteDir : minuteDirs) {
-                int minCmp = minuteDir.compareTo(cutoffMinute);
+                if (dayCmp == 0 && minuteDir.compareTo(cutoffMinute) > 0) {
+                    continue; // Minute is newer than cutoff — skip
+                }
+
+                String minuteKey = dayDir + "/" + minuteDir;
                 BlobPath minutePath = dayPath.add(minuteDir);
-                if (minCmp > 0) {
-                    // Minute is newer than cutoff — skip
+
+                // Checkpoint safety gate via rolling checkpoint map embedded in TARs.
+                // scanner == null → no gate (timestamp-only fallback, whole-minute delete).
+                if (scanner != null && !scanner.isSafeToDelete(minuteKey)) {
+                    // Minute-dir is not entirely safe — attempt per-TAR granularity deletion.
+                    // Safe TARs (from non-stuck shards) can be deleted individually even if the
+                    // minute-dir still holds a few stuck TARs from a down node.
+                    int partialDeleted = deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner);
+                    deleted += partialDeleted;
+                    // Don't evict — the minute-key stays in memory until all TARs are gone.
                     continue;
                 }
-                if (minCmp < 0) {
-                    // Entire minute is before the cutoff — delete entire minute dir
-                    deleted += deleteBlobsInDir(transferService, minutePath, null /* all blobs */);
-                    continue;
+
+                if (dayCmp == 0 && minuteDir.compareTo(cutoffMinute) == 0) {
+                    deleted += deleteBlobsInDir(transferService, minutePath, cutoff);
+                } else {
+                    deleted += deleteBlobsInDir(transferService, minutePath, null);
                 }
-                // Boundary minute: delete only blobs with timestamp < cutoff
-                deleted += deleteBlobsInDir(transferService, minutePath, cutoff);
+
+                if (scanner != null) {
+                    scanner.evict(minuteKey);
+                }
             }
         }
         return deleted;
     }
 
     /**
-     * Deletes all minute-level directories (and their blobs) under a day path.
+     * Backward-compatible overload — no scanner, timestamp-only.
      */
-    private static int deleteAllMinuteDirs(TransferService transferService, BlobPath dayPath) throws IOException {
-        Set<String> minuteDirs;
+    static int deleteHierarchicalArchivesOlderThan(
+        TransferService transferService,
+        BlobPath txlogRoot,
+        Instant cutoff
+    ) throws IOException {
+        return deleteHierarchicalArchivesOlderThan(transferService, txlogRoot, cutoff, null);
+    }
+
+    /**
+     * Per-TAR granularity deletion for a stuck minute-dir.
+     *
+     * <p>When a minute-dir is not entirely safe to delete (because at least one shard is stuck),
+     * we iterate over each TAR blob and delete only those whose GC entries are all safe.
+     * This prevents a single stuck node from holding back 9,000+ safe TARs from other nodes.
+     *
+     * <p>Per-TAR GC entries are read from the scanner's in-memory cache (populated during
+     * {@code scanMinute()}). If not cached (e.g. minute loaded from persisted .idx on restart),
+     * we fall back to a range-GET of the TAR's GC prefix — same cost as the initial scan.
+     *
+     * <p>If all TARs in the minute-dir are deleted, the minute-key is evicted from the scanner.
+     *
+     * @param transferService blob service
+     * @param minutePath      path to the minute-dir
+     * @param minuteKey       {@code "yyyyMMdd/HHmm"} key
+     * @param scanner         GC scanner (never null when this method is called)
+     * @return number of TARs deleted in this call
+     */
+    static int deleteStuckMinutePartially(
+        TransferService transferService,
+        BlobPath minutePath,
+        String minuteKey,
+        TranslogArchiveGcScanner scanner
+    ) {
+        // List remaining TAR blobs in the minute-dir
+        List<BlobMetadata> remainingBlobs;
         try {
-            minuteDirs = transferService.listFolders(dayPath);
+            remainingBlobs = PlainActionFuture.<List<BlobMetadata>, IOException>get(
+                f -> transferService.listAllInSortedOrder(minutePath, "", MAX_ARCHIVE_BLOBS_PER_PAGE, f)
+            );
         } catch (IOException e) {
-            logger.warn("GC: failed to list day dir {}: {}", dayPath.buildAsString(), e.getMessage());
+            logger.warn("GC per-TAR: failed to list stuck minute {}: {}", minuteKey, e.getMessage());
             return 0;
         }
-        if (minuteDirs == null || minuteDirs.isEmpty()) {
+        if (remainingBlobs == null || remainingBlobs.isEmpty()) {
+            // Minute-dir is already empty — evict
+            scanner.evict(minuteKey);
             return 0;
         }
+
+        // Re-read GC prefix for each TAR to determine per-TAR safety.
+        // We do NOT cache per-TAR GC entries in memory because that would require
+        // ~160KB per TAR × 9,231 TARs/minute = ~14.8GB at steady state — unacceptable.
+        // This path is only taken for stuck minutes (rare: only during node outages).
+        // The extra range-GETs cost ~$2.64 one-time when the stuck node recovers.
+        List<String> safeToDelete = new ArrayList<>();
+        int remaining = 0;
+        for (BlobMetadata blob : remainingBlobs) {
+            String blobName = blob.name();
+            if (!blobName.endsWith(".tar")) {
+                // Non-TAR blobs: keep
+                remaining++;
+                continue;
+            }
+
+            // Re-read GC prefix via range-GET (1 GET per TAR — same cost as initial scan)
+            List<TarArchiveBuilder.GcShardEntry> gcEntries = scanner.readGcPrefix(minutePath, blobName);
+
+            if (scanner.isTarSafeToDelete(gcEntries)) {
+                safeToDelete.add(blobName);
+            } else {
+                remaining++;
+            }
+        }
+
+        // Delete safe TARs in batches
         int deleted = 0;
-        for (String minuteDir : minuteDirs) {
-            deleted += deleteBlobsInDir(transferService, dayPath.add(minuteDir), null /* all blobs */);
+        for (int i = 0; i < safeToDelete.size(); i += RETENTION_DELETE_BATCH_SIZE) {
+            int end = Math.min(i + RETENTION_DELETE_BATCH_SIZE, safeToDelete.size());
+            List<String> batch = safeToDelete.subList(i, end);
+            try {
+                transferService.deleteBlobs(minutePath, new ArrayList<>(batch));
+                deleted += batch.size();
+            } catch (IOException e) {
+                logger.warn("GC per-TAR: failed to delete batch in {}: {}", minutePath.buildAsString(), e.getMessage());
+                remaining += batch.size(); // Count as still remaining on failure
+            }
         }
+
+        // If all TARs are now gone, evict the minute-key from memory
+        if (remaining == 0 && deleted > 0) {
+            scanner.evict(minuteKey);
+            logger.debug("GC per-TAR: minute {} fully cleaned after per-TAR pass", minuteKey);
+        } else if (deleted > 0) {
+            logger.debug("GC per-TAR: deleted {} safe TARs from stuck minute {}, {} still stuck", deleted, minuteKey, remaining);
+        }
+
         return deleted;
     }
 
@@ -591,16 +763,17 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         String nodeId,
         List<TransferSnapshot> snapshots,
         List<IndexShard> contributingShards,
-        List<TarArchiveBuilder.ArchiveBuildEntry> allEntries
+        List<TarArchiveBuilder.ArchiveBuildEntry> allEntries,
+        List<TarArchiveBuilder.GcShardEntry> gcEntries
     ) throws IOException {
         // New hierarchical path: {base}/txlog/{yyyyMMdd}/{HHmm}/{ss}.{SSS}.{nodeIdShort}.tar
         Instant now = Instant.now();
         BlobPath archivePath = TranslogArchivePathHelper.tarBlobDir(basePath, now);
 
-        // TAR streaming: compute layout from file sizes alone (no content reads).
-        // All offsets and total size are determined before any data is read — enabling true
-        // single-pass streaming to S3 with exact Content-Length.
-        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(allEntries);
+        // TAR streaming: compute layout with embedded GC summary prefix.
+        // The GC scanner reads these entries (minGen, maxGen, globalCheckpoint per shard)
+        // via a single range-GET to build its rolling checkpoint map — no separate upload needed.
+        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(allEntries, gcEntries);
         long contentLength = layout.getTotalSize();
 
         AtomicReference<String> uploadedBlobName = new AtomicReference<>();

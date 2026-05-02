@@ -332,6 +332,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(shard.routingEntry()).thenReturn(routing);
         when(shard.isRemoteTranslogEnabled()).thenReturn(true);
         when(shard.isSyncNeeded()).thenReturn(true);
+        org.opensearch.index.seqno.SeqNoStats mockSeqNoStats = mock(org.opensearch.index.seqno.SeqNoStats.class);
+        when(mockSeqNoStats.getLocalCheckpoint()).thenReturn(0L);
+        when(mockSeqNoStats.getMaxSeqNo()).thenReturn(100L);
+        when(shard.seqNoStats()).thenReturn(mockSeqNoStats);
         when(shard.supportsArchiveSnapshot()).thenReturn(true);
         when(shard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
         when(shard.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
@@ -446,6 +450,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(shard0.routingEntry()).thenReturn(routing);
         when(shard0.isRemoteTranslogEnabled()).thenReturn(true);
         when(shard0.isSyncNeeded()).thenReturn(true);
+        org.opensearch.index.seqno.SeqNoStats seqNoStats0 = mock(org.opensearch.index.seqno.SeqNoStats.class);
+        when(seqNoStats0.getLocalCheckpoint()).thenReturn(0L);
+        when(seqNoStats0.getMaxSeqNo()).thenReturn(100L);
+        when(shard0.seqNoStats()).thenReturn(seqNoStats0);
         when(shard0.supportsArchiveSnapshot()).thenReturn(true);
         when(shard0.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
         when(shard0.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
@@ -462,6 +470,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(shard1.routingEntry()).thenReturn(routing);
         when(shard1.isRemoteTranslogEnabled()).thenReturn(true);
         when(shard1.isSyncNeeded()).thenReturn(true);
+        org.opensearch.index.seqno.SeqNoStats seqNoStats1 = mock(org.opensearch.index.seqno.SeqNoStats.class);
+        when(seqNoStats1.getLocalCheckpoint()).thenReturn(0L);
+        when(seqNoStats1.getMaxSeqNo()).thenReturn(100L);
+        when(shard1.seqNoStats()).thenReturn(seqNoStats1);
         when(shard1.supportsArchiveSnapshot()).thenReturn(true);
         when(shard1.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
         when(shard1.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
@@ -562,6 +574,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(shard.routingEntry()).thenReturn(routing);
         when(shard.isRemoteTranslogEnabled()).thenReturn(true);
         when(shard.isSyncNeeded()).thenReturn(true);
+        org.opensearch.index.seqno.SeqNoStats mockSeqNoStats = mock(org.opensearch.index.seqno.SeqNoStats.class);
+        when(mockSeqNoStats.getLocalCheckpoint()).thenReturn(0L);
+        when(mockSeqNoStats.getMaxSeqNo()).thenReturn(100L);
+        when(shard.seqNoStats()).thenReturn(mockSeqNoStats);
         when(shard.supportsArchiveSnapshot()).thenReturn(true);
         when(shard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
         when(shard.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
@@ -650,6 +666,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(shard.routingEntry()).thenReturn(routing);
         when(shard.isRemoteTranslogEnabled()).thenReturn(true);
         when(shard.isSyncNeeded()).thenReturn(true);
+        org.opensearch.index.seqno.SeqNoStats mockSeqNoStats = mock(org.opensearch.index.seqno.SeqNoStats.class);
+        when(mockSeqNoStats.getLocalCheckpoint()).thenReturn(0L);
+        when(mockSeqNoStats.getMaxSeqNo()).thenReturn(100L);
+        when(shard.seqNoStats()).thenReturn(mockSeqNoStats);
         when(shard.supportsArchiveSnapshot()).thenReturn(true);
         when(shard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
         when(shard.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
@@ -740,6 +760,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(shard.routingEntry()).thenReturn(routing);
         when(shard.isRemoteTranslogEnabled()).thenReturn(true);
         when(shard.isSyncNeeded()).thenReturn(true);
+        org.opensearch.index.seqno.SeqNoStats mockSeqNoStats = mock(org.opensearch.index.seqno.SeqNoStats.class);
+        when(mockSeqNoStats.getLocalCheckpoint()).thenReturn(0L);
+        when(mockSeqNoStats.getMaxSeqNo()).thenReturn(100L);
+        when(shard.seqNoStats()).thenReturn(mockSeqNoStats);
         when(shard.supportsArchiveSnapshot()).thenReturn(true);
         when(shard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
         when(shard.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
@@ -885,6 +909,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(shard.routingEntry()).thenReturn(routing);
         when(shard.isRemoteTranslogEnabled()).thenReturn(true);
         when(shard.isSyncNeeded()).thenReturn(true);
+        org.opensearch.index.seqno.SeqNoStats mockSeqNoStats = mock(org.opensearch.index.seqno.SeqNoStats.class);
+        when(mockSeqNoStats.getLocalCheckpoint()).thenReturn(0L);
+        when(mockSeqNoStats.getMaxSeqNo()).thenReturn(100L);
+        when(shard.seqNoStats()).thenReturn(mockSeqNoStats);
         when(shard.supportsArchiveSnapshot()).thenReturn(true);
         when(shard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
         when(shard.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
@@ -1166,6 +1194,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(shard.routingEntry()).thenReturn(routing);
         when(shard.isRemoteTranslogEnabled()).thenReturn(true);
         when(shard.isSyncNeeded()).thenReturn(true);
+        org.opensearch.index.seqno.SeqNoStats mockSeqNoStats = mock(org.opensearch.index.seqno.SeqNoStats.class);
+        when(mockSeqNoStats.getLocalCheckpoint()).thenReturn(0L);
+        when(mockSeqNoStats.getMaxSeqNo()).thenReturn(100L);
+        when(shard.seqNoStats()).thenReturn(mockSeqNoStats);
         when(shard.supportsArchiveSnapshot()).thenReturn(true);
         when(shard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
         when(shard.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
@@ -1458,6 +1490,10 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         when(shard.routingEntry()).thenReturn(routing);
         when(shard.isRemoteTranslogEnabled()).thenReturn(true);
         when(shard.isSyncNeeded()).thenReturn(true);
+        org.opensearch.index.seqno.SeqNoStats mockSeqNoStats = mock(org.opensearch.index.seqno.SeqNoStats.class);
+        when(mockSeqNoStats.getLocalCheckpoint()).thenReturn(0L);
+        when(mockSeqNoStats.getMaxSeqNo()).thenReturn(100L);
+        when(shard.seqNoStats()).thenReturn(mockSeqNoStats);
         when(shard.supportsArchiveSnapshot()).thenReturn(true);
         when(shard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
         when(shard.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
@@ -1500,6 +1536,134 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
      * Fix: gc_interval default is 5 minutes.
      * Verifies the setting default is 5m so that the retention GC doesn't run too frequently.
      */
+    /**
+     * Integration test: TAR archive with GC entries where maxGen > globalCheckpoint should NOT be deleted.
+     * The checkpoint gate must block deletion even when the blob is past the retention timestamp.
+     */
+    public void testCheckpointGateBlocksDeletionWhenMaxGenExceedsCheckpoint() throws IOException {
+        // Build a TAR with GC entries: shard 0, gen 5..10 (maxGen=10)
+        String indexUuid = "test-uuid";
+        int shardIdInt = 0;
+        String pathPrefix = indexUuid + "/" + shardIdInt + "/1/";
+        byte[] tlogContent = "tlog".getBytes(StandardCharsets.UTF_8);
+        byte[] ckpContent = "ckp".getBytes(StandardCharsets.UTF_8);
+
+        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
+            new TarArchiveBuilder.GcShardEntry(shardIdInt, 5L, 10L, indexUuid.hashCode(), 8L)
+        );
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
+            TarArchiveBuilder.fromBytes(pathPrefix + "translog-5.tlog", tlogContent),
+            TarArchiveBuilder.fromBytes(pathPrefix + "translog-5.ckp", ckpContent)
+        );
+        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(entries, gcEntries);
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        TarArchiveBuilder.build(baos, layout, entries);
+        byte[] tarBytes = baos.toByteArray();
+
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            String uniqueBase = "base-" + randomAlphaOfLength(12);
+            BlobPath basePath = new BlobPath().add(uniqueBase);
+
+            // Upload TAR at a timestamp 2 hours ago (past retention)
+            Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
+            BlobPath tarDir = TranslogArchivePathHelper.tarBlobDir(basePath, twoHoursAgo);
+            String blobName = TranslogArchivePathHelper.tarBlobName(twoHoursAgo, "node-1");
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blobName, tarBytes, 0L), tarDir, WritePriority.HIGH);
+            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
+
+            // Set up shard mock: globalCheckpoint = 8 → maxGen(10) > 8 → NOT safe
+            IndexMetadata metadata = IndexMetadata.builder("test-index")
+                .settings(
+                    Settings.builder()
+                        .put(IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.CURRENT)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                        .put(IndexMetadata.SETTING_REMOTE_TRANSLOG_STORE_REPOSITORY, "repo")
+                        .put(IndexMetadata.SETTING_REPLICATION_TYPE,
+                            org.opensearch.indices.replication.common.ReplicationType.SEGMENT.toString())
+                        .put(IndexMetadata.SETTING_REMOTE_STORE_ENABLED, true)
+                        .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+                        .build()
+                )
+                .build();
+            IndexSettings indexSettings = new IndexSettings(metadata, Settings.EMPTY);
+            ShardId shardId = new ShardId(metadata.getIndex(), shardIdInt);
+
+            TranslogTransferManager transferManager = mock(TranslogTransferManager.class);
+            when(transferManager.getTransferService()).thenReturn(transferService);
+            when(transferManager.getArchiveBasePath()).thenReturn(basePath);
+
+            IndexShard shard = mock(IndexShard.class);
+            when(shard.shardId()).thenReturn(shardId);
+            when(shard.isRemoteTranslogEnabled()).thenReturn(true);
+            when(shard.isSyncNeeded()).thenReturn(false);
+            when(shard.getTranslogTransferManager()).thenReturn(Optional.of(transferManager));
+            when(shard.getTranslogNodeId()).thenReturn(Optional.of("node-1"));
+            when(shard.indexSettings()).thenReturn(indexSettings);
+            when(shard.getArchiveRetentionBounds()).thenReturn(Optional.empty());
+            // globalCheckpoint = 8 → maxGen(10) > 8 → must NOT delete
+            when(shard.getLastSyncedGlobalCheckpoint()).thenReturn(8L);
+
+            IndexService indexService = mock(IndexService.class);
+            when(indexService.getIndexSettings()).thenReturn(indexSettings);
+            when(indexService.getShardOrNull(shardIdInt)).thenReturn(shard);
+
+            IndicesService indicesService = mock(IndicesService.class);
+            when(indicesService.indexService(any())).thenReturn(indexService);
+            when(indicesService.iterator()).thenAnswer(inv -> Collections.singleton(indexService).iterator());
+
+            RemoteStoreSettings remoteStoreSettings = mock(RemoteStoreSettings.class);
+            when(remoteStoreSettings.getClusterRemoteTranslogBufferInterval()).thenReturn(TimeValue.timeValueMinutes(1));
+            when(remoteStoreSettings.getPathHashAlgorithm()).thenReturn(RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+
+            TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
+            collector.runRetentionForTesting();
+
+            // TAR must still exist — checkpoint gate blocked deletion
+            Map<String, BlobMetadata> after = blobStore.blobContainer(tarDir).listBlobs();
+            assertThat(
+                "TAR with maxGen(10) > globalCheckpoint(8) must NOT be deleted",
+                archiveBlobCount(after),
+                equalTo(1L)
+            );
+
+            // Now upload a newer TAR for the same shard with globalCheckpoint=10 (covers maxGen=10).
+            // The scanner will pick up checkpoint=10 from this TAR → rolling map advances → safe to delete.
+            Instant oneHourAgo = Instant.now().minus(Duration.ofHours(1));
+            BlobPath newerTarDir = TranslogArchivePathHelper.tarBlobDir(basePath, oneHourAgo);
+            String newerBlobName = TranslogArchivePathHelper.tarBlobName(oneHourAgo, "node-1");
+            List<TarArchiveBuilder.GcShardEntry> newerGc = List.of(
+                new TarArchiveBuilder.GcShardEntry(shardIdInt, 11L, 12L, indexUuid.hashCode(), 10L)
+            );
+            List<TarArchiveBuilder.ArchiveBuildEntry> newerEntries = List.of(
+                TarArchiveBuilder.fromBytes(pathPrefix + "translog-11.tlog", "newer".getBytes(StandardCharsets.UTF_8))
+            );
+            TarArchiveBuilder.TarLayout newerLayout = TarArchiveBuilder.computeLayout(newerEntries, newerGc);
+            java.io.ByteArrayOutputStream newerBaos = new java.io.ByteArrayOutputStream();
+            TarArchiveBuilder.build(newerBaos, newerLayout, newerEntries);
+            transferService.uploadBlob(
+                new FileSnapshot.TransferFileSnapshot(newerBlobName, newerBaos.toByteArray(), 0L),
+                newerTarDir, WritePriority.HIGH
+            );
+
+            // Second retention run: scanner sees newer TAR with checkpoint=10 → rolling map = 10
+            // maxGen(10) ≤ rollingCheckpoint(10) → safe → old TAR deleted
+            collector.runRetentionForTesting();
+
+            Map<String, BlobMetadata> afterAdvanced = blobStore.blobContainer(tarDir).listBlobs();
+            assertThat(
+                "TAR with maxGen(10) ≤ rollingCheckpoint(10) must be deleted",
+                archiveBlobCount(afterAdvanced),
+                equalTo(0L)
+            );
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
     public void testTranslogArchiveGcIntervalDefaultIsTenMinutes() {
         // The default gc_interval was changed to 10 minutes to reduce S3 LIST storms.
         TimeValue defaultInterval = RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.getDefault(
