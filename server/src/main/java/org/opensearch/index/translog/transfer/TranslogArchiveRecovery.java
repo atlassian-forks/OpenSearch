@@ -40,11 +40,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
- * Recovers translog files for a single shard from archive ZIPs using binary search on sorted ZIP blob names.
+ * Recovers translog files for a single shard from archive TARs using binary search on sorted TAR blob names.
  * <p>
- * ZIP blob names are timestamps ({@code yyyyMMddHHmmssSSS.zip}), so S3 LIST returns them lexicographically
- * sorted. Generations are monotonically increasing, so binary search on ZIP comments (EOCD tail reads)
- * efficiently locates the ZIPs containing the required generation range.
+ * TAR blob names are timestamps ({@code yyyyMMddHHmmssSSS.tar}), so S3 LIST returns them lexicographically
+ * sorted. Generations are monotonically increasing, so binary search on TAR index (range-reads)
+ * efficiently locates the TARs containing the required generation range.
  *
  * @opensearch.internal
  */
@@ -53,9 +53,9 @@ public final class TranslogArchiveRecovery {
 
     private static final Logger logger = LogManager.getLogger(TranslogArchiveRecovery.class);
 
-    /** Maximum bytes to read from ZIP tail for EOCD comment (covers most comments). */
+    /** Maximum bytes to read from TAR tail for EOCD comment (covers most comments). */
     /** Minimum EOCD size (22 bytes fixed header). */
-    private static final int MAX_ZIPS_PER_BUCKET = 10_000;
+    private static final int MAX_TARS_PER_BUCKET = 10_000;
 
     /** Max blobs to list per minute-dir during hierarchical recovery. */
     private static final int MAX_BLOBS_PER_MINUTE_DIR = 5_000;
@@ -115,7 +115,7 @@ public final class TranslogArchiveRecovery {
         );
 
         // Collect all relevant TARs from minute-dirs at or after startFrom
-        List<ZipRef> tars = collectTarsFromHierarchicalPath(transferService, txlogRoot, startFrom);
+        List<TarRef> tars = collectTarsFromHierarchicalPath(transferService, txlogRoot, startFrom);
         if (tars.isEmpty()) {
             logger.info("No TAR blobs found in hierarchical path from {}, falling back", startFrom);
             return false;
@@ -125,34 +125,47 @@ public final class TranslogArchiveRecovery {
         // Use a call-local cache (blobKey → entries) to avoid re-reading the same TAR index
         // when recovering multiple shards from the same TAR.
         Map<String, List<ArchiveIndexEntry>> entryCache = new HashMap<>();
-        Map<Long, ZipEntryLocation> genToLocation = new HashMap<>();
+        Map<Long, TarEntryLocation> genToLocation = new HashMap<>();
 
-        for (ZipRef tar : tars) {
+        for (TarRef tar : tars) {
             List<ArchiveIndexEntry> entries = readTarIndexCachedEntries(transferService, tar, entryCache);
             for (ArchiveIndexEntry entry : entries) {
                 if (entry.getShardId() != shardId) continue;
                 long generation = entry.getGeneration();
                 if (generation < minGeneration || generation > maxGeneration) continue;
                 // Keep the latest TAR that has this generation (most recent wins)
-                genToLocation.put(generation, new ZipEntryLocation(tar.path, tar.blobName, entry));
+                genToLocation.put(generation, new TarEntryLocation(tar.path, tar.blobName, entry));
             }
         }
 
-        // Download all required generations
+        // Download all required generations.
+        // When minGeneration == Long.MIN_VALUE / maxGeneration == Long.MAX_VALUE this is a
+        // "recover everything" call — iterate only over what was actually found in the TARs,
+        // not over the entire Long range (which would be an infinite loop).
         boolean allFound = true;
-        for (long gen = minGeneration; gen <= maxGeneration; gen++) {
-            ZipEntryLocation loc = genToLocation.get(gen);
-            if (loc == null) {
-                logger.warn("Generation {} not found in hierarchical path for shard {}", gen, shardId);
-                allFound = false;
-                continue;
+        long effectiveMaxGeneration = maxGeneration;
+        if (minGeneration == Long.MIN_VALUE && maxGeneration == Long.MAX_VALUE) {
+            // "Recover all" mode: download every generation found across all TARs for this shard.
+            for (Map.Entry<Long, TarEntryLocation> e : genToLocation.entrySet()) {
+                downloadGeneration(transferService, e.getValue(), e.getKey(), location);
             }
-            downloadGeneration(transferService, loc, gen, location);
+            // Track the highest generation actually found so we can copy the checkpoint below.
+            effectiveMaxGeneration = genToLocation.keySet().stream().mapToLong(Long::longValue).max().orElse(Long.MIN_VALUE);
+        } else {
+            for (long gen = minGeneration; gen <= maxGeneration; gen++) {
+                TarEntryLocation loc = genToLocation.get(gen);
+                if (loc == null) {
+                    logger.warn("Generation {} not found in hierarchical path for shard {}", gen, shardId);
+                    allFound = false;
+                    continue;
+                }
+                downloadGeneration(transferService, loc, gen, location);
+            }
         }
 
-        if (allFound && maxGeneration >= minGeneration) {
-            // Copy final checkpoint
-            String commitCkp = Translog.getCommitCheckpointFileName(maxGeneration);
+        // Copy the highest-generation .ckp to translog.ckp so the translog bootstrap can read it.
+        if (effectiveMaxGeneration != Long.MIN_VALUE && effectiveMaxGeneration != Long.MAX_VALUE) {
+            String commitCkp = Translog.getCommitCheckpointFileName(effectiveMaxGeneration);
             Path commitCkpPath = location.resolve(commitCkp);
             if (Files.exists(commitCkpPath)) {
                 Path globalCkp = location.resolve(Translog.CHECKPOINT_FILE_NAME);
@@ -177,12 +190,12 @@ public final class TranslogArchiveRecovery {
      * @param startFrom       only include TARs in minute-dirs ≥ this timestamp
      * @return sorted list of TAR blob references
      */
-    static List<ZipRef> collectTarsFromHierarchicalPath(
+    static List<TarRef> collectTarsFromHierarchicalPath(
         TransferService transferService,
         BlobPath txlogRoot,
         Instant startFrom
     ) throws IOException {
-        List<ZipRef> result = new ArrayList<>();
+        List<TarRef> result = new ArrayList<>();
 
         Set<String> dayDirs;
         try {
@@ -229,7 +242,7 @@ public final class TranslogArchiveRecovery {
                 if (blobs == null) continue;
                 for (BlobMetadata blob : blobs) {
                     if (blob.name().endsWith(".tar")) {
-                        result.add(new ZipRef(minutePath, blob.name(), blob.length()));
+                        result.add(new TarRef(minutePath, blob.name(), blob.length()));
                     }
                 }
             }
@@ -260,7 +273,7 @@ public final class TranslogArchiveRecovery {
      */
     static List<ArchiveIndexEntry> readTarIndexCachedEntries(
         TransferService transferService,
-        ZipRef tar,
+        TarRef tar,
         Map<String, List<ArchiveIndexEntry>> entryCache
     ) throws IOException {
         String cacheKey = tar.path.buildAsString() + "/" + tar.blobName;
@@ -281,7 +294,7 @@ public final class TranslogArchiveRecovery {
      * The index is always at offset 512 with a known size (from the TAR header), so we can read it
      * with a bounded byte-range GET without knowing the total archive size.
      */
-    static List<ArchiveIndexEntry> readTarIndex(TransferService transferService, ZipRef ref) throws IOException {
+    static List<ArchiveIndexEntry> readTarIndex(TransferService transferService, TarRef ref) throws IOException {
         // Step 1: read the first 512 bytes (TAR header for the index entry) to get index size
         byte[] header;
         try (InputStream hStream = transferService.downloadBlob(ref.path, ref.blobName, 0, TarArchiveBuilder.TAR_BLOCK)) {
@@ -381,9 +394,9 @@ public final class TranslogArchiveRecovery {
     }
 
     /**
-     * Download tlog + ckp for a single generation from a ZIP via range-read.
+     * Download tlog + ckp for a single generation from a TAR via range-read.
      */
-    private static void downloadGeneration(TransferService transferService, ZipEntryLocation loc, long generation, Path location)
+    private static void downloadGeneration(TransferService transferService, TarEntryLocation loc, long generation, Path location)
         throws IOException {
         String tlogFilename = Translog.getFilename(generation);
         String ckpFilename = Translog.getCommitCheckpointFileName(generation);
@@ -453,30 +466,30 @@ public final class TranslogArchiveRecovery {
         return result != null ? result : Collections.emptyList();
     }
 
-    /** Reference to a ZIP blob in the archive. */
-    static final class ZipRef {
+    /** Reference to a TAR blob in the archive. */
+    static final class TarRef {
         final BlobPath path;
         final String blobName;
         final long size;
 
-        ZipRef(BlobPath path, String blobName) {
+        TarRef(BlobPath path, String blobName) {
             this(path, blobName, -1);
         }
 
-        ZipRef(BlobPath path, String blobName, long size) {
+        TarRef(BlobPath path, String blobName, long size) {
             this.path = path;
             this.blobName = blobName;
             this.size = size;
         }
     }
 
-    /** Location of a generation's data within a specific ZIP blob. */
-    static final class ZipEntryLocation {
+    /** Location of a generation's data within a specific TAR blob. */
+    static final class TarEntryLocation {
         final BlobPath path;
         final String blobName;
         final ArchiveIndexEntry entry;
 
-        ZipEntryLocation(BlobPath path, String blobName, ArchiveIndexEntry entry) {
+        TarEntryLocation(BlobPath path, String blobName, ArchiveIndexEntry entry) {
             this.path = path;
             this.blobName = blobName;
             this.entry = entry;

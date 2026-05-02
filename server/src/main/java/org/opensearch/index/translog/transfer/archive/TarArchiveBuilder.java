@@ -67,20 +67,27 @@ public final class TarArchiveBuilder {
     static final String INDEX_ENTRY_NAME = "_index";
 
     /**
-     * GC summary prefix layout (embedded at the head of the binary {@code _index}):
+     * GC summary prefix layout (embedded at the head of the binary {@code _index}),
+     * grouped by index UUID to avoid repeating the UUID per shard:
      * <pre>
-     *   [2 bytes: numShardsGC (unsigned short, big-endian)]
-     *   Per shard:
-     *     [4 bytes: shardId        (int)]
-     *     [8 bytes: minGen         (long)]
-     *     [8 bytes: maxGen         (long)]
-     *     [4 bytes: indexUUID hash (int, first 4 bytes of UUID hash)]
-     *     [8 bytes: globalCheckpoint (long, value at TAR upload time)]
-     *   = 32 bytes/shard
+     *   [2 bytes: numIndices (unsigned short, big-endian)]
+     *   Per index:
+     *     [8 bytes: indexUUID most-significant bits  (long)]
+     *     [8 bytes: indexUUID least-significant bits (long)]
+     *     [2 bytes: numShards (unsigned short, big-endian)]
+     *     Per shard (24 bytes):
+     *       [4 bytes: shardId           (int)]
+     *       [8 bytes: minSeqNo          (long)]
+     *       [8 bytes: maxSeqNo          (long)]
+     *       [8 bytes: globalCheckpoint  (long, value at TAR upload time)]
      * </pre>
-     * Total GC prefix size: {@code 2 + numShardsGC * 32}.
+     * Per-index header overhead: {@code 16 + 2 = 18 bytes}.
+     * Per-shard overhead: {@code 4 (shardId) + 8 (minSeqNo) + 8 (maxSeqNo) + 8 (globalCheckpoint) = 28 bytes}.
      */
-    public static final int GC_SUMMARY_BYTES_PER_SHARD = 32;
+    public static final int GC_SUMMARY_BYTES_PER_SHARD = 28;
+
+    /** Per-index header size in the GC prefix: 16 bytes UUID + 2 bytes numShards. */
+    public static final int GC_INDEX_HEADER_BYTES = 18;
 
     /**
      * Immutable GC summary entry for one shard, embedded in each TAR's {@code _index}.
@@ -92,34 +99,34 @@ public final class TarArchiveBuilder {
      */
     @ExperimentalApi
     public static final class GcShardEntry {
+        private final String indexUUID;
         private final int shardId;
         private final long minSeqNo;
         private final long maxSeqNo;
-        private final int uuidHash;
         private final long globalCheckpoint;
 
         /**
+         * @param indexUUID        full index UUID string (used as grouping key, avoids hash collisions)
          * @param shardId          shard identifier
          * @param minSeqNo         minimum sequence number of ops in this TAR's translog files for this shard
          * @param maxSeqNo         maximum sequence number of ops in this TAR's translog files for this shard
-         * @param uuidHash         first 4 bytes of the index UUID hash (for shard identity disambiguation)
          * @param globalCheckpoint global checkpoint (seqNo) on the data node at TAR upload time;
          *                         same numeric space as minSeqNo/maxSeqNo
          */
-        public GcShardEntry(int shardId, long minSeqNo, long maxSeqNo, int uuidHash, long globalCheckpoint) {
+        public GcShardEntry(String indexUUID, int shardId, long minSeqNo, long maxSeqNo, long globalCheckpoint) {
+            this.indexUUID = indexUUID;
             this.shardId = shardId;
             this.minSeqNo = minSeqNo;
             this.maxSeqNo = maxSeqNo;
-            this.uuidHash = uuidHash;
             this.globalCheckpoint = globalCheckpoint;
         }
 
+        public String getIndexUUID() { return indexUUID; }
         public int getShardId() { return shardId; }
         /** Minimum sequence number of ops in this TAR's translog files for this shard (seqNo space). */
         public long getMinSeqNo() { return minSeqNo; }
         /** Maximum sequence number of ops in this TAR's translog files for this shard (seqNo space). */
         public long getMaxSeqNo() { return maxSeqNo; }
-        public int getUuidHash() { return uuidHash; }
         /** Global checkpoint (seqNo) on the data node at the time this TAR was uploaded. */
         public long getGlobalCheckpoint() { return globalCheckpoint; }
     }
@@ -195,9 +202,12 @@ public final class TarArchiveBuilder {
      *
      * <p>The {@code _index} binary layout with GC prefix:
      * <pre>
-     *   GC SUMMARY PREFIX:
-     *     [2 bytes: numShardsGC]
-     *     Per shard: [4 shardId][8 minGen][8 maxGen][4 uuidHash][8 globalCheckpoint] = 32 bytes
+     *   GC SUMMARY PREFIX (index-grouped):
+     *     [2 bytes: numIndices]
+     *     Per index:
+     *       [16 bytes: indexUUID as 2 longs (msb+lsb)]
+     *       [2 bytes: numShards]
+     *       Per shard: [4 shardId][8 minSeqNo][8 maxSeqNo][8 globalCheckpoint] = 24 bytes
      *   FULL ENTRY INDEX:
      *     [4 bytes: numEntries]
      *     Per entry: [2 pathLen][pathLen path][8 dataOffset][8 dataLength]
@@ -220,11 +230,18 @@ public final class TarArchiveBuilder {
             sizes.add(e.getSize());
         }
 
-        // Step 2: compute index size
-        //   GC prefix:   2 + numGcShards * GC_SUMMARY_BYTES_PER_SHARD
-        //   Entry index: 4 (num_entries) + sum(2 + path_len + 8 + 8) per entry
-        int numGcShards = gcEntries.size();
-        int gcPrefixSize = 2 + numGcShards * GC_SUMMARY_BYTES_PER_SHARD;
+        // Step 2: compute GC prefix size (index-grouped format)
+        //   2 (numIndices) + per-index: 18 (header) + numShards * 24
+        // Group gcEntries by indexUUID
+        java.util.LinkedHashMap<String, List<GcShardEntry>> byIndex = new java.util.LinkedHashMap<>();
+        for (GcShardEntry gc : gcEntries) {
+            byIndex.computeIfAbsent(gc.getIndexUUID(), k -> new ArrayList<>()).add(gc);
+        }
+        int numIndices = byIndex.size();
+        int gcPrefixSize = 2; // numIndices
+        for (List<GcShardEntry> shards : byIndex.values()) {
+            gcPrefixSize += GC_INDEX_HEADER_BYTES + shards.size() * GC_SUMMARY_BYTES_PER_SHARD;
+        }
 
         int numEntries = paths.size();
         int entryIndexSize = 4; // num_entries header
@@ -304,8 +321,16 @@ public final class TarArchiveBuilder {
     // ── Index serialization ────────────────────────────────────────────────────
 
     private static byte[] serializeIndex(List<String> paths, List<EntryLocation> locations, List<GcShardEntry> gcEntries) {
-        int numGcShards = gcEntries.size();
-        int gcPrefixSize = 2 + numGcShards * GC_SUMMARY_BYTES_PER_SHARD;
+        // Group by indexUUID (preserve insertion order)
+        java.util.LinkedHashMap<String, List<GcShardEntry>> byIndex = new java.util.LinkedHashMap<>();
+        for (GcShardEntry gc : gcEntries) {
+            byIndex.computeIfAbsent(gc.getIndexUUID(), k -> new ArrayList<>()).add(gc);
+        }
+        int numIndices = byIndex.size();
+        int gcPrefixSize = 2; // numIndices
+        for (List<GcShardEntry> shards : byIndex.values()) {
+            gcPrefixSize += GC_INDEX_HEADER_BYTES + shards.size() * GC_SUMMARY_BYTES_PER_SHARD;
+        }
 
         int numEntries = paths.size();
         int entryIndexSize = 4;
@@ -318,14 +343,32 @@ public final class TarArchiveBuilder {
 
         ByteBuffer buf = ByteBuffer.allocate(gcPrefixSize + entryIndexSize);
 
-        // Write GC summary prefix
-        buf.putShort((short) numGcShards);
-        for (GcShardEntry gc : gcEntries) {
-            buf.putInt(gc.getShardId());
-            buf.putLong(gc.getMinSeqNo());
-            buf.putLong(gc.getMaxSeqNo());
-            buf.putInt(gc.getUuidHash());
-            buf.putLong(gc.getGlobalCheckpoint());
+        // Write GC summary prefix (index-grouped)
+        buf.putShort((short) numIndices);
+        for (java.util.Map.Entry<String, List<GcShardEntry>> indexEntry : byIndex.entrySet()) {
+            // Write 16-byte UUID (msb + lsb). For non-standard UUID strings (e.g. "_na_" in tests),
+            // fall back to a deterministic 128-bit hash of the string.
+            long uuidMsb, uuidLsb;
+            try {
+                java.util.UUID uuid = java.util.UUID.fromString(indexEntry.getKey());
+                uuidMsb = uuid.getMostSignificantBits();
+                uuidLsb = uuid.getLeastSignificantBits();
+            } catch (IllegalArgumentException e) {
+                // Non-standard UUID: use name-based UUID (type 3) as a deterministic fallback
+                java.util.UUID uuid = java.util.UUID.nameUUIDFromBytes(indexEntry.getKey().getBytes(StandardCharsets.UTF_8));
+                uuidMsb = uuid.getMostSignificantBits();
+                uuidLsb = uuid.getLeastSignificantBits();
+            }
+            buf.putLong(uuidMsb);
+            buf.putLong(uuidLsb);
+            List<GcShardEntry> shards = indexEntry.getValue();
+            buf.putShort((short) shards.size());
+            for (GcShardEntry gc : shards) {
+                buf.putInt(gc.getShardId());
+                buf.putLong(gc.getMinSeqNo());
+                buf.putLong(gc.getMaxSeqNo());
+                buf.putLong(gc.getGlobalCheckpoint());
+            }
         }
 
         // Write full entry index
@@ -342,16 +385,30 @@ public final class TarArchiveBuilder {
 
     /**
      * Parses the binary entry index from {@code _index} bytes, skipping the GC summary prefix.
+     * The GC prefix uses the index-grouped format; we skip it by reading the structure.
      *
      * @param indexBytes raw index bytes (content of the first TAR entry)
      * @return list of (path, dataOffset, dataLength) in order
      */
     public static List<EntryLocation> parseIndex(byte[] indexBytes) throws IOException {
+        if (indexBytes == null || indexBytes.length < 2) {
+            return Collections.emptyList();
+        }
         ByteBuffer buf = ByteBuffer.wrap(indexBytes);
-        // Skip GC summary prefix: [2 bytes numShardsGC] + numShardsGC * GC_SUMMARY_BYTES_PER_SHARD bytes
-        int numShardsGC = buf.getShort() & 0xFFFF;
-        buf.position(buf.position() + numShardsGC * GC_SUMMARY_BYTES_PER_SHARD);
+        // Skip GC summary prefix (index-grouped format):
+        //   [2 bytes: numIndices]
+        //   Per index: [16 bytes UUID][2 bytes numShards][numShards * 24 bytes]
+        int numIndices = buf.getShort() & 0xFFFF;
+        for (int i = 0; i < numIndices; i++) {
+            buf.getLong(); // UUID msb
+            buf.getLong(); // UUID lsb
+            int numShards = buf.getShort() & 0xFFFF;
+            buf.position(buf.position() + numShards * GC_SUMMARY_BYTES_PER_SHARD);
+        }
 
+        if (buf.remaining() < 4) {
+            return Collections.emptyList();
+        }
         int numEntries = buf.getInt();
         List<EntryLocation> result = new ArrayList<>(numEntries);
         for (int i = 0; i < numEntries; i++) {
@@ -367,31 +424,41 @@ public final class TarArchiveBuilder {
     }
 
     /**
-     * Parses only the GC summary prefix from {@code _index} bytes.
-     * This is a fast path for the GC scanner: read just the first
-     * {@code 2 + numShardsGC * GC_SUMMARY_BYTES_PER_SHARD} bytes without parsing the full entry index.
+     * Parses only the GC summary prefix from {@code _index} bytes (index-grouped format).
+     * This is a fast path for the GC scanner: returns one {@link GcShardEntry} per shard
+     * across all indices, with the {@code indexUUID} populated from the group header.
      *
      * @param indexBytes raw index bytes (GC prefix only, or full _index)
-     * @return list of {@link GcShardEntry} from the GC prefix
+     * @return list of {@link GcShardEntry} from the GC prefix (all indices flattened)
      */
     public static List<GcShardEntry> parseGcSummary(byte[] indexBytes) {
         if (indexBytes == null || indexBytes.length < 2) {
             return Collections.emptyList();
         }
         ByteBuffer buf = ByteBuffer.wrap(indexBytes);
-        int numShards = buf.getShort() & 0xFFFF;
-        int requiredBytes = 2 + numShards * GC_SUMMARY_BYTES_PER_SHARD;
-        if (indexBytes.length < requiredBytes) {
+        int numIndices = buf.getShort() & 0xFFFF;
+        if (numIndices == 0) {
             return Collections.emptyList();
         }
-        List<GcShardEntry> result = new ArrayList<>(numShards);
-        for (int i = 0; i < numShards; i++) {
-            int shardId = buf.getInt();
-            long minGen = buf.getLong();
-            long maxGen = buf.getLong();
-            int uuidHash = buf.getInt();
-            long globalCheckpoint = buf.getLong();
-            result.add(new GcShardEntry(shardId, minGen, maxGen, uuidHash, globalCheckpoint));
+        List<GcShardEntry> result = new ArrayList<>();
+        for (int i = 0; i < numIndices; i++) {
+            if (buf.remaining() < GC_INDEX_HEADER_BYTES) {
+                return Collections.emptyList(); // truncated
+            }
+            long uuidMsb = buf.getLong();
+            long uuidLsb = buf.getLong();
+            String indexUUID = new java.util.UUID(uuidMsb, uuidLsb).toString();
+            int numShards = buf.getShort() & 0xFFFF;
+            if (buf.remaining() < numShards * GC_SUMMARY_BYTES_PER_SHARD) {
+                return Collections.emptyList(); // truncated
+            }
+            for (int s = 0; s < numShards; s++) {
+                int shardId = buf.getInt();
+                long minSeqNo = buf.getLong();
+                long maxSeqNo = buf.getLong();
+                long globalCheckpoint = buf.getLong();
+                result.add(new GcShardEntry(indexUUID, shardId, minSeqNo, maxSeqNo, globalCheckpoint));
+            }
         }
         return result;
     }

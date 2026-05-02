@@ -62,12 +62,14 @@ public final class TranslogArchiveGcScanner {
     private static final int MAX_IDX_PER_DAY = 10_000;
 
     /**
-     * Upper bound for the GC prefix read in one range-GET:
-     * {@code 2 + 4096 * GC_SUMMARY_BYTES_PER_SHARD = 2 + 4096 * 32 = 131,074 bytes ≈ 128 KB}.
+     * Upper bound for the GC prefix read in one range-GET (index-grouped format):
+     * {@code 2 (numIndices) + maxIndices * (18 (header) + maxShardsPerIndex * 28 (per shard))}.
+     * Assuming max 512 indices/node and max 8 shards/index = 4096 shards/node:
+     * {@code 2 + 512 * (18 + 8 * 28) = 2 + 512 * 242 = 123,906 bytes ≈ 121 KB}.
+     * Conservative upper bound: use 2 + 4096 * (18 + 28) to handle worst case (1 shard/index).
      * S3 charges per request, not per byte — this is effectively free.
-     * 4,096 shards/node is a generous upper bound covering any realistic cluster configuration.
      */
-    static final int MAX_GC_PREFIX_BYTES = 2 + 4096 * TarArchiveBuilder.GC_SUMMARY_BYTES_PER_SHARD;
+    static final int MAX_GC_PREFIX_BYTES = 2 + 4096 * (TarArchiveBuilder.GC_INDEX_HEADER_BYTES + TarArchiveBuilder.GC_SUMMARY_BYTES_PER_SHARD);
 
     private final TransferService transferService;
     private final BlobPath archiveBasePath;
@@ -79,19 +81,21 @@ public final class TranslogArchiveGcScanner {
     private final Map<String, MinuteGcIndex> inMemoryIndex = new ConcurrentHashMap<>();
 
     /**
-     * Rolling per-shard checkpoint: {@code shardId → max(lastSyncedGlobalCheckpoint)} across all scanned TARs.
+     * Rolling per-(indexUUID, shardId) checkpoint:
+     * {@code indexUUID → shardId → max(lastSyncedGlobalCheckpoint)} across all scanned TARs.
      * Updated in chronological minute order so the max is always the latest known value.
      * Used in Phase 2 of {@link #isSafeToDelete} and {@link #isTarSafeToDelete}.
+     * Two-level map avoids collisions between different indices that share the same shard ID.
      */
-    private final Map<Integer, Long> rollingCheckpoints = new ConcurrentHashMap<>();
+    private final Map<String, Map<Integer, Long>> rollingCheckpoints = new ConcurrentHashMap<>();
 
     /**
-     * Latest max seqNo ever observed per shard across all scanned minute-dirs.
+     * Latest max seqNo ever observed per (indexUUID, shardId) across all scanned minute-dirs.
      * Used by {@link #isShardStuck}: a shard is stuck when its rolling checkpoint
      * has not yet advanced past its latest observed maxSeqNo.
      * Bounded by cluster topology (total shards in cluster).
      */
-    private final Map<Integer, Long> latestMaxSeqNo = new ConcurrentHashMap<>();
+    private final Map<String, Map<Integer, Long>> latestMaxSeqNo = new ConcurrentHashMap<>();
 
     // Note: No per-TAR GC cache is maintained.
     // During deleteStuckMinutePartially(), GC prefix is re-read via range-GET for each TAR.
@@ -169,9 +173,13 @@ public final class TranslogArchiveGcScanner {
                         }
                         MinuteGcIndex idx = MinuteGcIndex.deserialize(bytes);
                         inMemoryIndex.put(minuteKey, idx);
-                        // Restore rolling checkpoints from persisted state
-                        for (MinuteGcIndex.ShardRange shard : idx.shards()) {
-                            rollingCheckpoints.merge(shard.getShardId(), shard.getMaxCheckpoint(), Math::max);
+                        // Restore rolling checkpoints from persisted state (2-level: indexUUID → shardId)
+                        for (String indexUUID : idx.indexUUIDs()) {
+                            Map<Integer, Long> indexCheckpoints = rollingCheckpoints
+                                .computeIfAbsent(indexUUID, k -> new ConcurrentHashMap<>());
+                            for (MinuteGcIndex.ShardRange shard : idx.shards(indexUUID).values()) {
+                                indexCheckpoints.merge(shard.getShardId(), shard.getMaxCheckpoint(), Math::max);
+                            }
                         }
                     } catch (IOException e) {
                         logger.warn("GC scanner: failed to load idx {}/{}: {}", dayDir, blob.name(), e.getMessage());
@@ -186,46 +194,62 @@ public final class TranslogArchiveGcScanner {
 
     /**
      * Checks if a minute-dir is safe to delete using a two-phase check.
-     *
-     * <p><b>Phase 1 — Immediate check</b> (no newer TAR needed):
-     * For each shard in this minute, if {@code entry.maxCheckpoint ≥ entry.maxSeqNo} at upload time,
-     * the ops were already committed to remote segments when the TAR was written. Safe immediately.
-     *
-     * <p><b>Phase 2 — Rolling check</b> (newer TAR advanced the checkpoint):
-     * For shards not yet safe by Phase 1, check {@code rollingCheckpoints[shard] ≥ maxSeqNo}.
-     * The rolling checkpoint is the max globalCheckpoint ever seen across all scanned TARs,
-     * including newer minutes.
-     *
-     * <p>This two-phase design correctly handles idle shards (Phase 1) and active shards
-     * where the checkpoint advanced in a later minute (Phase 2) — without requiring any
-     * extra S3 uploads.
-     *
-     * <p>Special cases:
-     * <ul>
-     *   <li>{@code idx == null}: not yet scanned → {@code false} (conservative)</li>
-     *   <li>{@code idx.size() == 0}: scanned, no GC shards → {@code true} (safe)</li>
-     * </ul>
+     * Uses {@code null} liveIndexUUIDs (conservative: no liveness check, same as before).
      *
      * @param minuteKey {@code "yyyyMMdd/HHmm"} key identifying the minute-dir
      * @return true if all shards in this minute have their ops durably committed
      */
     public boolean isSafeToDelete(String minuteKey) {
+        return isSafeToDelete(minuteKey, null);
+    }
+
+    /**
+     * Checks if a minute-dir is safe to delete using a two-phase check, with optional
+     * index liveness information.
+     *
+     * <p>For each (indexUUID, shard) entry in the minute:
+     * <ul>
+     *   <li>If {@code liveIndexUUIDs} is non-null and does NOT contain the indexUUID →
+     *       index was deleted → this shard's entry is unconditionally safe (skip).</li>
+     *   <li><b>Phase 1</b>: {@code maxCheckpoint ≥ maxSeqNo} at upload time → ops in remote segments → safe.</li>
+     *   <li><b>Phase 2</b>: {@code rollingCheckpoints[indexUUID][shardId] ≥ maxSeqNo} → newer TAR confirmed → safe.</li>
+     *   <li>Otherwise → hold (not safe yet).</li>
+     * </ul>
+     *
+     * <p>Special cases:
+     * <ul>
+     *   <li>{@code idx == null}: not yet scanned → {@code false} (conservative)</li>
+     *   <li>{@code idx.isEmpty()}: scanned, no GC shards → {@code true} (safe)</li>
+     * </ul>
+     *
+     * @param minuteKey      {@code "yyyyMMdd/HHmm"} key identifying the minute-dir
+     * @param liveIndexUUIDs set of index UUIDs currently alive in cluster state; null → skip liveness check
+     * @return true if all shard entries in this minute are safe to delete
+     */
+    public boolean isSafeToDelete(String minuteKey, Set<String> liveIndexUUIDs) {
         MinuteGcIndex idx = inMemoryIndex.get(minuteKey);
         if (idx == null) {
             return false; // Not yet scanned — conservatively hold
         }
-        if (idx.size() == 0) {
+        if (idx.isEmpty()) {
             return true; // Scanned, no GC shards → safe
         }
-        for (MinuteGcIndex.ShardRange shard : idx.shards()) {
-            // Phase 1: immediate — checkpoint at upload time already covered all ops
-            if (shard.getMaxCheckpoint() >= shard.getMaxSeqNo()) {
-                continue; // This shard is immediately safe
+        for (String indexUUID : idx.indexUUIDs()) {
+            // If index is gone from cluster state, all its shard data is unconditionally safe
+            if (liveIndexUUIDs != null && !liveIndexUUIDs.contains(indexUUID)) {
+                continue;
             }
-            // Phase 2: rolling — a newer TAR has since advanced the checkpoint past maxSeqNo
-            Long latestCheckpoint = rollingCheckpoints.get(shard.getShardId());
-            if (latestCheckpoint == null || shard.getMaxSeqNo() > latestCheckpoint) {
-                return false; // Still waiting for checkpoint to advance
+            for (MinuteGcIndex.ShardRange shard : idx.shards(indexUUID).values()) {
+                // Phase 1: immediate — checkpoint at upload time already covered all ops
+                if (shard.getMaxCheckpoint() >= shard.getMaxSeqNo()) {
+                    continue;
+                }
+                // Phase 2: rolling — a newer TAR has since advanced the checkpoint past maxSeqNo
+                Map<Integer, Long> indexCheckpoints = rollingCheckpoints.get(indexUUID);
+                Long latestCheckpoint = indexCheckpoints != null ? indexCheckpoints.get(shard.getShardId()) : null;
+                if (latestCheckpoint == null || shard.getMaxSeqNo() > latestCheckpoint) {
+                    return false; // Still waiting for checkpoint to advance
+                }
             }
         }
         return true;
@@ -235,38 +259,55 @@ public final class TranslogArchiveGcScanner {
      * Returns true if a shard is currently "stuck" — its rolling checkpoint has not yet
      * advanced past its latest observed maxSeqNo across all scanned minute-dirs.
      *
-     * <p>A stuck shard means at least one TAR containing it cannot yet be safely deleted.
-     * Used for per-TAR granularity: TARs whose shards are all non-stuck can be deleted
-     * even when their minute-dir contains other stuck shards from a different node.
-     *
-     * @param shardId shard identifier
+     * @param indexUUID index UUID (required to disambiguate shards across indices)
+     * @param shardId   shard identifier
      * @return true if the shard's checkpoint has not caught up to its latest observed seqNo
      */
-    public boolean isShardStuck(int shardId) {
-        Long checkpoint = rollingCheckpoints.get(shardId);
-        Long maxSeq = latestMaxSeqNo.get(shardId);
-        if (checkpoint == null || maxSeq == null) return true; // unknown → conservative
+    public boolean isShardStuck(String indexUUID, int shardId) {
+        Map<Integer, Long> indexCheckpoints = rollingCheckpoints.get(indexUUID);
+        Map<Integer, Long> indexMaxSeqNos = latestMaxSeqNo.get(indexUUID);
+        if (indexCheckpoints == null || indexMaxSeqNos == null) return true; // unknown → conservative
+        Long checkpoint = indexCheckpoints.get(shardId);
+        Long maxSeq = indexMaxSeqNos.get(shardId);
+        if (checkpoint == null || maxSeq == null) return true;
         return checkpoint < maxSeq;
     }
 
     /**
-     * Checks if a specific TAR blob is safe to delete using the two-phase check applied
-     * to each shard in the TAR's GC entries.
-     *
-     * <p>This enables per-TAR granularity: even when a minute-dir is not entirely safe
-     * (because one node's shard is stuck), individual TARs from other nodes whose shards
-     * are all safe can still be deleted immediately.
-     *
-     * @param gcEntries GC shard entries from this specific TAR's {@code _index} prefix
-     * @return true if all shards in this TAR have their ops durably committed
+     * Checks if a specific TAR blob is safe to delete.
+     * Uses {@code null} liveIndexUUIDs (conservative: no liveness check).
      */
     public boolean isTarSafeToDelete(List<TarArchiveBuilder.GcShardEntry> gcEntries) {
+        return isTarSafeToDelete(gcEntries, null);
+    }
+
+    /**
+     * Checks if a specific TAR blob is safe to delete using the two-phase check applied
+     * to each shard in the TAR's GC entries, with optional index liveness information.
+     *
+     * <p>For each shard entry:
+     * <ul>
+     *   <li>If {@code liveIndexUUIDs} non-null and index not in set → deleted → unconditionally safe (skip).</li>
+     *   <li>Phase 1: {@code globalCheckpoint ≥ maxSeqNo} → safe.</li>
+     *   <li>Phase 2: {@code !isShardStuck(indexUUID, shardId)} → rolling checkpoint covered → safe.</li>
+     *   <li>Otherwise → hold.</li>
+     * </ul>
+     *
+     * @param gcEntries      GC shard entries from this specific TAR's {@code _index} prefix
+     * @param liveIndexUUIDs set of index UUIDs currently alive in cluster state; null → skip liveness check
+     * @return true if all shards in this TAR have their ops durably committed
+     */
+    public boolean isTarSafeToDelete(List<TarArchiveBuilder.GcShardEntry> gcEntries, Set<String> liveIndexUUIDs) {
         if (gcEntries.isEmpty()) return true; // No GC shards → safe
         for (TarArchiveBuilder.GcShardEntry e : gcEntries) {
+            // Deleted index: unconditionally safe (no recovery possible)
+            if (liveIndexUUIDs != null && !liveIndexUUIDs.contains(e.getIndexUUID())) {
+                continue;
+            }
             // Phase 1: immediate — checkpoint at upload time already covered all ops
             if (e.getGlobalCheckpoint() >= e.getMaxSeqNo()) continue;
             // Phase 2: rolling — checkpoint advanced in a later minute
-            if (isShardStuck(e.getShardId())) return false;
+            if (isShardStuck(e.getIndexUUID(), e.getShardId())) return false;
         }
         return true;
     }
@@ -274,14 +315,14 @@ public final class TranslogArchiveGcScanner {
     /**
      * Returns the rolling checkpoint map (for testing / inspection).
      */
-    public Map<Integer, Long> getRollingCheckpoints() {
+    public Map<String, Map<Integer, Long>> getRollingCheckpoints() {
         return Collections.unmodifiableMap(rollingCheckpoints);
     }
 
     /**
      * Returns the latestMaxSeqNo map (for testing / inspection).
      */
-    public Map<Integer, Long> getLatestMaxSeqNo() {
+    public Map<String, Map<Integer, Long>> getLatestMaxSeqNo() {
         return Collections.unmodifiableMap(latestMaxSeqNo);
     }
 
@@ -291,6 +332,20 @@ public final class TranslogArchiveGcScanner {
      */
     public void evict(String minuteKey) {
         inMemoryIndex.remove(minuteKey);
+    }
+
+    /**
+     * Evicts all in-memory state for a deleted index.
+     * Called when an index is deleted so stale checkpoint data doesn't block GC
+     * of future indices that reuse the same shard IDs.
+     *
+     * @param indexUUID the UUID of the deleted index
+     */
+    public void evictIndex(String indexUUID) {
+        rollingCheckpoints.remove(indexUUID);
+        latestMaxSeqNo.remove(indexUUID);
+        // Note: inMemoryIndex (MinuteGcIndex) entries are keyed by minute-key, not indexUUID.
+        // Those will be cleaned up naturally when the minute-dir is deleted via GC.
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -391,9 +446,10 @@ public final class TranslogArchiveGcScanner {
             if (!blob.name().endsWith(".tar")) continue;
             List<TarArchiveBuilder.GcShardEntry> gcEntries = readGcPrefix(minutePath, blob.name());
             builder.merge(gcEntries);
-            // Update latestMaxSeqNo for per-TAR stuck detection (isShardStuck)
+            // Update latestMaxSeqNo for per-TAR stuck detection (isShardStuck), keyed by (indexUUID, shardId)
             for (TarArchiveBuilder.GcShardEntry e : gcEntries) {
-                latestMaxSeqNo.merge(e.getShardId(), e.getMaxSeqNo(), Math::max);
+                latestMaxSeqNo.computeIfAbsent(e.getIndexUUID(), k -> new ConcurrentHashMap<>())
+                    .merge(e.getShardId(), e.getMaxSeqNo(), Math::max);
             }
         }
 
@@ -439,10 +495,14 @@ public final class TranslogArchiveGcScanner {
         // This preserves the invariant: absent .idx means "not yet scanned".
         inMemoryIndex.put(minuteKey, idx);
 
-        // Update rolling checkpoints with this minute's per-shard maxCheckpoint.
+        // Update rolling checkpoints with this minute's per-(indexUUID, shardId) maxCheckpoint.
         // Called after persistence to ensure durability-memory consistency.
-        for (MinuteGcIndex.ShardRange shard : idx.shards()) {
-            rollingCheckpoints.merge(shard.getShardId(), shard.getMaxCheckpoint(), Math::max);
+        for (String indexUUID : idx.indexUUIDs()) {
+            Map<Integer, Long> indexCheckpoints = rollingCheckpoints
+                .computeIfAbsent(indexUUID, k -> new ConcurrentHashMap<>());
+            for (MinuteGcIndex.ShardRange shard : idx.shards(indexUUID).values()) {
+                indexCheckpoints.merge(shard.getShardId(), shard.getMaxCheckpoint(), Math::max);
+            }
         }
 
         logger.debug("GC scanner: indexed minute {}/{} with {} shards", dayDir, minuteDir, idx.size());

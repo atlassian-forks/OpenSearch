@@ -237,25 +237,11 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         );
 
         String path = pathCaptor.getValue().buildAsString();
-        String hashNodeId = TranslogArchivePathHelper.hashNodeId(
-            "test-node-id",
-            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-        );
-        String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
-            "test-index-uuid",
-            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-        );
 
-        // Path must NOT contain legacy hashed components — those are now in the blob name
-        assertFalse("Path must NOT contain hashed nodeId in directory", path.contains(hashNodeId));
-        assertFalse("Path must NOT contain hashed indexUUID in directory", path.contains(hashTypeIndex));
-        assertFalse("Path must NOT use old translog/data/ prefix", path.contains("translog/data/"));
-
-        // Path must start with txlog/
-        assertThat(path, org.hamcrest.Matchers.startsWith("repo-root/txlog/"));
-
-        // Node ID must be embedded in the blob name instead
-        assertThat("Node ID must be in blob name", nameCaptor.getValue(), org.hamcrest.Matchers.containsString("testnode"));
+        // New hierarchical path: repo-root/txlog/{yyyyMMdd}/{HHmm}/
+        // Path must NOT use legacy hash-based segments or bare numeric buckets
+        assertThat("Path must use txlog/ prefix", path, org.hamcrest.Matchers.startsWith("repo-root/txlog/"));
+        assertFalse("Path must NOT use bare bucket '/0/'", path.contains("/0/"));
     }
 
     /**

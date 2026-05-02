@@ -31,14 +31,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -453,6 +457,44 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
     }
 
     /**
+     * Dedicated test: verifies that uploaded TARs follow the exact hierarchical S3 path structure:
+     * {@code txlog/{yyyyMMdd}/{HHmm}/{ss}.{SSS}.{nodeIdShort}.tar}
+     *
+     * <p>This catches regressions where the helper methods exist but are not wired into the actual
+     * upload call (e.g. if someone accidentally uses the legacy flat path instead).
+     */
+    public void testTarUploadFollowsHierarchicalPathStructure() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder().put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "50ms").build()
+            )
+            .get();
+        internalCluster().startDataOnlyNode();
+        Settings indexSettings = Settings.builder()
+            .put(remoteStoreIndexSettings(0, 1))
+            .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+            .build();
+        createIndex(INDEX_NAME, indexSettings);
+        ensureGreen(INDEX_NAME);
+
+        // Flush first batch → goes to segments; second batch stays in translog → triggers archive upload
+        indexKnownDocs(INDEX_NAME, 10);
+        flushAndRefresh(INDEX_NAME);
+        indexKnownDocs(INDEX_NAME, 10);
+        waitForTranslogArchiveUpload();
+
+        // Collect all uploaded TAR paths and assert each conforms to the spec.
+        List<String> tarPaths = collectTarPaths(translogRepoPath);
+        assertFalse("expected at least one TAR path to validate", tarPaths.isEmpty());
+        for (String relPath : tarPaths) {
+            assertTarPathStructure(relPath);
+        }
+    }
+
+    /**
      * Wait until at least one translog archive TAR appears in the translog repo.
      * New path layout: txlog/{yyyyMMdd}/{HHmm}/*.tar
      */
@@ -539,5 +581,63 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
      */
     private static boolean hasZipInDirOrChildren(Path dir, int levelsToZip) {
         return hasArchiveInDirOrChildren(dir, levelsToZip);
+    }
+
+    /**
+     * Collects all {@code *.tar} paths under {@code txlog/} in the repo root, returning each
+     * as a relative path string: {@code txlog/{day}/{minute}/{blob}.tar}.
+     */
+    private static List<String> collectTarPaths(Path repoRoot) throws IOException {
+        List<String> result = new ArrayList<>();
+        Path txlogRoot = repoRoot.resolve("txlog");
+        if (!Files.isDirectory(txlogRoot)) {
+            return result;
+        }
+        // Walk: txlog/{day}/{minute}/*.tar
+        try (DirectoryStream<Path> dayDirs = Files.newDirectoryStream(txlogRoot)) {
+            for (Path dayDir : dayDirs) {
+                if (!Files.isDirectory(dayDir)) continue;
+                try (DirectoryStream<Path> minuteDirs = Files.newDirectoryStream(dayDir)) {
+                    for (Path minuteDir : minuteDirs) {
+                        if (!Files.isDirectory(minuteDir)) continue;
+                        try (DirectoryStream<Path> blobs = Files.newDirectoryStream(minuteDir, "*.tar")) {
+                            for (Path blob : blobs) {
+                                // Build relative path: txlog/{day}/{minute}/{blob}
+                                result.add("txlog/"
+                                    + dayDir.getFileName() + "/"
+                                    + minuteDir.getFileName() + "/"
+                                    + blob.getFileName());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Asserts that a relative TAR path matches the exact hierarchical structure from the design:
+     * <pre>txlog/{yyyyMMdd}/{HHmm}/{ss}.{SSS}.{nodeIdShort}.tar</pre>
+     * where:
+     * <ul>
+     *   <li>{yyyyMMdd} — 8 digits</li>
+     *   <li>{HHmm}     — 4 digits</li>
+     *   <li>{ss}       — exactly 2 digits (00-59)</li>
+     *   <li>{SSS}      — exactly 3 digits (000-999)</li>
+     *   <li>{nodeIdShort} — exactly 8 alphanumeric chars</li>
+     * </ul>
+     *
+     * @param relPath relative path like {@code txlog/20260502/1430/45.123.a3f7b2c1.tar}
+     */
+    private static void assertTarPathStructure(String relPath) {
+        // Pattern: txlog/{8 digits}/{4 digits}/{2 digits}.{3 digits}.{8 alnum}.tar
+        Pattern pattern = Pattern.compile(
+            "txlog/\\d{8}/\\d{4}/\\d{2}\\.\\d{3}\\.[a-zA-Z0-9]{8}\\.tar"
+        );
+        assertTrue(
+            "TAR path does not match expected structure 'txlog/{yyyyMMdd}/{HHmm}/{ss}.{SSS}.{nodeIdShort}.tar', got: " + relPath,
+            pattern.matcher(relPath).matches()
+        );
     }
 }

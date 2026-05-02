@@ -10,26 +10,35 @@ package org.opensearch.index.translog.transfer.archive;
 
 import org.opensearch.common.annotation.ExperimentalApi;
 
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 
 /**
- * Per-minute merged GC index: tracks the min/maxGen for each shard across all TARs in one minute-dir.
+ * Per-minute merged GC index: tracks the min/maxSeqNo and max globalCheckpoint for each
+ * (indexUUID, shardId) pair across all TARs in one minute-dir.
  *
  * <p>Built by {@link TranslogArchiveGcScanner} after merging GC summaries from all TAR blobs in a
  * minute-dir. Persisted to {@code gc_idx/{day}/{HHmm}.idx} and held in memory on the cluster-manager.
  *
- * <p>Binary serialization format ({@code .idx} file):
+ * <p>Binary serialization format ({@code .idx} file) mirrors the TAR GC prefix (index-grouped):
  * <pre>
- *   [2 bytes: numShards (unsigned short)]
- *   Per shard:
- *     [4 bytes: shardId]
- *     [8 bytes: minGen]
- *     [8 bytes: maxGen]
- *     [4 bytes: uuidHash]
- *   = 18 bytes/shard + 2 byte header
+ *   [2 bytes: numIndices (unsigned short)]
+ *   Per index:
+ *     [8 bytes: indexUUID most-significant bits  (long)]
+ *     [8 bytes: indexUUID least-significant bits (long)]
+ *     [2 bytes: numShards (unsigned short)]
+ *     Per shard (28 bytes):
+ *       [4 bytes: shardId]
+ *       [8 bytes: minSeqNo]
+ *       [8 bytes: maxSeqNo]
+ *       [8 bytes: maxCheckpoint]
  * </pre>
  *
  * @opensearch.internal
@@ -37,72 +46,97 @@ import java.util.Map;
 @ExperimentalApi
 public final class MinuteGcIndex {
 
-    /**
-     * Bytes per shard entry in the serialized {@code .idx} file.
-     * Layout: [4 shardId][8 minGen][8 maxGen][4 uuidHash][8 maxCheckpoint] = 32 bytes.
-     */
+    /** Bytes per shard entry in the serialized format (matches TarArchiveBuilder.GC_SUMMARY_BYTES_PER_SHARD = 28). */
     static final int BYTES_PER_SHARD = TarArchiveBuilder.GC_SUMMARY_BYTES_PER_SHARD;
 
-    /** Merged shard entries: shardId → ShardRange */
-    private final Map<Integer, ShardRange> shards;
+    /** Per-index header bytes in serialized format: 16 UUID + 2 numShards (matches GC_INDEX_HEADER_BYTES = 18). */
+    static final int INDEX_HEADER_BYTES = TarArchiveBuilder.GC_INDEX_HEADER_BYTES;
 
-    public MinuteGcIndex(Map<Integer, ShardRange> shards) {
-        this.shards = Collections.unmodifiableMap(shards);
+    /** Merged shard entries: indexUUID → shardId → ShardRange */
+    private final Map<String, Map<Integer, ShardRange>> shards;
+
+    public MinuteGcIndex(Map<String, Map<Integer, ShardRange>> shards) {
+        // Make deeply unmodifiable
+        Map<String, Map<Integer, ShardRange>> immutable = new HashMap<>(shards.size());
+        for (Map.Entry<String, Map<Integer, ShardRange>> e : shards.entrySet()) {
+            immutable.put(e.getKey(), Collections.unmodifiableMap(new HashMap<>(e.getValue())));
+        }
+        this.shards = Collections.unmodifiableMap(immutable);
     }
 
-    /** Returns all shard ranges in this minute index. */
-    public Collection<ShardRange> shards() {
-        return shards.values();
+    /** Returns all index UUIDs tracked in this minute. */
+    public Set<String> indexUUIDs() {
+        return shards.keySet();
     }
 
-    /** Returns the shard range for the given shardId, or null if not present. */
-    public ShardRange get(int shardId) {
-        return shards.get(shardId);
+    /** Returns all shard ranges for a specific index, or empty map if index not present. */
+    public Map<Integer, ShardRange> shards(String indexUUID) {
+        return shards.getOrDefault(indexUUID, Collections.emptyMap());
     }
 
-    /** Number of shards tracked in this minute. */
+    /** Returns the shard range for a specific (indexUUID, shardId), or null if not present. */
+    public ShardRange get(String indexUUID, int shardId) {
+        Map<Integer, ShardRange> indexShards = shards.get(indexUUID);
+        return indexShards != null ? indexShards.get(shardId) : null;
+    }
+
+    /** Returns all shard ranges across all indices (flattened). */
+    public Collection<ShardRange> allShards() {
+        List<ShardRange> result = new ArrayList<>();
+        for (Map<Integer, ShardRange> indexShards : shards.values()) {
+            result.addAll(indexShards.values());
+        }
+        return result;
+    }
+
+    /** Total number of shards tracked across all indices in this minute. */
     public int size() {
-        return shards.size();
+        int total = 0;
+        for (Map<Integer, ShardRange> indexShards : shards.values()) {
+            total += indexShards.size();
+        }
+        return total;
+    }
+
+    /** Returns true if no shards are tracked (empty minute). */
+    public boolean isEmpty() {
+        return shards.isEmpty();
     }
 
     /**
-     * Merged generation range + max known global checkpoint for one shard in one minute-dir,
-     * accumulated across all TAR blobs in that minute.
-     *
-     * <p>{@code maxCheckpoint} is the maximum {@code globalCheckpoint} seen across all TARs
-     * in this minute for this shard. It represents the latest checkpoint observed at upload
-     * time within this minute, used by the scanner's rolling checkpoint map.
+     * Merged generation range + max known global checkpoint for one (indexUUID, shardId) pair
+     * in one minute-dir, accumulated across all TAR blobs in that minute.
      */
     @ExperimentalApi
     public static final class ShardRange {
+        private final String indexUUID;
         private final int shardId;
         private final long minSeqNo;
         private final long maxSeqNo;
-        private final int uuidHash;
         private final long maxCheckpoint;
 
-        public ShardRange(int shardId, long minSeqNo, long maxSeqNo, int uuidHash, long maxCheckpoint) {
+        public ShardRange(String indexUUID, int shardId, long minSeqNo, long maxSeqNo, long maxCheckpoint) {
+            this.indexUUID = indexUUID;
             this.shardId = shardId;
             this.minSeqNo = minSeqNo;
             this.maxSeqNo = maxSeqNo;
-            this.uuidHash = uuidHash;
             this.maxCheckpoint = maxCheckpoint;
         }
 
+        public String getIndexUUID() { return indexUUID; }
         public int getShardId() { return shardId; }
         public long getMinSeqNo() { return minSeqNo; }
         public long getMaxSeqNo() { return maxSeqNo; }
-        public int getUuidHash() { return uuidHash; }
-        /** Max globalCheckpoint seen across all TARs in this minute for this shard. */
+        /** Max globalCheckpoint seen across all TARs in this minute for this (index, shard). */
         public long getMaxCheckpoint() { return maxCheckpoint; }
 
-        /** Merge with another range for the same shard: expand gen range, take max checkpoint. */
+        /** Merge with another range for the same (indexUUID, shardId): expand seqNo range, take max checkpoint. */
         public ShardRange merge(ShardRange other) {
             return new ShardRange(
+                indexUUID,
                 shardId,
                 Math.min(minSeqNo, other.minSeqNo),
                 Math.max(maxSeqNo, other.maxSeqNo),
-                uuidHash,
                 Math.max(maxCheckpoint, other.maxCheckpoint)
             );
         }
@@ -114,24 +148,31 @@ public final class MinuteGcIndex {
      * Mutable builder: accumulates GC entries from multiple TARs in one minute-dir.
      */
     public static final class Builder {
-        private final Map<Integer, ShardRange> shards = new HashMap<>();
+        /** indexUUID → shardId → ShardRange */
+        private final Map<String, Map<Integer, ShardRange>> shards = new HashMap<>();
 
         /**
          * Merges a list of {@link TarArchiveBuilder.GcShardEntry} from one TAR into this builder.
          */
-        public void merge(java.util.List<TarArchiveBuilder.GcShardEntry> gcEntries) {
+        public void merge(List<TarArchiveBuilder.GcShardEntry> gcEntries) {
             for (TarArchiveBuilder.GcShardEntry entry : gcEntries) {
+                String indexUUID = entry.getIndexUUID();
+                int shardId = entry.getShardId();
                 ShardRange incoming = new ShardRange(
-                    entry.getShardId(), entry.getMinSeqNo(), entry.getMaxSeqNo(),
-                    entry.getUuidHash(), entry.getGlobalCheckpoint()
+                    indexUUID,
+                    shardId,
+                    entry.getMinSeqNo(),
+                    entry.getMaxSeqNo(),
+                    entry.getGlobalCheckpoint()
                 );
-                shards.merge(entry.getShardId(), incoming, ShardRange::merge);
+                shards.computeIfAbsent(indexUUID, k -> new HashMap<>())
+                    .merge(shardId, incoming, ShardRange::merge);
             }
         }
 
         /** Builds the immutable {@link MinuteGcIndex}. */
         public MinuteGcIndex build() {
-            return new MinuteGcIndex(new HashMap<>(shards));
+            return new MinuteGcIndex(shards);
         }
 
         public boolean isEmpty() {
@@ -143,18 +184,38 @@ public final class MinuteGcIndex {
 
     /**
      * Serializes this index to bytes for storage as a {@code .idx} blob.
-     * Format mirrors the GC prefix in the TAR {@code _index} (same layout, reusable parser).
+     * Format mirrors the GC prefix in the TAR {@code _index} (index-grouped, same layout).
      */
     public byte[] serialize() {
-        int numShards = shards.size();
-        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(2 + numShards * BYTES_PER_SHARD);
-        buf.putShort((short) numShards);
-        for (ShardRange r : shards.values()) {
-            buf.putInt(r.getShardId());
-            buf.putLong(r.getMinSeqNo());
-            buf.putLong(r.getMaxSeqNo());
-            buf.putInt(r.getUuidHash());
-            buf.putLong(r.getMaxCheckpoint());
+        int numIndices = shards.size();
+        // Compute total size: 2 (numIndices) + per-index: 18 header + numShards * 28
+        int totalSize = 2;
+        for (Map<Integer, ShardRange> indexShards : shards.values()) {
+            totalSize += INDEX_HEADER_BYTES + indexShards.size() * BYTES_PER_SHARD;
+        }
+        ByteBuffer buf = ByteBuffer.allocate(totalSize);
+        buf.putShort((short) numIndices);
+        for (Map.Entry<String, Map<Integer, ShardRange>> indexEntry : shards.entrySet()) {
+            long uuidMsb, uuidLsb;
+            try {
+                UUID uuid = UUID.fromString(indexEntry.getKey());
+                uuidMsb = uuid.getMostSignificantBits();
+                uuidLsb = uuid.getLeastSignificantBits();
+            } catch (IllegalArgumentException e) {
+                UUID uuid = UUID.nameUUIDFromBytes(indexEntry.getKey().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                uuidMsb = uuid.getMostSignificantBits();
+                uuidLsb = uuid.getLeastSignificantBits();
+            }
+            buf.putLong(uuidMsb);
+            buf.putLong(uuidLsb);
+            Map<Integer, ShardRange> indexShards = indexEntry.getValue();
+            buf.putShort((short) indexShards.size());
+            for (ShardRange r : indexShards.values()) {
+                buf.putInt(r.getShardId());
+                buf.putLong(r.getMinSeqNo());
+                buf.putLong(r.getMaxSeqNo());
+                buf.putLong(r.getMaxCheckpoint());
+            }
         }
         return buf.array();
     }
@@ -169,20 +230,32 @@ public final class MinuteGcIndex {
         if (bytes == null || bytes.length < 2) {
             return new MinuteGcIndex(Collections.emptyMap());
         }
-        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(bytes);
-        int numShards = buf.getShort() & 0xFFFF;
-        int required = 2 + numShards * BYTES_PER_SHARD;
-        if (bytes.length < required) {
+        ByteBuffer buf = ByteBuffer.wrap(bytes);
+        int numIndices = buf.getShort() & 0xFFFF;
+        if (numIndices == 0) {
             return new MinuteGcIndex(Collections.emptyMap());
         }
-        Map<Integer, ShardRange> result = new HashMap<>(numShards);
-        for (int i = 0; i < numShards; i++) {
-            int shardId = buf.getInt();
-            long minSeqNo = buf.getLong();
-            long maxSeqNo = buf.getLong();
-            int uuidHash = buf.getInt();
-            long maxCheckpoint = buf.getLong();
-            result.put(shardId, new ShardRange(shardId, minSeqNo, maxSeqNo, uuidHash, maxCheckpoint));
+        Map<String, Map<Integer, ShardRange>> result = new HashMap<>(numIndices);
+        for (int i = 0; i < numIndices; i++) {
+            if (buf.remaining() < INDEX_HEADER_BYTES) {
+                return new MinuteGcIndex(Collections.emptyMap()); // truncated
+            }
+            long uuidMsb = buf.getLong();
+            long uuidLsb = buf.getLong();
+            String indexUUID = new UUID(uuidMsb, uuidLsb).toString();
+            int numShards = buf.getShort() & 0xFFFF;
+            if (buf.remaining() < numShards * BYTES_PER_SHARD) {
+                return new MinuteGcIndex(Collections.emptyMap()); // truncated
+            }
+            Map<Integer, ShardRange> indexShards = new HashMap<>(numShards);
+            for (int s = 0; s < numShards; s++) {
+                int shardId = buf.getInt();
+                long minSeqNo = buf.getLong();
+                long maxSeqNo = buf.getLong();
+                long maxCheckpoint = buf.getLong();
+                indexShards.put(shardId, new ShardRange(indexUUID, shardId, minSeqNo, maxSeqNo, maxCheckpoint));
+            }
+            result.put(indexUUID, indexShards);
         }
         return new MinuteGcIndex(result);
     }

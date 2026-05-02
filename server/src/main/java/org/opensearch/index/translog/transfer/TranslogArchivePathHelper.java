@@ -10,8 +10,6 @@ package org.opensearch.index.translog.transfer;
 
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.index.remote.RemoteStoreEnums;
-import org.opensearch.index.remote.RemoteStoreUtils;
 
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -23,14 +21,14 @@ import java.util.Optional;
 /**
  * Helpers for translog archive path layout and blob name generation.
  *
- * <p><b>New hierarchical path layout</b> (per-node, all indices combined):
+ * <p><b>Hierarchical path layout</b> (per-node, all indices combined):
  * <pre>
  *   {base}/txlog/{yyyyMMdd}/{HHmm}/{ss}.{SSS}.{nodeIdShort}.tar
  * </pre>
  * Example: {@code txlog/20260501/2230/45.123.a3f7b2c1.tar}
  *
  * <ul>
- *   <li>{@code txlog/} — fixed top-level prefix (shorter than legacy "translog/data/")</li>
+ *   <li>{@code txlog/} — fixed top-level prefix</li>
  *   <li>{@code yyyyMMdd/} — UTC day directory</li>
  *   <li>{@code HHmm/} — UTC minute directory (~120 per 2h window at steady state)</li>
  *   <li>{@code ss.SSS.{nodeIdShort}.tar} — blob: seconds, milliseconds, short node id</li>
@@ -43,11 +41,6 @@ import java.util.Optional;
  * <p><b>Restore</b>: LIST minute-dirs from {@code lastSegmentTimestamp - margin}, then list
  * blobs within those dirs.
  *
- * <p><b>Legacy</b>: Old {@code .zip} and flat {@code .tar} blobs under
- * {@code translog/data/{hashTypeIndex}/{hashNodeId}/} are still parseable via
- * {@link #parseBlobNameTimestamp(String)} and {@link #hashTypeIndex}/{@link #hashNodeId}
- * for backward-compatible reading. New uploads always use the hierarchical path.
- *
  * @opensearch.internal
  */
 @ExperimentalApi
@@ -55,9 +48,6 @@ public final class TranslogArchivePathHelper {
 
     /** Top-level directory prefix for the new hierarchical path. */
     public static final String TXLOG_PREFIX = "txlog";
-
-    /** Legacy file type used in hashTypeIndex (kept for backward compat reading). */
-    private static final String FILE_TYPE_TRANSLOG_ZIP = "translog_zip";
 
     /** Formatter for the day-level directory: {@code yyyyMMdd}. */
     private static final DateTimeFormatter DAY_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd", Locale.ROOT)
@@ -71,8 +61,8 @@ public final class TranslogArchivePathHelper {
     private static final DateTimeFormatter BLOB_NAME_TIME_FORMAT = DateTimeFormatter.ofPattern("ss.SSS", Locale.ROOT)
         .withZone(ZoneOffset.UTC);
 
-    /** Legacy timestamp formatter used for old blob names: {@code yyyyMMddHHmmssSSS}. */
-    private static final DateTimeFormatter LEGACY_BLOB_TIMESTAMP_FORMAT = DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS", Locale.ROOT)
+    /** Formatter for parsing concatenated day+minute+blob timestamp: {@code yyyyMMddHHmmssSSS}. */
+    private static final DateTimeFormatter FULL_TIMESTAMP_FORMAT = DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS", Locale.ROOT)
         .withZone(ZoneOffset.UTC);
 
     /** Length of the short node ID appended to blob names. */
@@ -161,13 +151,15 @@ public final class TranslogArchivePathHelper {
         if (parts.length < 4) {
             return Optional.empty();
         }
-        // Reassemble full timestamp: yyyyMMdd + HHmm + ss + SSS = 17 chars
-        String tsStr = dayDirStr + minuteDirStr + parts[0] + parts[1];
+        // Parse timestamp from component parts: yyyyMMdd (day) + HHmm (minute) + ss.SSS (blob)
+        // Combine into a single yyyyMMddHHmmssSSS string and parse with a prebuilt formatter.
+        // Format: dayDir=yyyyMMdd, minuteDir=HHmm, parts[0]=ss, parts[1]=SSS
+        String tsStr = dayDirStr + minuteDirStr + parts[0] + parts[1]; // 17 chars: yyyyMMddHHmmssSSS
         if (tsStr.length() != 17) {
             return Optional.empty();
         }
         try {
-            return Optional.of(Instant.from(LEGACY_BLOB_TIMESTAMP_FORMAT.parse(tsStr)));
+            return Optional.of(Instant.from(FULL_TIMESTAMP_FORMAT.parse(tsStr)));
         } catch (DateTimeParseException e) {
             return Optional.empty();
         }
@@ -184,81 +176,6 @@ public final class TranslogArchivePathHelper {
         String[] parts = blobName.split("\\.", -1);
         // ss.SSS.nodeIdShort.tar → ["ss", "SSS", nodeIdShort, "tar"] = 4 parts
         return parts.length == 4 && parts[0].length() == 2 && parts[1].length() == 3;
-    }
-
-    // ── Legacy path helpers (kept for backward-compat reading) ────────────────
-
-    /**
-     * Legacy: first path component hash(fileType, indexUUID).
-     */
-    public static String hashTypeIndex(String indexUUID, RemoteStoreEnums.PathHashAlgorithm algorithm) {
-        return RemoteStoreUtils.hashStringForPath(FILE_TYPE_TRANSLOG_ZIP + "|" + indexUUID, algorithm);
-    }
-
-    /**
-     * Legacy: second path component hash(nodeId).
-     */
-    public static String hashNodeId(String nodeId, RemoteStoreEnums.PathHashAlgorithm algorithm) {
-        return RemoteStoreUtils.hashStringForPath(nodeId, algorithm);
-    }
-
-    /**
-     * Legacy: blob name for ZIP archives: {@code yyyyMMddHHmmssSSS.zip}.
-     */
-    public static String blobNameFromCurrentTime() {
-        return LEGACY_BLOB_TIMESTAMP_FORMAT.format(Instant.now()) + ".zip";
-    }
-
-    /**
-     * Legacy: flat TAR blob name: {@code yyyyMMddHHmmssSSS.tar}.
-     *
-     * @deprecated Use {@link #tarBlobName(Instant, String)} with {@link #tarBlobDir(BlobPath, Instant)}.
-     */
-    @Deprecated
-    public static String tarBlobNameFromCurrentTime() {
-        return LEGACY_BLOB_TIMESTAMP_FORMAT.format(Instant.now()) + ".tar";
-    }
-
-    /**
-     * Format an {@link Instant} to the legacy timestamp string ({@code yyyyMMddHHmmssSSS}).
-     * Useful in tests to construct blob names with controlled timestamps.
-     */
-    public static String formatTimestamp(Instant instant) {
-        return LEGACY_BLOB_TIMESTAMP_FORMAT.format(instant);
-    }
-
-    /**
-     * Parse blob name to timestamp for legacy blob retention.
-     * Handles old format {@code yyyyMMddHHmmssSSS.zip} or flat {@code yyyyMMddHHmmssSSS.tar}.
-     * For new-format blobs, use {@link #parseTarBlobTimestamp(String, String, String)}.
-     */
-    public static Optional<Instant> parseBlobNameTimestamp(String blobName) {
-        if (blobName == null) {
-            return Optional.empty();
-        }
-        String base;
-        if (blobName.endsWith(".zip")) {
-            base = blobName.substring(0, blobName.length() - 4);
-        } else if (blobName.endsWith(".tar")) {
-            base = blobName.substring(0, blobName.length() - 4);
-        } else {
-            return Optional.empty();
-        }
-        if (base.length() != 17) {
-            return Optional.empty();
-        }
-        try {
-            return Optional.of(Instant.from(LEGACY_BLOB_TIMESTAMP_FORMAT.parse(base)));
-        } catch (DateTimeParseException e) {
-            return Optional.empty();
-        }
-    }
-
-    /**
-     * Returns true if the blob name is a legacy archive blob (ZIP or flat TAR).
-     */
-    public static boolean isArchiveBlob(String blobName) {
-        return blobName != null && (blobName.endsWith(".zip") || blobName.endsWith(".tar"));
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

@@ -13,6 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.LocalNodeClusterManagerListener;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobMetadata;
@@ -46,6 +47,7 @@ import java.io.PipedOutputStream;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -386,8 +388,8 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
                 // Use last SYNCED checkpoint: the checkpoint written to the last committed Lucene segment.
                 // This is the checkpoint the remote segment store has durably uploaded — safe for GC decisions.
                 long syncedGlobalCheckpoint = shard.getLastSyncedGlobalCheckpoint();
-                int uuidHash = shard.indexSettings().getIndexMetadata().getIndexUUID().hashCode();
-                gcEntries.add(new TarArchiveBuilder.GcShardEntry(shard.shardId().id(), minSeqNo, maxSeqNo, uuidHash, syncedGlobalCheckpoint));
+                String indexUUID = shard.indexSettings().getIndexMetadata().getIndexUUID();
+                gcEntries.add(new TarArchiveBuilder.GcShardEntry(indexUUID, shard.shardId().id(), minSeqNo, maxSeqNo, syncedGlobalCheckpoint));
             }
             if (allEntries.isEmpty()) {
                 logger.debug("Skipping translog archive upload: all snapshots are empty (no translog files to archive)");
@@ -458,6 +460,16 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             }
         }
 
+        // Build liveIndexUUIDs from cluster state — authoritative, works on dedicated master with no local shards.
+        // Indices absent from cluster state have been deleted; their TARs are unconditionally safe to delete.
+        Set<String> liveIndexUUIDs = null;
+        if (clusterService != null) {
+            liveIndexUUIDs = new HashSet<>();
+            for (IndexMetadata meta : clusterService.state().metadata()) {
+                liveIndexUUIDs.add(meta.getIndexUUID());
+            }
+        }
+
         // Safety buffer: never delete a minute-dir that was uploaded less than MIN_RETENTION_SAFETY_BUFFER_MINUTES
         // ago, regardless of checkpoint state. This protects against edge cases where a minute-dir is
         // brand-new and the scanner hasn't had time to index it yet.
@@ -465,7 +477,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(anyBasePath);
 
         try {
-            deleteHierarchicalArchivesOlderThan(anyTransferService, txlogRoot, safetyCutoff, scanner);
+            deleteHierarchicalArchivesOlderThan(anyTransferService, txlogRoot, safetyCutoff, scanner, liveIndexUUIDs);
         } catch (IOException ex) {
             logger.warn("Archive retention GC failed: {}", ex.getMessage());
         }
@@ -494,6 +506,45 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         BlobPath txlogRoot,
         Instant cutoff,
         TranslogArchiveGcScanner scanner
+    ) throws IOException {
+        return deleteHierarchicalArchivesOlderThan(transferService, txlogRoot, cutoff, scanner, null);
+    }
+
+    /**
+     * Backward-compatible overload — no scanner, timestamp-only.
+     */
+    static int deleteHierarchicalArchivesOlderThan(
+        TransferService transferService,
+        BlobPath txlogRoot,
+        Instant cutoff
+    ) throws IOException {
+        return deleteHierarchicalArchivesOlderThan(transferService, txlogRoot, cutoff, null, null);
+    }
+
+    /**
+     * Hierarchical GC for {@code txlog/{day}/{minute}/} path structure.
+     *
+     * <p>For each expired minute-dir (older than {@code cutoff}):
+     * <ol>
+     *   <li>Ask {@code scanner.isSafeToDelete(minuteKey, liveIndexUUIDs)}: deleted-index shards are
+     *       unconditionally safe; live-index shards use the two-phase checkpoint check.</li>
+     *   <li>Delete all blobs in the minute-dir (or just blobs older than cutoff for boundary minute).</li>
+     *   <li>Evict from scanner's in-memory index.</li>
+     * </ol>
+     *
+     * @param transferService blob service
+     * @param txlogRoot       path to the {@code txlog/} root
+     * @param cutoff          delete blobs/dirs with timestamp before this instant
+     * @param scanner         checkpoint-aware GC scanner; may be null (skips checkpoint gate)
+     * @param liveIndexUUIDs  set of index UUIDs currently alive in cluster state; null → skip liveness check
+     * @return total number of blobs deleted
+     */
+    static int deleteHierarchicalArchivesOlderThan(
+        TransferService transferService,
+        BlobPath txlogRoot,
+        Instant cutoff,
+        TranslogArchiveGcScanner scanner,
+        Set<String> liveIndexUUIDs
     ) throws IOException {
         int deleted = 0;
 
@@ -539,11 +590,11 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
 
                 // Checkpoint safety gate via rolling checkpoint map embedded in TARs.
                 // scanner == null → no gate (timestamp-only fallback, whole-minute delete).
-                if (scanner != null && !scanner.isSafeToDelete(minuteKey)) {
+                if (scanner != null && !scanner.isSafeToDelete(minuteKey, liveIndexUUIDs)) {
                     // Minute-dir is not entirely safe — attempt per-TAR granularity deletion.
                     // Safe TARs (from non-stuck shards) can be deleted individually even if the
                     // minute-dir still holds a few stuck TARs from a down node.
-                    int partialDeleted = deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner);
+                    int partialDeleted = deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner, liveIndexUUIDs);
                     deleted += partialDeleted;
                     // Don't evict — the minute-key stays in memory until all TARs are gone.
                     continue;
@@ -561,17 +612,6 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             }
         }
         return deleted;
-    }
-
-    /**
-     * Backward-compatible overload — no scanner, timestamp-only.
-     */
-    static int deleteHierarchicalArchivesOlderThan(
-        TransferService transferService,
-        BlobPath txlogRoot,
-        Instant cutoff
-    ) throws IOException {
-        return deleteHierarchicalArchivesOlderThan(transferService, txlogRoot, cutoff, null);
     }
 
     /**
@@ -598,6 +638,16 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         BlobPath minutePath,
         String minuteKey,
         TranslogArchiveGcScanner scanner
+    ) {
+        return deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner, null);
+    }
+
+    static int deleteStuckMinutePartially(
+        TransferService transferService,
+        BlobPath minutePath,
+        String minuteKey,
+        TranslogArchiveGcScanner scanner,
+        Set<String> liveIndexUUIDs
     ) {
         // List remaining TAR blobs in the minute-dir
         List<BlobMetadata> remainingBlobs;
@@ -633,7 +683,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             // Re-read GC prefix via range-GET (1 GET per TAR — same cost as initial scan)
             List<TarArchiveBuilder.GcShardEntry> gcEntries = scanner.readGcPrefix(minutePath, blobName);
 
-            if (scanner.isTarSafeToDelete(gcEntries)) {
+            if (scanner.isTarSafeToDelete(gcEntries, liveIndexUUIDs)) {
                 safeToDelete.add(blobName);
             } else {
                 remaining++;
@@ -915,10 +965,15 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
 
     /**
      * Unregister an index from coordinator-based upload (e.g. on index deletion).
-     * Orphaned ZIPs are detected and cleaned up by the GC via S3 folder scan.
+     * Also evicts the index from the GC scanner's in-memory state so stale checkpoint data
+     * doesn't block GC for future indices that reuse the same shard IDs.
      */
     public void unregisterCoordinatorIndex(String indexUUID) {
         coordinatorEnabledIndices.remove(indexUUID);
+        TranslogArchiveGcScanner scanner = gcScanner;
+        if (scanner != null) {
+            scanner.evictIndex(indexUUID);
+        }
     }
 
     /**
@@ -944,45 +999,4 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         runArchiveRetention();
     }
 
-    /**
-     * Backward-compatible adapter for tests that used the old flat-dir GC API.
-     * Deletes blobs in {@code zipDir} whose legacy timestamp (from blob name) is older than
-     * {@code now - retentionMinutes}. Used by unit tests that set up blobs directly in a flat dir.
-     *
-     * @param transferService  blob transfer service
-     * @param zipDir           flat blob directory (path ending at the container level)
-     * @param retentionMinutes retention cutoff in minutes
-     * @return number of blobs deleted
-     * @throws IOException on list failure
-     */
-    static int deleteArchivesOlderThanRetention(
-        TransferService transferService,
-        BlobPath zipDir,
-        long retentionMinutes
-    ) throws IOException {
-        Instant cutoff = Instant.now().minus(Duration.ofMinutes(retentionMinutes));
-        // Use listAllInSortedOrder directly (flat dir, old blob names)
-        List<BlobMetadata> blobs;
-        blobs = PlainActionFuture.<List<BlobMetadata>, IOException>get(
-            f -> transferService.listAllInSortedOrder(zipDir, "", MAX_ARCHIVE_BLOBS_PER_PAGE, f)
-        );
-        if (blobs == null || blobs.isEmpty()) {
-            return 0;
-        }
-        List<String> toDelete = new ArrayList<>();
-        for (BlobMetadata blob : blobs) {
-            String name = blob.name();
-            Optional<Instant> tsOpt = TranslogArchivePathHelper.parseBlobNameTimestamp(name);
-            if (tsOpt.isPresent() && tsOpt.get().isBefore(cutoff)) {
-                toDelete.add(name);
-            }
-        }
-        int deleted = 0;
-        for (int i = 0; i < toDelete.size(); i += RETENTION_DELETE_BATCH_SIZE) {
-            int end = Math.min(i + RETENTION_DELETE_BATCH_SIZE, toDelete.size());
-            transferService.deleteBlobs(zipDir, new ArrayList<>(toDelete.subList(i, end)));
-            deleted += end - i;
-        }
-        return deleted;
-    }
 }

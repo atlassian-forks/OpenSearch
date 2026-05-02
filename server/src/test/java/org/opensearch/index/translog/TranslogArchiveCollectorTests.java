@@ -32,15 +32,17 @@ import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 
 import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
-import org.opensearch.index.translog.transfer.archive.ArchiveEntry;
 import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
+import org.opensearch.index.translog.transfer.archive.TranslogArchiveGcScanner;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -57,6 +59,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.hasItems;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -64,10 +67,14 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
+
+    private static final String UUID_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    private static final String UUID_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
     /** Count archive blobs only; ignores filesystem metadata (e.g. .DS_Store on macOS). */
     private static long archiveBlobCount(Map<String, BlobMetadata> blobs) {
@@ -144,84 +151,6 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             assertThat("TAR index should have one entry", locations, hasSize(1));
             assertThat(locations.get(0).getPath(), equalTo(path));
             assertThat(locations.get(0).getDataLength(), equalTo((long) content.length));
-        } finally {
-            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
-        }
-    }
-
-    /**
-     * deleteArchivesOlderThanRetention deletes TARs with a timestamp older than the retention cutoff.
-     * Uses a blob name with a timestamp 1 hour in the past with 5-minute retention → should be deleted.
-     */
-    public void testDeleteArchivesOlderThanRetentionDeletesWhenPastRetention() throws IOException {
-        String pathPrefix = "idx-uuid/0/1/";
-        byte[] tlogContent = "tlog".getBytes(StandardCharsets.UTF_8);
-        byte[] ckpContent = "ckp".getBytes(StandardCharsets.UTF_8);
-        List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
-            TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", tlogContent),
-            TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.ckp", ckpContent)
-        );
-        TranslogArchiveCollector collector = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] tarBytes = collector.buildArchiveFromEntries(entries);
-
-        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
-        ThreadPool threadPool = new TestThreadPool(getClass().getName());
-        try {
-            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
-            String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
-                "idx-uuid",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-            );
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
-
-            // Blob name: timestamp 1 hour ago → past 5-minute retention
-            String oldBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now().minus(Duration.ofHours(1))) + ".tar";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldBlobName, tarBytes, 0L), tarDir, WritePriority.HIGH);
-            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
-
-            long retentionMinutes = 5L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
-            assertThat(deleted, equalTo(1));
-            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(0L));
-        } finally {
-            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
-        }
-    }
-
-    /**
-     * deleteArchivesOlderThanRetention keeps TARs with a timestamp within the retention window.
-     * Uses a blob name with current timestamp and 60-minute retention → should be kept.
-     */
-    public void testDeleteArchivesOlderThanRetentionKeepsWhenWithinRetention() throws IOException {
-        String pathPrefix = "idx-uuid/0/1/";
-        byte[] content = "x".getBytes(StandardCharsets.UTF_8);
-        TranslogArchiveCollector collector = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] tarBytes = collector.buildArchiveFromEntries(
-            Collections.singletonList(TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", content))
-        );
-
-        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
-        ThreadPool threadPool = new TestThreadPool(getClass().getName());
-        try {
-            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
-            String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
-                "idx-uuid",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-            );
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
-
-            // Blob name: current timestamp → within 60-minute retention
-            String freshBlobName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshBlobName, tarBytes, 0L), tarDir, WritePriority.HIGH);
-
-            long retentionMinutes = 60L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
-            assertThat(deleted, equalTo(0));
-            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
@@ -1048,119 +977,6 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
     }
 
     /**
-     * deleteArchivesOlderThanRetentionNewPath with empty retention bounds map: no-op, no archives deleted.
-     */
-    /**
-     * deleteArchivesOlderThanRetention with a fresh TAR (current timestamp) and long retention → no deletion.
-     * Verifies that TARs within the retention window are not touched.
-     */
-    public void testDeleteArchivesWithFreshZipIsNoOp() throws IOException {
-        String pathPrefix = "idx-uuid/0/1/";
-        byte[] content = "x".getBytes(StandardCharsets.UTF_8);
-        TranslogArchiveCollector collectorForBuild = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] tarBytes = collectorForBuild.buildArchiveFromEntries(
-            Collections.singletonList(TarArchiveBuilder.fromBytes(pathPrefix + "translog-2.tlog", content))
-        );
-
-        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
-        ThreadPool threadPool = new TestThreadPool(getClass().getName());
-        try {
-            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
-            String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
-                "idx-uuid",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-            );
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
-
-            // Fresh TAR → within 60-minute retention window
-            String freshName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshName, tarBytes, 0L), tarDir, WritePriority.HIGH);
-            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
-
-            long retentionMinutes = 60L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
-            assertThat("fresh TAR within retention should not be deleted", deleted, equalTo(0));
-            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
-        } finally {
-            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
-        }
-    }
-
-    /**
-     * Retention with mixed old/new TARs by timestamp: old TARs (past retention) are deleted, new TARs kept.
-     */
-    public void testRetentionWithMixedOldNewZips() throws IOException {
-        String indexUuid = "idx-uuid";
-        String pathPrefix0 = indexUuid + "/0/1/";
-        String pathPrefix1 = indexUuid + "/1/1/";
-
-        // Old TAR: gen 2 (past retention bounds of minGen=1, maxGen=3)
-        byte[] oldContent = "old".getBytes(StandardCharsets.UTF_8);
-        TranslogArchiveCollector collectorForBuild = new TranslogArchiveCollector(mock(IndicesService.class));
-        byte[] oldTarBytes = collectorForBuild.buildArchiveFromEntries(
-            Arrays.asList(
-                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.tlog", oldContent),
-                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.ckp", oldContent)
-            )
-        );
-
-        // New TAR: gen 10 (well beyond retention bounds, should be kept because it's newer)
-        byte[] newContent = "new".getBytes(StandardCharsets.UTF_8);
-        byte[] newTarBytes = collectorForBuild.buildArchiveFromEntries(
-            Arrays.asList(
-                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-10.tlog", newContent),
-                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-10.ckp", newContent)
-            )
-        );
-
-        // Mixed TAR: gen 2 for shard 0 (past retention for shard 0) AND gen 10 for shard 1 (kept)
-        byte[] mixedTarBytes = collectorForBuild.buildArchiveFromEntries(
-            Arrays.asList(
-                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.tlog", oldContent),
-                TarArchiveBuilder.fromBytes(pathPrefix0 + "translog-2.ckp", oldContent),
-                TarArchiveBuilder.fromBytes(pathPrefix1 + "translog-10.tlog", newContent),
-                TarArchiveBuilder.fromBytes(pathPrefix1 + "translog-10.ckp", newContent)
-            )
-        );
-
-        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
-        ThreadPool threadPool = new TestThreadPool(getClass().getName());
-        try {
-            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
-            String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
-                indexUuid,
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-            );
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
-
-            // Old TARs: timestamps 2 hours ago — past 5-minute retention
-            Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
-            String oldName1 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo) + ".tar";
-            String oldName2 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(1)) + ".tar";
-            // New TAR: current timestamp — within retention
-            String newName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
-
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldName1, oldTarBytes, 0L), tarDir, WritePriority.HIGH);
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldName2, mixedTarBytes, 0L), tarDir, WritePriority.HIGH);
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(newName, newTarBytes, 0L), tarDir, WritePriority.HIGH);
-            assertThat("should have 3 TARs before retention", archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(3L));
-
-            // 5-minute retention: 2 old TARs deleted, 1 new TAR kept
-            long retentionMinutes = 5L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
-            assertThat("2 old TARs should be deleted", deleted, equalTo(2));
-            assertThat("1 new TAR should remain", archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
-            assertThat("new TAR should still be present", blobStore.blobContainer(tarDir).listBlobs().containsKey(newName), equalTo(true));
-        } finally {
-            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
-        }
-    }
-
-    /**
      * When a coordinator index is registered, runBatch skips upload (only retention runs).
      * This prevents double uploads when the school-bus coordinator handles uploads inline.
      */
@@ -1339,113 +1155,50 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
     }
 
     /**
-     * Fix: early-exit in deleteArchivesOlderThanRetention when a fresh TAR is encountered.
-     * Verifies that once a ZIP within retention is encountered, pagination stops immediately —
-     * remaining ZIPs (also within retention, sorted after) are not listed or deleted.
-     *
-     * Scenario: 2 old TARs (past retention) + 1 fresh TAR → early-exit after deleting 2 old ones.
-     * The fresh TAR being encountered should prevent checking any further pages.
+     * Tests the active hierarchical GC path (deleteHierarchicalArchivesOlderThan) with the new
+     * txlog/{day}/{minute}/ path structure. Verifies that old TARs in expired minute-dirs are
+     * deleted and fresh TARs are preserved.
      */
-    public void testDeleteArchivesEarlyExitOnFreshZip() throws IOException {
+    public void testDeleteHierarchicalArchivesDeletesOldMinuteDirsKeepsFresh() throws IOException {
         BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
         ThreadPool threadPool = new TestThreadPool(getClass().getName());
         try {
             TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
             String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
-                "idx-uuid",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-            );
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
+            BlobPath basePath = new BlobPath().add(uniqueBase);
 
             byte[] tarBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(
                 Collections.singletonList(TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8)))
             );
 
-            // Two old TARs: past 5-minute retention → should be deleted
+            // Old TAR: 2 hours ago → past 5-min safety buffer → should be deleted (no scanner = timestamp-only)
             Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
-            String old1 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo) + ".tar";
-            String old2 = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(1)) + ".tar";
-            // One fresh TAR: within retention → should stop further pagination
-            String fresh = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
+            BlobPath oldDir = TranslogArchivePathHelper.tarBlobDir(basePath, twoHoursAgo);
+            String oldName = TranslogArchivePathHelper.tarBlobName(twoHoursAgo, "node-x");
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldName, tarBytes, 0L), oldDir, WritePriority.HIGH);
 
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(old1, tarBytes, 0L), tarDir, WritePriority.HIGH);
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(old2, tarBytes, 0L), tarDir, WritePriority.HIGH);
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(fresh, tarBytes, 0L), tarDir, WritePriority.HIGH);
-            assertThat(archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(3L));
+            // Fresh TAR: now → within 5-min safety buffer → should NOT be deleted
+            Instant now = Instant.now();
+            BlobPath freshDir = TranslogArchivePathHelper.tarBlobDir(basePath, now);
+            String freshName = TranslogArchivePathHelper.tarBlobName(now, "node-x");
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshName, tarBytes, 0L), freshDir, WritePriority.HIGH);
 
-            long retentionMinutes = 5L;
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, retentionMinutes);
+            assertThat("old TAR should exist before GC", archiveBlobCount(blobStore.blobContainer(oldDir).listBlobs()), equalTo(1L));
+            assertThat("fresh TAR should exist before GC", archiveBlobCount(blobStore.blobContainer(freshDir).listBlobs()), equalTo(1L));
 
-            assertThat("2 old TARs should be deleted, fresh TAR should stop further iteration", deleted, equalTo(2));
-            assertThat("fresh TAR should still be present", archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()), equalTo(1L));
-            assertThat("fresh TAR should not be deleted", blobStore.blobContainer(tarDir).listBlobs().containsKey(fresh), equalTo(true));
+            // Run hierarchical GC with 5-min safety cutoff (no scanner = timestamp-only mode)
+            BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(basePath);
+            Instant cutoff = Instant.now().minus(java.time.Duration.ofMinutes(ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES));
+            int deleted = TranslogArchiveCollector.deleteHierarchicalArchivesOlderThan(transferService, txlogRoot, cutoff);
+
+            assertThat("old TAR should be deleted", deleted, equalTo(1));
+            assertThat("old minute-dir should be empty after GC", archiveBlobCount(blobStore.blobContainer(oldDir).listBlobs()), equalTo(0L));
+            assertThat("fresh TAR should survive GC", archiveBlobCount(blobStore.blobContainer(freshDir).listBlobs()), equalTo(1L));
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
     }
 
-    /**
-     * When there are more than MAX_ARCHIVE_BLOBS_PER_NODE (500) expired TARs, the loop must
-     * re-list after each batch of deletions until all expired ZIPs are gone.
-     *
-     * Scenario: 600 old TARs (all past retention) + 1 fresh TAR.
-     * Expected: all 600 old TARs deleted in one GC cycle (2 re-list passes), fresh TAR kept.
-     */
-    public void testDeleteArchivesMoreThan500ExpiredZipsDeletedInOneGcCycle() throws IOException {
-        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
-        ThreadPool threadPool = new TestThreadPool(getClass().getName());
-        try {
-            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
-            String uniqueBase = "base-" + randomAlphaOfLength(12);
-            String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
-                "idx-uuid",
-                RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-            );
-            String hashNodeId = TranslogArchivePathHelper.hashNodeId("node-1", RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
-            BlobPath tarDir = new BlobPath().add(uniqueBase).add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
-
-            byte[] tarBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(
-                Collections.singletonList(TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8)))
-            );
-
-            // Upload 600 expired ZIPs (sorted ascending: each 1ms apart, all > 2h ago)
-            int expiredCount = 600;
-            Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
-            for (int i = 0; i < expiredCount; i++) {
-                String name = TranslogArchivePathHelper.formatTimestamp(twoHoursAgo.plusMillis(i)) + ".tar";
-                transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(name, tarBytes, 0L), tarDir, WritePriority.HIGH);
-            }
-
-            // Upload 1 fresh TAR (within retention)
-            String freshName = TranslogArchivePathHelper.formatTimestamp(Instant.now()) + ".tar";
-            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(freshName, tarBytes, 0L), tarDir, WritePriority.HIGH);
-
-            assertThat(
-                "Should have 601 ZIPs before GC",
-                archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()),
-                equalTo((long) expiredCount + 1)
-            );
-
-            // Run GC with 5-minute retention: all 600 old TARs should be deleted in one cycle
-            int deleted = TranslogArchiveCollector.deleteArchivesOlderThanRetention(transferService, tarDir, 5L);
-
-            assertThat("All 600 expired ZIPs should be deleted in one GC cycle", deleted, equalTo(expiredCount));
-            assertThat(
-                "Only 1 fresh TAR should remain",
-                archiveBlobCount(blobStore.blobContainer(tarDir).listBlobs()),
-                equalTo(1L)
-            );
-            assertThat(
-                "Fresh ZIP should still be present",
-                blobStore.blobContainer(tarDir).listBlobs().containsKey(freshName),
-                equalTo(true)
-            );
-        } finally {
-            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
-        }
-    }
 
     /**
      * Fix: empty translog archive is skipped — no S3 PUT when all snapshots have zero files.
@@ -1533,10 +1286,6 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
     }
 
     /**
-     * Fix: gc_interval default is 5 minutes.
-     * Verifies the setting default is 5m so that the retention GC doesn't run too frequently.
-     */
-    /**
      * Integration test: TAR archive with GC entries where maxGen > globalCheckpoint should NOT be deleted.
      * The checkpoint gate must block deletion even when the blob is past the retention timestamp.
      */
@@ -1549,7 +1298,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         byte[] ckpContent = "ckp".getBytes(StandardCharsets.UTF_8);
 
         List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
-            new TarArchiveBuilder.GcShardEntry(shardIdInt, 5L, 10L, indexUuid.hashCode(), 8L)
+            new TarArchiveBuilder.GcShardEntry(indexUuid, shardIdInt, 5L, 10L, 8L)
         );
         List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
             TarArchiveBuilder.fromBytes(pathPrefix + "translog-5.tlog", tlogContent),
@@ -1636,7 +1385,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             BlobPath newerTarDir = TranslogArchivePathHelper.tarBlobDir(basePath, oneHourAgo);
             String newerBlobName = TranslogArchivePathHelper.tarBlobName(oneHourAgo, "node-1");
             List<TarArchiveBuilder.GcShardEntry> newerGc = List.of(
-                new TarArchiveBuilder.GcShardEntry(shardIdInt, 11L, 12L, indexUuid.hashCode(), 10L)
+                new TarArchiveBuilder.GcShardEntry(indexUuid, shardIdInt, 11L, 12L, 10L)
             );
             List<TarArchiveBuilder.ArchiveBuildEntry> newerEntries = List.of(
                 TarArchiveBuilder.fromBytes(pathPrefix + "translog-11.tlog", "newer".getBytes(StandardCharsets.UTF_8))
@@ -1662,6 +1411,387 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
+    }
+
+    /**
+     * When a minute-dir is not fully safe, per-TAR GC should delete only safe TARs and keep stuck ones.
+     */
+    public void testDeleteStuckMinutePartiallyDeletesOnlySafeTars() throws IOException {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            BlobPath archiveBasePath = new BlobPath().add("base");
+            Instant minuteTime = Instant.parse("2026-05-01T10:00:30Z");
+            BlobPath minutePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minuteTime);
+            String minuteKey = TranslogArchivePathHelper.dayDir(minuteTime) + "/" + TranslogArchivePathHelper.minuteDir(minuteTime);
+
+            // Safe TAR: checkpoint already covers maxSeqNo (phase 1).
+            List<TarArchiveBuilder.GcShardEntry> safeGc = List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 10L, 10L));
+            List<TarArchiveBuilder.ArchiveBuildEntry> safeEntries = List.of(
+                TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "safe".getBytes(StandardCharsets.UTF_8))
+            );
+            ByteArrayOutputStream safeOut = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(safeOut, TarArchiveBuilder.computeLayout(safeEntries, safeGc), safeEntries);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("00.100.nodeA.tar", safeOut.toByteArray(), 0L), minutePath, WritePriority.HIGH);
+
+            // Stuck TAR: checkpoint below maxSeqNo, no newer minute to advance rolling checkpoint.
+            List<TarArchiveBuilder.GcShardEntry> stuckGc = List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 1, 11L, 20L, 12L));
+            List<TarArchiveBuilder.ArchiveBuildEntry> stuckEntries = List.of(
+                TarArchiveBuilder.fromBytes("idx-uuid/1/1/translog-2.tlog", "stuck".getBytes(StandardCharsets.UTF_8))
+            );
+            ByteArrayOutputStream stuckOut = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(stuckOut, TarArchiveBuilder.computeLayout(stuckEntries, stuckGc), stuckEntries);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("00.200.nodeB.tar", stuckOut.toByteArray(), 0L), minutePath, WritePriority.HIGH);
+
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+            scanner.scan(minuteTime);
+
+            int deleted = TranslogArchiveCollector.deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner);
+            assertEquals(1, deleted);
+
+            Map<String, BlobMetadata> remaining = blobStore.blobContainer(minutePath).listBlobs();
+            assertFalse("safe TAR must be deleted", remaining.containsKey("00.100.nodeA.tar"));
+            assertTrue("stuck TAR must remain", remaining.containsKey("00.200.nodeB.tar"));
+            assertTrue("minute-key must remain indexed while stuck TAR exists", scanner.getInMemoryIndex().containsKey(minuteKey));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * If all TARs in a stuck minute become safe, per-TAR GC should delete all and evict the minute key.
+     */
+    public void testDeleteStuckMinutePartiallyEvictsWhenAllTarsDeleted() throws IOException {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            BlobPath archiveBasePath = new BlobPath().add("base");
+            Instant minuteTime = Instant.parse("2026-05-01T10:01:30Z");
+            BlobPath minutePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minuteTime);
+            String minuteKey = TranslogArchivePathHelper.dayDir(minuteTime) + "/" + TranslogArchivePathHelper.minuteDir(minuteTime);
+
+            List<TarArchiveBuilder.ArchiveBuildEntry> e1 = List.of(
+                TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "a".getBytes(StandardCharsets.UTF_8))
+            );
+            List<TarArchiveBuilder.ArchiveBuildEntry> e2 = List.of(
+                TarArchiveBuilder.fromBytes("idx-uuid/1/1/translog-1.tlog", "b".getBytes(StandardCharsets.UTF_8))
+            );
+
+            ByteArrayOutputStream out1 = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(
+                out1,
+                TarArchiveBuilder.computeLayout(e1, List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L))),
+                e1
+            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("01.100.nodeA.tar", out1.toByteArray(), 0L), minutePath, WritePriority.HIGH);
+
+            ByteArrayOutputStream out2 = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(
+                out2,
+                TarArchiveBuilder.computeLayout(e2, List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 1, 1L, 7L, 8L))),
+                e2
+            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("01.200.nodeB.tar", out2.toByteArray(), 0L), minutePath, WritePriority.HIGH);
+
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+            scanner.scan(minuteTime);
+
+            int deleted = TranslogArchiveCollector.deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner);
+            assertEquals(2, deleted);
+            assertEquals(0L, archiveBlobCount(blobStore.blobContainer(minutePath).listBlobs()));
+            assertFalse("minute-key must be evicted once all TARs are gone", scanner.getInMemoryIndex().containsKey(minuteKey));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * If per-TAR delete fails, the minute must remain indexed and blobs must remain untouched.
+     */
+    public void testDeleteStuckMinutePartiallyKeepsMinuteWhenDeleteFails() throws Exception {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            BlobStoreTransferService realTransferService = new BlobStoreTransferService(blobStore, threadPool);
+            TransferService transferService = org.mockito.Mockito.spy(realTransferService);
+
+            BlobPath archiveBasePath = new BlobPath().add("base");
+            Instant minuteTime = Instant.parse("2026-05-01T10:02:30Z");
+            BlobPath minutePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minuteTime);
+            String minuteKey = TranslogArchivePathHelper.dayDir(minuteTime) + "/" + TranslogArchivePathHelper.minuteDir(minuteTime);
+
+            List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+                TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8))
+            );
+            List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L));
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(out, TarArchiveBuilder.computeLayout(entries, gcEntries), entries);
+            transferService.uploadBlob(
+                new FileSnapshot.TransferFileSnapshot("02.100.nodeA.tar", out.toByteArray(), 0L),
+                minutePath,
+                WritePriority.HIGH
+            );
+
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+            scanner.scan(minuteTime);
+
+            doThrow(new IOException("simulated delete failure")).when(transferService).deleteBlobs(eq(minutePath), any(List.class));
+
+            int deleted = TranslogArchiveCollector.deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner);
+            assertEquals(0, deleted);
+            assertEquals(1L, archiveBlobCount(blobStore.blobContainer(minutePath).listBlobs()));
+            assertTrue("minute-key must remain indexed when delete fails", scanner.getInMemoryIndex().containsKey(minuteKey));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Multi-index minute: same shard id across indices must not collide; only safe index TAR is deleted.
+     */
+    public void testDeleteStuckMinutePartiallyWithMultipleIndicesSameShardId() throws Exception {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            BlobPath archiveBasePath = new BlobPath().add("base");
+            Instant minuteTime = Instant.parse("2026-05-01T10:03:30Z");
+            BlobPath minutePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minuteTime);
+            String minuteKey = TranslogArchivePathHelper.dayDir(minuteTime) + "/" + TranslogArchivePathHelper.minuteDir(minuteTime);
+
+            List<TarArchiveBuilder.ArchiveBuildEntry> entriesA = List.of(
+                TarArchiveBuilder.fromBytes("idx-a/0/1/translog-1.tlog", "a".getBytes(StandardCharsets.UTF_8))
+            );
+            List<TarArchiveBuilder.ArchiveBuildEntry> entriesB = List.of(
+                TarArchiveBuilder.fromBytes("idx-b/0/1/translog-2.tlog", "b".getBytes(StandardCharsets.UTF_8))
+            );
+
+            // Index A (shard 0): safe in phase-1.
+            ByteArrayOutputStream outA = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(
+                outA,
+                TarArchiveBuilder.computeLayout(entriesA, List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L))),
+                entriesA
+            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("03.100.nodeA.tar", outA.toByteArray(), 0L), minutePath, WritePriority.HIGH);
+
+            // Index B (same shard 0): stuck (checkpoint below maxSeqNo).
+            ByteArrayOutputStream outB = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(
+                outB,
+                TarArchiveBuilder.computeLayout(entriesB, List.of(new TarArchiveBuilder.GcShardEntry(UUID_B, 0, 6L, 10L, 3L))),
+                entriesB
+            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("03.200.nodeB.tar", outB.toByteArray(), 0L), minutePath, WritePriority.HIGH);
+
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+            scanner.scan(minuteTime);
+
+            int deleted = TranslogArchiveCollector.deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner);
+            assertEquals(1, deleted);
+
+            Map<String, BlobMetadata> remaining = blobStore.blobContainer(minutePath).listBlobs();
+            assertFalse("safe TAR for index A should be removed", remaining.containsKey("03.100.nodeA.tar"));
+            assertTrue("stuck TAR for index B should remain", remaining.containsKey("03.200.nodeB.tar"));
+            assertTrue("minute should remain indexed while one TAR is stuck", scanner.getInMemoryIndex().containsKey(minuteKey));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Deleted-index TARs should be removed in per-TAR GC when liveIndexUUIDs excludes that index.
+     */
+    public void testDeleteStuckMinutePartiallyWithLiveIndexFilterDeletesDeletedIndexTar() throws Exception {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            BlobPath archiveBasePath = new BlobPath().add("base");
+            Instant minuteTime = Instant.parse("2026-05-01T10:06:30Z");
+            BlobPath minutePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minuteTime);
+            String minuteKey = TranslogArchivePathHelper.dayDir(minuteTime) + "/" + TranslogArchivePathHelper.minuteDir(minuteTime);
+
+            List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+                TarArchiveBuilder.fromBytes("idx-a/0/1/translog-1.tlog", "a".getBytes(StandardCharsets.UTF_8))
+            );
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            // Intentionally unsafe by checkpoint so only the live-index filter can make it deletable.
+            TarArchiveBuilder.build(
+                out,
+                TarArchiveBuilder.computeLayout(entries, List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 0L))),
+                entries
+            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("06.100.nodeA.tar", out.toByteArray(), 0L), minutePath, WritePriority.HIGH);
+
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+            scanner.scan(minuteTime);
+
+            int deleted = TranslogArchiveCollector.deleteStuckMinutePartially(
+                transferService,
+                minutePath,
+                minuteKey,
+                scanner,
+                Collections.singleton(UUID_B)
+            );
+
+            assertEquals(1, deleted);
+            assertEquals(0L, archiveBlobCount(blobStore.blobContainer(minutePath).listBlobs()));
+            assertFalse("minute key should be evicted after all TARs are deleted", scanner.getInMemoryIndex().containsKey(minuteKey));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Multi-index minute becomes fully safe after a newer TAR advances checkpoint for the stuck index.
+     */
+    public void testDeleteHierarchicalArchivesMultipleIndicesBecomesSafeAfterNewerMinute() throws Exception {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            BlobPath archiveBasePath = new BlobPath().add("base");
+
+            Instant minute1 = Instant.parse("2026-05-01T10:04:30Z");
+            Instant minute2 = Instant.parse("2026-05-01T10:05:30Z");
+            BlobPath minute1Path = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minute1);
+            BlobPath minute2Path = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minute2);
+            String minute1Key = TranslogArchivePathHelper.dayDir(minute1) + "/" + TranslogArchivePathHelper.minuteDir(minute1);
+
+            List<TarArchiveBuilder.ArchiveBuildEntry> entriesA = List.of(
+                TarArchiveBuilder.fromBytes("idx-a/0/1/translog-1.tlog", "a".getBytes(StandardCharsets.UTF_8))
+            );
+            List<TarArchiveBuilder.ArchiveBuildEntry> entriesB1 = List.of(
+                TarArchiveBuilder.fromBytes("idx-b/0/1/translog-2.tlog", "b1".getBytes(StandardCharsets.UTF_8))
+            );
+            List<TarArchiveBuilder.ArchiveBuildEntry> entriesB2 = List.of(
+                TarArchiveBuilder.fromBytes("idx-b/0/1/translog-3.tlog", "b2".getBytes(StandardCharsets.UTF_8))
+            );
+
+            // Minute1: index A is safe, index B stuck.
+            ByteArrayOutputStream outA = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(
+                outA,
+                TarArchiveBuilder.computeLayout(entriesA, List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L))),
+                entriesA
+            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("04.100.nodeA.tar", outA.toByteArray(), 0L), minute1Path, WritePriority.HIGH);
+
+            ByteArrayOutputStream outB1 = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(
+                outB1,
+                TarArchiveBuilder.computeLayout(entriesB1, List.of(new TarArchiveBuilder.GcShardEntry(UUID_B, 0, 6L, 10L, 3L))),
+                entriesB1
+            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("04.200.nodeB.tar", outB1.toByteArray(), 0L), minute1Path, WritePriority.HIGH);
+
+            // Minute2: newer TAR for index B advances checkpoint to cover minute1 maxSeqNo.
+            ByteArrayOutputStream outB2 = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(
+                outB2,
+                TarArchiveBuilder.computeLayout(entriesB2, List.of(new TarArchiveBuilder.GcShardEntry(UUID_B, 0, 11L, 12L, 12L))),
+                entriesB2
+            );
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("05.100.nodeB.tar", outB2.toByteArray(), 0L), minute2Path, WritePriority.HIGH);
+
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+            scanner.scan(minute2); // scan both minutes
+
+            assertThat("rolling checkpoints must track each index UUID independently", scanner.getRollingCheckpoints().keySet(), hasItems(UUID_A, UUID_B));
+
+            // Cutoff only targets minute1; minute2 should be skipped as newer minute-dir.
+            Instant cutoff = Instant.parse("2026-05-01T10:04:59Z");
+            int deleted = TranslogArchiveCollector.deleteHierarchicalArchivesOlderThan(
+                transferService,
+                TranslogArchivePathHelper.txlogRootPath(archiveBasePath),
+                cutoff,
+                scanner
+            );
+
+            assertEquals("both minute1 TARs should be deleted once index B is covered", 2, deleted);
+            assertEquals(0L, archiveBlobCount(blobStore.blobContainer(minute1Path).listBlobs()));
+            assertEquals(1L, archiveBlobCount(blobStore.blobContainer(minute2Path).listBlobs()));
+            assertFalse("minute1 key should be evicted after full cleanup", scanner.getInMemoryIndex().containsKey(minute1Key));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Boundary-minute cleanup should only delete parseable TARs older than cutoff, keeping fresh and malformed names.
+     */
+    public void testDeleteBlobsInDirWithCutoffDeletesOnlyOlderParseableTarNames() throws Exception {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            BlobPath minutePath = new BlobPath().add("base").add("txlog").add("20260501").add("1000");
+
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("00.001.nodeA.tar", new byte[] { 1 }, 0L), minutePath, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("59.999.nodeA.tar", new byte[] { 2 }, 0L), minutePath, WritePriority.HIGH);
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot("malformed.tar", new byte[] { 3 }, 0L), minutePath, WritePriority.HIGH);
+
+            Instant cutoff = Instant.parse("2026-05-01T10:00:30Z");
+            int deleted = TranslogArchiveCollector.deleteBlobsInDir(transferService, minutePath, cutoff);
+            assertEquals(1, deleted);
+
+            Map<String, BlobMetadata> remaining = blobStore.blobContainer(minutePath).listBlobs();
+            assertThat(remaining.keySet(), hasItems("59.999.nodeA.tar", "malformed.tar"));
+            assertFalse(remaining.containsKey("00.001.nodeA.tar"));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Becoming cluster-manager should schedule retention exactly once even if callback is invoked repeatedly.
+     */
+    public void testOnClusterManagerSchedulesRetentionOnce() {
+        IndicesService indicesService = mock(IndicesService.class);
+        when(indicesService.iterator()).thenReturn(Collections.emptyIterator());
+
+        ThreadPool threadPool = mock(ThreadPool.class);
+        Scheduler.Cancellable cancellable = mock(Scheduler.Cancellable.class);
+        TimeValue gcInterval = TimeValue.timeValueMinutes(1);
+        when(threadPool.scheduleWithFixedDelay(any(Runnable.class), eq(gcInterval), eq(ThreadPool.Names.TRANSLOG_TRANSFER))).thenReturn(
+            cancellable
+        );
+
+        RemoteStoreSettings remoteStoreSettings = mock(RemoteStoreSettings.class);
+        when(remoteStoreSettings.getTranslogArchiveGcInterval()).thenReturn(gcInterval);
+
+        TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
+        collector.onClusterManager();
+        collector.onClusterManager();
+
+        verify(threadPool, times(1)).scheduleWithFixedDelay(any(Runnable.class), eq(gcInterval), eq(ThreadPool.Names.TRANSLOG_TRANSFER));
+    }
+
+    /**
+     * Losing cluster-manager role should cancel the retention task that was scheduled on promotion.
+     */
+    public void testOffClusterManagerCancelsRetentionTask() {
+        IndicesService indicesService = mock(IndicesService.class);
+        when(indicesService.iterator()).thenReturn(Collections.emptyIterator());
+
+        ThreadPool threadPool = mock(ThreadPool.class);
+        Scheduler.Cancellable cancellable = mock(Scheduler.Cancellable.class);
+        TimeValue gcInterval = TimeValue.timeValueMinutes(1);
+        when(threadPool.scheduleWithFixedDelay(any(Runnable.class), eq(gcInterval), eq(ThreadPool.Names.TRANSLOG_TRANSFER))).thenReturn(
+            cancellable
+        );
+
+        RemoteStoreSettings remoteStoreSettings = mock(RemoteStoreSettings.class);
+        when(remoteStoreSettings.getTranslogArchiveGcInterval()).thenReturn(gcInterval);
+
+        TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
+        collector.onClusterManager();
+        collector.offClusterManager();
+
+        verify(cancellable, times(1)).cancel();
     }
 
     public void testTranslogArchiveGcIntervalDefaultIsTenMinutes() {

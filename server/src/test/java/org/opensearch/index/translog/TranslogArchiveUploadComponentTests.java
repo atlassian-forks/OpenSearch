@@ -250,7 +250,11 @@ public class TranslogArchiveUploadComponentTests extends OpenSearchTestCase {
         TranslogTransferManager mgr = buildManager(false);
         RemoteFsTimestampAwareTranslog.cleanup(mgr);
 
-        assertThat("Archive-OFF cleanup: ≥1 LIST", transferService.listCount(), greaterThan(0));
+        // cleanup() calls deleteStaleTranslogMetadataFilesAsync() which issues exactly 1 LIST
+        // (listAllInSortedOrderAsync on the metadata prefix) then deletes all but the newest.
+        assertEquals("Archive-OFF cleanup: exactly 1 LIST (metadata discovery)", 1, transferService.listCount());
+        // 2 metadata blobs → keep newest 1, delete 1 stale (plus potential generation-level deletes)
+        assertThat("Archive-OFF cleanup: ≥1 DELETE (stale metadata)", transferService.deleteCount(), greaterThan(0));
 
         logger.info(
             "Archive-OFF cleanup — PUTs={}, GETs={}, LISTs={}, DELETEs={}",

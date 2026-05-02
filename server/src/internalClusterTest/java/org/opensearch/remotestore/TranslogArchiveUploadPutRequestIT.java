@@ -35,8 +35,8 @@ import static org.hamcrest.Matchers.not;
 
 /**
  * Integration test verifying that translog archive upload mode reduces remote PUT requests by:
- *   1. Uploading only ZIP files (no per-shard .tlog/.ckp/.metadata files) when archive is enabled.
- *   2. Uploading per-shard files + metadata (no ZIPs) when archive is disabled.
+ *   1. Uploading only TAR files (no per-shard .tlog/.ckp/.metadata files) when archive is enabled.
+ *   2. Uploading per-shard files + metadata (no TARs) when archive is disabled.
  *   3. syncNeeded() does not trigger upload for an empty generation when archive is enabled.
  *
  * Uses a single-node cluster with FS-backed repositories so we can inspect blob files on disk.
@@ -78,8 +78,8 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
      * What we assert (structural correctness, not ratios):
      *
      * Archive-ON index:
-     *   - At least 1 ZIP exists in the repo (archive coordinator batches all shards per sync cycle)
-     *   - ZERO ZIP files in the archive-OFF UUID dir
+     *   - At least 1 TAR exists in the repo (archive coordinator batches all shards per sync cycle)
+     *   - ZERO TAR files in the archive-OFF UUID dir
      *
      * Archive-OFF index:
      *   - At least 1 metadata__ blob and at least 1 .tlog file exist in the repo after flush
@@ -92,7 +92,7 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
      *     to per-shard uploads. This is a known transient behaviour, not a correctness bug.
      *
      * PUT reduction design (documented, not asserted):
-     *   - archive-ON per cycle: 1 ZIP + N metadata PUTs (N = active shards)
+     *   - archive-ON per cycle: 1 TAR + N metadata PUTs (N = active shards)
      *   - archive-OFF per cycle: N × 3 PUTs (.tlog + .ckp + metadata per shard)
      *   - Saving: (3N) - (1 + N) = 2N - 1 PUTs per cycle (eliminates .tlog + .ckp PUTs per shard)
      *   - For 10 shards: 30 - 11 = 19 fewer PUTs per cycle (~63% reduction in PUT count)
@@ -125,33 +125,33 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
         indexDocuments(INDEX_ARCHIVE_ON, NUM_DOCS);
 
         assertBusy(
-            () -> assertThat("Expected ≥1 ZIP for archive-ON index", findBlobs(translogRepoPath, "*.zip"), not(empty())),
+            () -> assertThat("Expected ≥1 TAR for archive-ON index", findBlobs(translogRepoPath, "*.tar"), not(empty())),
             30,
             TimeUnit.SECONDS
         );
 
-        List<Path> onZips = findBlobs(translogRepoPath, "*.zip");
+        List<Path> onTars = findBlobs(translogRepoPath, "*.tar");
         List<Path> onTlogBlobs = findBlobs(translogRepoPath, "*.tlog", archiveOnUuid);
         List<Path> onMetaBlobs = findMetadataBlobs(translogRepoPath, archiveOnUuid);
 
         // Remote store writes initial empty translog (.tlog) and checkpoint files per shard at index
         // creation time — so .tlog count > 0 even with no user ops is expected. What we can assert is:
-        // archive-OFF never produces ZIPs (ZIPs are exclusively an archive-ON artifact).
-        List<Path> offZipsPhase1 = findBlobs(translogRepoPath, "*.zip", archiveOffUuid);
+        // archive-OFF never produces TARs (TARs are exclusively an archive-ON artifact).
+        List<Path> offTarsPhase1 = findBlobs(translogRepoPath, "*.tar", archiveOffUuid);
 
         logger.info(
-            "Phase 1 (archive-ON) — ZIPs: {}, .tlog: {}, metadata: {}, archive-OFF ZIPs (must be 0): {}",
-            onZips.size(),
+            "Phase 1 (archive-ON) — TARs: {}, .tlog: {}, metadata: {}, archive-OFF TARs (must be 0): {}",
+            onTars.size(),
             onTlogBlobs.size(),
             onMetaBlobs.size(),
-            offZipsPhase1.size()
+            offTarsPhase1.size()
         );
 
-        assertThat("Archive-ON: ≥1 ZIP uploaded", onZips, not(empty()));
-        assertEquals("Archive-OFF: ZERO ZIPs at any point (ZIPs are exclusive to archive-ON)", 0, offZipsPhase1.size());
+        assertThat("Archive-ON: ≥1 TAR uploaded", onTars, not(empty()));
+        assertEquals("Archive-OFF: ZERO TARs at any point (TARs are exclusive to archive-ON)", 0, offTarsPhase1.size());
 
         // -----------------------------------------------------------------------
-        // Phase 2: Index into archive-OFF, flush, assert ZERO ZIPs in its path.
+        // Phase 2: Index into archive-OFF, flush, assert ZERO TARs in its path.
         // -----------------------------------------------------------------------
         indexDocuments(INDEX_ARCHIVE_OFF, NUM_DOCS);
         flushAndRefresh(INDEX_ARCHIVE_OFF);
@@ -166,25 +166,25 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
             TimeUnit.SECONDS
         );
 
-        List<Path> offZips = findBlobs(translogRepoPath, "*.zip", archiveOffUuid);
+        List<Path> offTars = findBlobs(translogRepoPath, "*.tar", archiveOffUuid);
         List<Path> offTlogBlobs = findBlobs(translogRepoPath, "*.tlog", archiveOffUuid);
         List<Path> offMetaBlobs = findMetadataBlobs(translogRepoPath, archiveOffUuid);
 
-        logger.info("Phase 2 (archive-OFF) — ZIPs: {}, .tlog: {}, metadata: {}", offZips.size(), offTlogBlobs.size(), offMetaBlobs.size());
+        logger.info("Phase 2 (archive-OFF) — TARs: {}, .tlog: {}, metadata: {}", offTars.size(), offTlogBlobs.size(), offMetaBlobs.size());
 
-        assertEquals("Archive-OFF: ZERO ZIPs in its path", 0, offZips.size());
+        assertEquals("Archive-OFF: ZERO TARs in its path", 0, offTars.size());
         assertThat("Archive-OFF: ≥1 .tlog file", offTlogBlobs, not(empty()));
         assertThat("Archive-OFF: ≥1 metadata blob", offMetaBlobs, not(empty()));
         assertEquals("Archive-OFF: 1 metadata per .tlog (always uploaded as a pair)", offTlogBlobs.size(), offMetaBlobs.size());
 
         // PUT reduction summary (logged, not asserted — ratio depends on sync timing).
-        // Archive-ON: 1 ZIP + N metadata PUTs per cycle
+        // Archive-ON: 1 TAR + N metadata PUTs per cycle
         // Archive-OFF: N×3 PUTs (.tlog + .ckp + metadata) per cycle → saves 2N-1 PUTs (~63% for 10 shards)
         logger.info(
-            "PUT summary — archive-ON: {} ZIPs + {} metadata = {} PUTs; " + "archive-OFF: {} .tlog + {} metadata = {} PUTs",
-            onZips.size(),
+            "PUT summary — archive-ON: {} TARs + {} metadata = {} PUTs; " + "archive-OFF: {} .tlog + {} metadata = {} PUTs",
+            onTars.size(),
             onMetaBlobs.size(),
-            onZips.size() + onMetaBlobs.size(),
+            onTars.size() + onMetaBlobs.size(),
             offTlogBlobs.size(),
             offMetaBlobs.size(),
             offTlogBlobs.size() + offMetaBlobs.size()
@@ -193,13 +193,13 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
 
     /**
      * Verify that with archive enabled and zero translog ops (after flush with no new writes),
-     * syncNeeded() returns false and no additional ZIPs are uploaded.
+     * syncNeeded() returns false and no additional TARs are uploaded.
      *
      * Flow:
-     *   1. Index docs → background sync → ZIPs appear.
+     *   1. Index docs → background sync → TARs appear.
      *   2. Flush (commits ops, rolls generation to empty — 0 ops).
      *   3. Wait several sync cycles via assertBusy with stable-count check.
-     *   4. Assert ZIP count has NOT grown — empty generation skipped by syncNeeded() fix.
+     *   4. Assert TAR count has NOT grown — empty generation skipped by syncNeeded() fix.
      *
      * Uses assertBusy with a stable-count check instead of Thread.sleep for CI robustness.
      */
@@ -219,23 +219,23 @@ public class TranslogArchiveUploadPutRequestIT extends RemoteStoreBaseIntegTestC
 
         indexDocuments(INDEX_ARCHIVE_ON, NUM_DOCS);
 
-        // Wait until ≥1 ZIP appears — archive upload is working.
-        assertBusy(() -> assertThat(findBlobs(translogRepoPath, "*.zip"), not(empty())), 30, TimeUnit.SECONDS);
+        // Wait until ≥1 TAR appears — archive upload is working.
+        assertBusy(() -> assertThat(findBlobs(translogRepoPath, "*.tar"), not(empty())), 30, TimeUnit.SECONDS);
 
         // Flush: commits ops → rolls generation to a new empty generation (0 ops).
-        // With syncNeeded() fix, archive mode short-circuits → no additional ZIPs.
+        // With syncNeeded() fix, archive mode short-circuits → no additional TARs.
         flushAndRefresh(INDEX_ARCHIVE_ON);
-        final int zipCountAfterFlush = findBlobs(translogRepoPath, "*.zip").size();
-        logger.info("ZIP count after flush (baseline): {}", zipCountAfterFlush);
+        final int tarCountAfterFlush = findBlobs(translogRepoPath, "*.tar").size();
+        logger.info("TAR count after flush (baseline): {}", tarCountAfterFlush);
 
         // Trigger another flush+refresh to ensure at least one more sync cycle fires.
-        // If syncNeeded() is broken, a new ZIP would appear; if fixed, count stays stable.
+        // If syncNeeded() is broken, a new TAR would appear; if fixed, count stays stable.
         flushAndRefresh(INDEX_ARCHIVE_ON);
         flushAndRefresh(INDEX_ARCHIVE_ON);
 
-        int zipCountFinal = findBlobs(translogRepoPath, "*.zip").size();
-        logger.info("ZIP count after flush: baseline={}, final={}", zipCountAfterFlush, zipCountFinal);
-        assertEquals("syncNeeded() fix: no ZIPs uploaded for empty generation after flush", zipCountAfterFlush, zipCountFinal);
+        int tarCountFinal = findBlobs(translogRepoPath, "*.tar").size();
+        logger.info("TAR count after flush: baseline={}, final={}", tarCountAfterFlush, tarCountFinal);
+        assertEquals("syncNeeded() fix: no TARs uploaded for empty generation after flush", tarCountAfterFlush, tarCountFinal);
     }
 
     // -----------------------------------------------------------------------

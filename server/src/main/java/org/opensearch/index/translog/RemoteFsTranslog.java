@@ -292,13 +292,13 @@ public class RemoteFsTranslog extends Translog {
                     // A generation's entry was not found in the metadata's ZIP — it may live in an
                     // older ZIP (multi-cycle scenario). Fall back to 8-param ZIP scan with gen range.
                     logger.info(
-                        "Archive entry not found in metadata ZIP, falling back to ZIP scan gen=[{}-{}]",
+                        "Archive entry not found in metadata TAR, falling back to TAR scan gen=[{}-{}]",
                         translogMetadata.getMinTranslogGeneration(),
                         translogMetadata.getGeneration()
                     );
                     IOUtils.rm(FileSystemUtils.files(location));
                     String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
-                    recoverFromArchiveZipWithGenRange(
+                    recoverFromArchiveWithGenRange(
                         translogTransferManager,
                         indexUUID,
                         location,
@@ -320,13 +320,13 @@ public class RemoteFsTranslog extends Translog {
                     if (translogTransferManager.isTranslogArchiveUploadEnabled()) {
                         // Per-shard files not found — archive mode, fall back to ZIP range-read.
                         logger.info(
-                            "Per-shard files not found in archive mode, falling back to ZIP scan gen=[{}-{}]",
+                            "Per-shard files not found in archive mode, falling back to TAR scan gen=[{}-{}]",
                             translogMetadata.getMinTranslogGeneration(),
                             translogMetadata.getGeneration()
                         );
                         IOUtils.rm(FileSystemUtils.files(location));
                         String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
-                        recoverFromArchiveZipWithGenRange(
+                        recoverFromArchiveWithGenRange(
                             translogTransferManager,
                             indexUUID,
                             location,
@@ -349,7 +349,7 @@ public class RemoteFsTranslog extends Translog {
             statsTracker.recordDownloadStats(prevDownloadBytesSucceeded, prevDownloadTimeInMillis);
 
             // Copy latest generation .ckp to translog.ckp for flows that depend on its existence.
-            // recoverFromArchiveZipWithGenRange copies it internally; for direct downloads, do it here.
+            // recoverFromArchiveWithGenRange copies it internally; for direct downloads, do it here.
             Path commitCkpForCopy = location.resolve(Translog.getCommitCheckpointFileName(translogMetadata.getGeneration()));
             if (Files.exists(commitCkpForCopy)) {
                 Path destCkp = location.resolve(Translog.CHECKPOINT_FILE_NAME);
@@ -364,9 +364,9 @@ public class RemoteFsTranslog extends Translog {
             // archive ZIP scan and legacy local-cleanup. The flag is reliable at recovery time
             // (before coordinator re-registers after node restart), unlike the registry.
             if (translogTransferManager.isTranslogArchiveUploadEnabled() && seedRemote == false) {
-                logger.info("Archive enabled, no metadata found: attempting ZIP scan recovery");
+                logger.info("Archive enabled, no metadata found: attempting TAR scan recovery");
                 String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
-                recoverFromArchiveZip(
+                recoverFromArchive(
                     translogTransferManager,
                     indexUUID,
                     location,
@@ -407,7 +407,7 @@ public class RemoteFsTranslog extends Translog {
      * Uses {@link TranslogArchiveRecovery#recoverFromHierarchicalPath} to scan the hierarchical txlog/ path.
      * Writes files directly to {@code location} (not via temp dir).
      */
-    private static void recoverFromArchiveZipWithGenRange(
+    private static void recoverFromArchiveWithGenRange(
         TranslogTransferManager translogTransferManager,
         String indexUUID,
         Path location,
@@ -446,12 +446,12 @@ public class RemoteFsTranslog extends Translog {
     }
 
     /**
-     * Attempts recovery from archive ZIPs via {@link TranslogArchiveRecovery}.
-     * Uses a sibling temp directory to avoid destroying local translog files if no ZIPs are found (fresh shard).
+     * Attempts recovery from archive TARs via {@link TranslogArchiveRecovery}.
+     * Uses a sibling temp directory to avoid destroying local translog files if no TARs are found (fresh shard).
      * On success, moves recovered files into {@code location} and records download stats.
-     * On fresh shard (no ZIPs), falls through to local cleanup (create empty translog if needed).
+     * On fresh shard (no TARs), falls through to local cleanup (create empty translog if needed).
      */
-    private static void recoverFromArchiveZip(
+    private static void recoverFromArchive(
         TranslogTransferManager translogTransferManager,
         String indexUUID,
         Path location,
@@ -496,14 +496,14 @@ public class RemoteFsTranslog extends Translog {
                     Files.move(recoveredFile, location.resolve(recoveredFile.getFileName().toString()));
                 }
                 statsTracker.recordDownloadStats(prevDownloadBytesSucceeded, prevDownloadTimeInMillis);
-                logger.info("ZIP-first recovery succeeded for shard {}", translogTransferManager.getShardId());
+                logger.info("TAR recovery succeeded for shard {}", translogTransferManager.getShardId());
             } else {
                 // No ZIPs found. This can happen when archive was just toggled ON (OFF→ON) and no ZIP
                 // has been uploaded yet — per-shard tlog files still exist in remote.
                 // Fall back to per-shard metadata download (+1 LIST) before treating as fresh shard.
                 // This prevents data loss in the one-time transition window after enabling archive.
                 logger.info(
-                    "No archive ZIPs found for shard {}, attempting per-shard metadata fallback (OFF→ON toggle)",
+                    "No archive TARs found for shard {}, attempting per-shard metadata fallback (OFF→ON toggle)",
                     translogTransferManager.getShardId()
                 );
                 TranslogTransferMetadata fallbackMetadata = translogTransferManager.readMetadata(0);
@@ -536,8 +536,8 @@ public class RemoteFsTranslog extends Translog {
                     }
                     logger.info("Per-shard fallback recovery succeeded for shard {}", translogTransferManager.getShardId());
                 } else {
-                    // Truly fresh shard — no ZIPs and no per-shard metadata.
-                    logger.info("No archive ZIPs and no per-shard metadata (fresh shard), checking local filesystem for cleanup");
+                    // Truly fresh shard — no TARs and no per-shard metadata.
+                    logger.info("No archive TARs and no per-shard metadata (fresh shard), checking local filesystem for cleanup");
                     if (FileSystemUtils.exists(location.resolve(CHECKPOINT_FILE_NAME))) {
                         final Checkpoint checkpoint = readCheckpoint(location);
                         if (seedRemote) {
@@ -687,6 +687,9 @@ public class RemoteFsTranslog extends Translog {
         TranslogArchiveBatchCoordinator archiveBatchCoordinator = TranslogArchiveBatchCoordinator.get(shardId.getIndex().getUUID());
         if (indexSettings().isTranslogArchiveUploadEnabled() && archiveBatchCoordinator != null) {
             try {
+                // Provide the repo base path to the coordinator on first use so uploads and recovery
+                // use the same root path (blobStoreRepository.basePath()).
+                archiveBatchCoordinator.initArchiveBasePath(translogTransferManager.getArchiveBasePath());
                 logger.trace("submitting to archive batch coordinator for primary term {} generation {}", primaryTerm, generation);
                 List<TarArchiveBuilder.ArchiveBuildEntry> entries = buildArchiveEntries(primaryTerm, generation);
                 TranslogArchiveBatchCoordinator.ShardArchiveData shardData = new TranslogArchiveBatchCoordinator.ShardArchiveData(

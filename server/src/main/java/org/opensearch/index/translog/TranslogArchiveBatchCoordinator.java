@@ -96,7 +96,8 @@ public class TranslogArchiveBatchCoordinator {
 
     private final String indexUUID;
     private final String nodeId;
-    private final BlobPath archiveBasePath;
+    /** Archive base path — set lazily via {@link #initArchiveBasePath} on first shard submission. */
+    private volatile BlobPath archiveBasePath;
     private final RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm;
     private final long archiveMaxWaitMillis;
     private final int archiveThreshold;
@@ -319,6 +320,18 @@ public class TranslogArchiveBatchCoordinator {
         IOException error = dispatchError;
         if (error != null) {
             throw new IOException("Archive batch upload failed", error);
+        }
+    }
+
+    /**
+     * Sets the archive base path from the repository root. Called by {@link RemoteFsTranslog} on
+     * first submission so the coordinator uses the same base path as recovery.
+     * Thread-safe: the field is volatile and only set once (first-write-wins is fine since all
+     * shards in an index share the same repository base path).
+     */
+    public void initArchiveBasePath(BlobPath repoBasePath) {
+        if (this.archiveBasePath == null) {
+            this.archiveBasePath = repoBasePath;
         }
     }
 
