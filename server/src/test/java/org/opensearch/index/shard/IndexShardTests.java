@@ -173,6 +173,8 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Optional;
+import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -4896,6 +4898,25 @@ public class IndexShardTests extends IndexShardTestCase {
         assertEquals(remoteTranslogTransferTracker.getUploadBytesStarted(), remoteTranslogStats.getUploadBytesStarted());
         assertEquals(remoteTranslogTransferTracker.getUploadBytesSucceeded(), remoteTranslogStats.getUploadBytesSucceeded());
         assertEquals(remoteTranslogTransferTracker.getUploadBytesFailed(), remoteTranslogStats.getUploadBytesFailed());
+    }
+
+    public void testGetTranslogTransferManagerReturnsEmptyWhenEngineClosed() throws Exception {
+        // Regression test: getTranslogTransferManager() must not throw AlreadyClosedException
+        // when called on a shard whose engine has been closed (e.g. on a master node during GC).
+        IndexShard shard = newShard(true);
+        recoverShardFromStore(shard);
+        // Sanity: returns an Optional on open shard (non-remote store shard returns empty by design, no throw)
+        Optional<TranslogTransferManager> before = shard.getTranslogTransferManager();
+        assertNotNull("getTranslogTransferManager should not throw on open shard", before);
+        // Now close the shard (engine becomes AlreadyClosed)
+        closeShards(shard);
+        // Must return empty Optional, NOT throw AlreadyClosedException
+        try {
+            Optional<TranslogTransferManager> after = shard.getTranslogTransferManager();
+            assertFalse("Should return empty after engine closed", after.isPresent());
+        } catch (AlreadyClosedException e) {
+            fail("getTranslogTransferManager must not throw AlreadyClosedException when engine is closed: " + e.getMessage());
+        }
     }
 
     private static void assertRemoteSegmentStats(

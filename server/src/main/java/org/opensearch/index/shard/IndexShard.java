@@ -5417,7 +5417,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     public Optional<TranslogTransferManager> getTranslogTransferManager() {
-        Engine engine = getEngine();
+        Engine engine = getEngineOrNull();
         if (engine instanceof InternalEngine) {
             return ((InternalEngine) engine).translogManager().getTranslogTransferManager();
         }
