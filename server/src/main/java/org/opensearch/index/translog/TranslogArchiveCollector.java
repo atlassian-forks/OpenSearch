@@ -423,11 +423,11 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
      * </ol>
      */
     private void runArchiveRetention() {
-        // Resolve transfer service + base path from an eligible shard, and use that shard's
-        // per-index archive retention setting as the time gate.
+        // TARs are node-level batches containing ops from ALL shards on the node (across all indices).
+        // GC runs at cluster level and deletes entire minute-dirs. The retention window is therefore
+        // a cluster-level setting (cluster.remote_store.translog.archive.retention), not per-index.
         TransferService anyTransferService = null;
         BlobPath anyBasePath = null;
-        Long retentionMillis = null;
 
         for (ShardId sid : getEligibleShardIds()) {
             IndexService indexService = indicesService.indexService(sid.getIndex());
@@ -438,12 +438,11 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             if (tmOpt.isPresent()) {
                 anyTransferService = tmOpt.get().getTransferService();
                 anyBasePath = tmOpt.get().getArchiveBasePath();
-                retentionMillis = shard.indexSettings().getTranslogArchiveRetention().millis();
                 break;
             }
         }
 
-        if (anyTransferService == null || anyBasePath == null || retentionMillis == null) {
+        if (anyTransferService == null || anyBasePath == null) {
             return;
         }
 
@@ -471,11 +470,11 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             }
         }
 
-        // Retention cutoff: only delete minute-dirs older than the configured archive_retention.
-        // This is the primary time gate — combined with the checkpoint gate (isSafeToDelete),
-        // it ensures TARs are only deleted when both conditions are met:
-        //   1. The minute-dir is older than archive_retention (time gate)
+        // Retention cutoff: cluster.remote_store.translog.archive.retention (default 5m).
+        // Combined with the checkpoint gate (isSafeToDelete), TARs are deleted only when:
+        //   1. The minute-dir is older than the cluster retention window (time gate)
         //   2. All shard checkpoints in the minute are committed to remote segments (checkpoint gate)
+        long retentionMillis = remoteStoreSettings.getTranslogArchiveRetention().millis();
         Instant retentionCutoff = Instant.now().minus(Duration.ofMillis(retentionMillis));
         BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(anyBasePath);
 

@@ -61,6 +61,9 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
             .put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.getKey(), "1m")
             // Fast translog buffer so TARs are uploaded quickly
             .put(RemoteStoreSettings.CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "100ms")
+            // testGcSchedulerIndexesTarsAndDeletesThem: cluster retention = 1m
+            // testGcPreservesRecentTarsWhenRetentionIsLong: overridden dynamically in that test
+            .put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION.getKey(), "1m")
             .build();
     }
 
@@ -97,8 +100,7 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
                     Settings.builder()
                         .put(remoteStoreIndexSettings(0, 1))
                         .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
-                        // archive_retention = 1m — TARs can be deleted after 1m
-                        .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.getKey(), "1m")
+                        // Cluster retention is set to 1m in nodeSettings — no index-level override needed
                         .build()
                 )
         );
@@ -160,14 +162,22 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
         internalCluster().startNode();
         ensureGreen();
 
+        // Override cluster retention to 60m so recently-uploaded TARs are protected.
+        // This overrides the 1m default set in nodeSettings().
+        client().admin().cluster().prepareUpdateSettings()
+            .setPersistentSettings(
+                Settings.builder()
+                    .put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION.getKey(), "60m")
+                    .build()
+            ).get();
+
         assertAcked(
             client().admin().indices().prepareCreate(INDEX_NAME)
                 .setSettings(
                     Settings.builder()
                         .put(remoteStoreIndexSettings(0, 1))
                         .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
-                        // 60m retention — TARs uploaded just now should NOT be deleted
-                        .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.getKey(), "60m")
+                        // Cluster retention dynamically updated to 60m above — no index-level override needed
                         .build()
                 )
         );

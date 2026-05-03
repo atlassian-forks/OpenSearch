@@ -134,13 +134,28 @@ public class RemoteStoreSettings {
     );
 
     /**
-     * Controls how often the translog archive retention GC runs (i.e. how frequently stale ZIPs are deleted).
+     * Controls how often the translog archive retention GC runs (i.e. how frequently stale TARs are deleted).
      * This is the timer repeat interval — separate from the data retention age.
      * Default: 2 minutes. Minimum: 1 second (allows fast test cycles).
      */
     public static final Setting<TimeValue> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL = Setting.timeSetting(
         "cluster.remote_store.translog.archive.gc_interval",
         TimeValue.timeValueMinutes(2),
+        TimeValue.timeValueSeconds(1),
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
+    /**
+     * Controls how long translog archive TARs are retained before GC is allowed to delete them.
+     * Since TARs are node-level batches containing ops from ALL shards/indices on a node,
+     * this is a cluster-level setting — not per-index. GC runs on the cluster-manager and
+     * deletes entire minute-dirs; the retention window applies uniformly across all indices.
+     * Default: 5 minutes. Minimum: 1 second (allows fast test cycles).
+     */
+    public static final Setting<TimeValue> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION = Setting.timeSetting(
+        "cluster.remote_store.translog.archive.retention",
+        TimeValue.timeValueMinutes(5),
         TimeValue.timeValueSeconds(1),
         Property.NodeScope,
         Property.Dynamic
@@ -265,6 +280,7 @@ public class RemoteStoreSettings {
     private volatile boolean clusterRemoteStoreSegmentArchiveEnabled;
     private volatile boolean clusterRemoteStoreSegmentArchiveFallbackToPerFile;
     private volatile TimeValue translogArchiveGcInterval;
+    private volatile TimeValue translogArchiveRetention;
     private volatile TimeValue segmentMetadataGcMinInterval;
     private static volatile boolean isPinnedTimestampsEnabled;
     private static volatile TimeValue pinnedTimestampsSchedulerInterval;
@@ -336,6 +352,8 @@ public class RemoteStoreSettings {
 
         translogArchiveGcInterval = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.get(settings);
         clusterSettings.addSettingsUpdateConsumer(CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL, this::setTranslogArchiveGcInterval);
+        translogArchiveRetention = CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION, this::setTranslogArchiveRetention);
 
         segmentMetadataGcMinInterval = CLUSTER_REMOTE_STORE_SEGMENT_METADATA_GC_MIN_INTERVAL.get(settings);
         clusterSettings.addSettingsUpdateConsumer(
@@ -457,6 +475,14 @@ public class RemoteStoreSettings {
      */
     public TimeValue getTranslogArchiveGcInterval() {
         return translogArchiveGcInterval != null ? translogArchiveGcInterval : TimeValue.timeValueMinutes(1);
+    }
+
+    public TimeValue getTranslogArchiveRetention() {
+        return translogArchiveRetention != null ? translogArchiveRetention : TimeValue.timeValueMinutes(5);
+    }
+
+    private void setTranslogArchiveRetention(TimeValue retention) {
+        this.translogArchiveRetention = retention;
     }
 
     private void setTranslogArchiveGcInterval(TimeValue translogArchiveGcInterval) {
