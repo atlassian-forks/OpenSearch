@@ -993,9 +993,9 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
     }
 
     /**
-     * Runs archive retention GC synchronously; for unit tests only.
+     * Runs archive retention GC synchronously; for integration tests only.
      */
-    void runRetentionForTesting() {
+    public void runRetentionForTesting() {
         runArchiveRetention();
     }
 

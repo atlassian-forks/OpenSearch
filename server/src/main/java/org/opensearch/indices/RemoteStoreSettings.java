@@ -136,12 +136,12 @@ public class RemoteStoreSettings {
     /**
      * Controls how often the translog archive retention GC runs (i.e. how frequently stale ZIPs are deleted).
      * This is the timer repeat interval — separate from the data retention age.
-     * Default: 10 minutes. Minimum: 1 minute.
+     * Default: 10 minutes. Minimum: 1 second (lowered from 1 minute to allow fast test cycles).
      */
     public static final Setting<TimeValue> CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL = Setting.timeSetting(
         "cluster.remote_store.translog.archive.gc_interval",
         TimeValue.timeValueMinutes(10),
-        TimeValue.timeValueMinutes(1),
+        TimeValue.timeValueSeconds(1),
         Property.NodeScope,
         Property.Dynamic
     );

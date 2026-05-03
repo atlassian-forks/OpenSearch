@@ -2218,6 +2218,13 @@ public class IndicesService extends AbstractLifecycleComponent
         return this.clusterDefaultRefreshInterval;
     }
 
+    /**
+     * Returns the translog archive collector; for integration tests only.
+     */
+    public TranslogArchiveCollector getTranslogArchiveCollector() {
+        return translogArchiveCollector;
+    }
+
     public RemoteStoreSettings getRemoteStoreSettings() {
         return this.remoteStoreSettings;
     }
