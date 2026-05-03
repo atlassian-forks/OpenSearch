@@ -54,7 +54,7 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
 
     @Override
     public void tearDown() throws Exception {
-        ArchiveDeletionHelper.setMinRetentionSafetyBufferMinutesForTesting(5L);
+        ArchiveDeletionHelper.setMinRetentionSafetyBufferMinutesForTesting(1L); // restore to new default
         super.tearDown();
     }
 

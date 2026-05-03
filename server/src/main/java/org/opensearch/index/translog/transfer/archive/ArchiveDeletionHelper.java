@@ -30,7 +30,7 @@ public final class ArchiveDeletionHelper {
      * Default is 5 minutes in production. Can be overridden to 0 for integration tests via
      * {@link #setMinRetentionSafetyBufferMinutesForTesting(long)}.
      */
-    public static volatile long MIN_RETENTION_SAFETY_BUFFER_MINUTES = 5L;
+    public static volatile long MIN_RETENTION_SAFETY_BUFFER_MINUTES = 1L;
 
     /**
      * Override the safety buffer for integration tests so GC can run immediately after upload.
