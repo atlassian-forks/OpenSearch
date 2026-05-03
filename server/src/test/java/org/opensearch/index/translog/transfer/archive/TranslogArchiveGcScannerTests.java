@@ -773,7 +773,7 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
                 new org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot(name2, b2.toByteArray(), 0L),
                 min2Path, org.opensearch.common.blobstore.stream.write.WritePriority.HIGH);
 
-            // Scan both minutes
+            // Scan both minutes — uses real BlobStoreTransferService which calls uploadBlobStream for gc_idx
             TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
             scanner.scan(minute2Time); // scan up to minute2
 
@@ -795,5 +795,92 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         } finally {
             org.opensearch.threadpool.ThreadPool.terminate(threadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
         }
+    }
+
+    /**
+     * Regression test: scanMinute() must persist gc_idx via uploadBlobStream() not uploadBlob().
+     *
+     * uploadBlob(InputStream,...) calls checksumOfChecksum() which expects bytes to already contain
+     * an OpenSearch codec footer. MinuteGcIndex.serialize() produces raw bytes with no codec footer,
+     * causing "Checksum combination failed" errors and preventing GC index persistence.
+     *
+     * uploadBlobStream() writes raw bytes directly to the blob container without checksum processing.
+     */
+    public void testScanMinutePersistsGcIdxViaUploadBlobStreamNotUploadBlob() throws Exception {
+        TransferService mockTransfer = Mockito.mock(TransferService.class);
+        BlobPath archiveBasePath = new BlobPath().add("base");
+        BlobPath txlogDayPath = archiveBasePath.add("txlog").add("20260503");
+        BlobPath minutePath = txlogDayPath.add("1000");
+        BlobPath gcIdxDayPath = archiveBasePath.add("gc_idx").add("20260503");
+
+        // One TAR with a GC entry
+        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
+            new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 10L, 7L)
+        );
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+            TarArchiveBuilder.fromBytes("uuid/0/1/translog-1.tlog", "a".getBytes())
+        );
+        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(entries, gcEntries);
+        java.io.ByteArrayOutputStream tarOut = new java.io.ByteArrayOutputStream();
+        TarArchiveBuilder.build(tarOut, layout, entries);
+        byte[] tarBytes = tarOut.toByteArray();
+
+        // Mock: one TAR blob in the minute dir
+        BlobMetadata blobMeta = Mockito.mock(BlobMetadata.class);
+        Mockito.when(blobMeta.name()).thenReturn("00.000.node1.tar");
+        Mockito.doAnswer(inv -> {
+            @SuppressWarnings("unchecked")
+            org.opensearch.core.action.ActionListener<java.util.List<BlobMetadata>> listener =
+                inv.getArgument(3);
+            listener.onResponse(List.of(blobMeta));
+            return null;
+        }).when(mockTransfer).listAllInSortedOrder(
+            ArgumentMatchers.eq(minutePath), ArgumentMatchers.eq(""), ArgumentMatchers.anyInt(),
+            ArgumentMatchers.any()
+        );
+        // readGcPrefix uses downloadBlob(path, name, position, length) — 4-arg ranged version
+        Mockito.when(mockTransfer.downloadBlob(
+            ArgumentMatchers.eq(minutePath),
+            ArgumentMatchers.eq("00.000.node1.tar"),
+            ArgumentMatchers.eq(0L),
+            ArgumentMatchers.anyLong()
+        )).thenAnswer(inv -> new java.io.ByteArrayInputStream(tarBytes));
+
+        // No already-indexed minutes — mock the async version with ActionListener
+        Mockito.doAnswer(inv -> {
+            @SuppressWarnings("unchecked")
+            org.opensearch.core.action.ActionListener<java.util.List<BlobMetadata>> listener =
+                inv.getArgument(3);
+            listener.onResponse(List.of());
+            return null;
+        }).when(mockTransfer).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.eq(""), ArgumentMatchers.anyInt(),
+            ArgumentMatchers.any()
+        );
+
+        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(mockTransfer, archiveBasePath);
+        scanner.scanMinute(txlogDayPath, gcIdxDayPath, "20260503", "1000");
+
+        // Verify uploadBlobStream was called (not uploadBlob) — regression for checksum corruption bug
+        Mockito.verify(mockTransfer).uploadBlobStream(
+            ArgumentMatchers.any(java.io.InputStream.class),
+            ArgumentMatchers.anyLong(),
+            ArgumentMatchers.eq(gcIdxDayPath),
+            ArgumentMatchers.eq("1000.idx"),
+            ArgumentMatchers.eq(org.opensearch.common.blobstore.stream.write.WritePriority.NORMAL),
+            ArgumentMatchers.isNull()
+        );
+        // Verify uploadBlob was NOT called for gc_idx (would cause checksum corruption)
+        Mockito.verify(mockTransfer, Mockito.never()).uploadBlob(
+            ArgumentMatchers.any(java.io.InputStream.class),
+            ArgumentMatchers.any(),
+            ArgumentMatchers.eq("1000.idx"),
+            ArgumentMatchers.any(),
+            ArgumentMatchers.any()
+        );
+
+        // gc_idx should be in-memory after successful persist
+        String minuteKey = "20260503/1000";
+        assertNotNull("gc_idx should be in memory after successful persist", scanner.getInMemoryIndex().get(minuteKey));
     }
 }

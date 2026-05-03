@@ -462,30 +462,21 @@ public final class TranslogArchiveGcScanner {
 
         MinuteGcIndex idx = builder.build();
 
-        // Persist .idx blob synchronously using latch
+        // Persist .idx blob synchronously using uploadBlobStream (raw bytes, no codec checksum wrapping).
+        // uploadBlob() calls checksumOfChecksum() which expects bytes to already contain an OpenSearch
+        // codec footer — our raw serialized index bytes do not, causing checksum corruption errors.
+        // uploadBlobStream() writes directly to the blob container without any checksum processing.
         String idxBlobName = minuteDir + ".idx";
         byte[] idxBytes = idx.serialize();
         try {
-            java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
-            java.util.concurrent.atomic.AtomicReference<Exception> uploadErr = new java.util.concurrent.atomic.AtomicReference<>();
-            transferService.uploadBlob(
+            transferService.uploadBlobStream(
                 new java.io.ByteArrayInputStream(idxBytes),
+                idxBytes.length,
                 dayGcIdxPath,
                 idxBlobName,
                 org.opensearch.common.blobstore.stream.write.WritePriority.NORMAL,
-                new org.opensearch.core.action.ActionListener<Void>() {
-                    @Override public void onResponse(Void v) { latch.countDown(); }
-                    @Override public void onFailure(Exception e) { uploadErr.set(e); latch.countDown(); }
-                }
+                null
             );
-            latch.await();
-            if (uploadErr.get() != null) {
-                throw new IOException("Failed to upload gc_idx blob", uploadErr.get());
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            logger.warn("GC scanner: interrupted persisting gc_idx {}/{}", dayDir, idxBlobName);
-            return; // Don't load in-memory without durable persistence — caller will retry next cycle
         } catch (IOException e) {
             logger.warn("GC scanner: failed to persist gc_idx {}/{}: {}", dayDir, idxBlobName, e.getMessage());
             return; // Don't load in-memory: "absent .idx = not scanned" invariant must hold
