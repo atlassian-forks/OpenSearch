@@ -1063,4 +1063,47 @@ public class IndexSettingsTests extends OpenSearchTestCase {
         IndexSettings settings = newIndexSettings(newIndexMeta("index", theSettings), nodeSettings);
         assertTrue("Index should be on remote node", settings.isAssignedOnRemoteNode());
     }
+
+    public void testTranslogArchiveRetentionDefault() {
+        // Regression test: default retention must be 10 minutes (not 2 hours).
+        // A 2h default causes TARs to accumulate ~99K/hr during heavy indexing,
+        // blowing out S3 costs before GC kicks in.
+        IndexSettings settings = newIndexSettings(newIndexMeta("index", Settings.EMPTY), Settings.EMPTY);
+        assertEquals(
+            "Default translog archive retention must be 10 minutes",
+            TimeValue.timeValueMinutes(10),
+            settings.getTranslogArchiveRetention()
+        );
+    }
+
+    public void testTranslogArchiveRetentionMinimumEnforced() {
+        // Minimum is 5 minutes — values below should be rejected.
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> newIndexSettings(
+                newIndexMeta(
+                    "index",
+                    Settings.builder()
+                        .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.getKey(), "4m")
+                        .build()
+                ),
+                Settings.EMPTY
+            )
+        );
+        assertThat(e.getMessage(), containsString("archive_retention"));
+    }
+
+    public void testTranslogArchiveRetentionCustomValue() {
+        // Dynamic setting should be respected when set explicitly.
+        IndexSettings settings = newIndexSettings(
+            newIndexMeta(
+                "index",
+                Settings.builder()
+                    .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.getKey(), "30m")
+                    .build()
+            ),
+            Settings.EMPTY
+        );
+        assertEquals(TimeValue.timeValueMinutes(30), settings.getTranslogArchiveRetention());
+    }
 }

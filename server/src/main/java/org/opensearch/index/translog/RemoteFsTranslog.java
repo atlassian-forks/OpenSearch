@@ -879,6 +879,7 @@ public class RemoteFsTranslog extends Translog {
             minGen = 0;
         }
         // Use the dedicated archive retention setting (default 10 min, min 5 min safety buffer).
+        // See IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.
         long retentionMinutes = indexSettings().getTranslogArchiveRetention().getMinutes();
         return Optional.of(new ArchiveDeletionHelper.RetentionBounds(minPrimaryTermToKeep, minGen, retentionMinutes));
     }

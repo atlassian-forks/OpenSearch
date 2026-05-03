@@ -813,7 +813,7 @@ public final class IndexSettings {
      */
     public static final Setting<TimeValue> INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING = Setting.timeSetting(
         "index.remote_store.translog.archive_retention",
-        TimeValue.timeValueHours(2),
+        TimeValue.timeValueMinutes(10),
         TimeValue.timeValueMinutes(5),
         Property.Dynamic,
         Property.IndexScope
