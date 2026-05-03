@@ -22,7 +22,9 @@ import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.index.IndexService;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.translog.transfer.FileSnapshot;
@@ -30,7 +32,6 @@ import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
-import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 import org.opensearch.index.translog.transfer.archive.TranslogArchiveGcScanner;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
@@ -409,35 +410,43 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
      *
      * <p>The checkpoint gate is the primary safety mechanism — a minute-dir is deleted only when
      * all shard seqNos in that minute are confirmed committed to remote segments (via the two-phase
-     * {@link TranslogArchiveGcScanner#isSafeToDelete} check). No configurable retention window is
-     * needed; instead a minimal safety buffer ({@link ArchiveDeletionHelper#MIN_RETENTION_SAFETY_BUFFER_MINUTES}
-     * minutes) protects data that was just uploaded and hasn't been scanned yet.
+     * {@link TranslogArchiveGcScanner#isSafeToDelete} check). The configurable retention window
+     * ({@code index.remote_store.translog.archive_retention}) adds an additional time gate:
+     * minute-dirs younger than the retention age are never deleted even if the checkpoint gate passes.
      *
      * <p>Algorithm (only runs on the elected cluster-manager):
      * <ol>
      *   <li>Resolve transfer service + base path from any eligible shard.</li>
+     *   <li>Compute retention cutoff = {@code now - min(archiveRetention across all live indices)}.</li>
      *   <li>Ensure {@link #gcScanner} is initialised; run {@code scanner.scan()} to index new minute-dirs.</li>
-     *   <li>For every minute-dir in txlog/ that is older than the minimal safety buffer:
+     *   <li>For every minute-dir in txlog/ that is older than the retention cutoff:
      *       ask {@code scanner.isSafeToDelete()} — delete only if checkpoint gate passes.</li>
      *   <li>On successful deletion: evict the minute-key from the scanner's in-memory index.</li>
      * </ol>
      */
     private void runArchiveRetention() {
-        // Resolve transfer service + base path from any eligible shard.
+        // Resolve transfer service + base path, and compute the minimum retention across all live indices.
+        // Using the minimum ensures we honour the most conservative retention setting when multiple
+        // indices share the same archive base path on this node.
         TransferService anyTransferService = null;
         BlobPath anyBasePath = null;
+        long minRetentionMillis = IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.getDefault(Settings.EMPTY).millis();
 
         for (ShardId sid : getEligibleShardIds()) {
             IndexService indexService = indicesService.indexService(sid.getIndex());
             if (indexService == null) continue;
             IndexShard shard = indexService.getShardOrNull(sid.id());
             if (shard == null) continue;
+            // Collect minimum retention across all live archive-enabled indices
+            long shardRetentionMillis = shard.indexSettings().getTranslogArchiveRetention().millis();
+            if (shardRetentionMillis < minRetentionMillis) {
+                minRetentionMillis = shardRetentionMillis;
+            }
             if (anyTransferService == null) {
                 Optional<TranslogTransferManager> tmOpt = shard.getTranslogTransferManager();
                 if (tmOpt.isPresent()) {
                     anyTransferService = tmOpt.get().getTransferService();
                     anyBasePath = tmOpt.get().getArchiveBasePath();
-                    break;
                 }
             }
         }
@@ -470,14 +479,16 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             }
         }
 
-        // Safety buffer: never delete a minute-dir that was uploaded less than MIN_RETENTION_SAFETY_BUFFER_MINUTES
-        // ago, regardless of checkpoint state. This protects against edge cases where a minute-dir is
-        // brand-new and the scanner hasn't had time to index it yet.
-        Instant safetyCutoff = Instant.now().minus(Duration.ofMinutes(ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES));
+        // Retention cutoff: only delete minute-dirs older than the configured archive_retention.
+        // This is the primary time gate — combined with the checkpoint gate (isSafeToDelete),
+        // it ensures TARs are only deleted when both conditions are met:
+        //   1. The minute-dir is older than archive_retention (time gate)
+        //   2. All shard checkpoints in the minute are committed to remote segments (checkpoint gate)
+        Instant retentionCutoff = Instant.now().minus(Duration.ofMillis(minRetentionMillis));
         BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(anyBasePath);
 
         try {
-            deleteHierarchicalArchivesOlderThan(anyTransferService, txlogRoot, safetyCutoff, scanner, liveIndexUUIDs);
+            deleteHierarchicalArchivesOlderThan(anyTransferService, txlogRoot, retentionCutoff, scanner, liveIndexUUIDs);
         } catch (IOException ex) {
             logger.warn("Archive retention GC failed: {}", ex.getMessage());
         }

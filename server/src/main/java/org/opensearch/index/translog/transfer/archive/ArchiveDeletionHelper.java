@@ -26,23 +26,6 @@ public final class ArchiveDeletionHelper {
     private ArchiveDeletionHelper() {}
 
     /**
-     * Minimum safety buffer: never delete a minute-dir newer than this, regardless of configured retention.
-     * Default is 5 minutes in production. Can be overridden to 0 for integration tests via
-     * {@link #setMinRetentionSafetyBufferMinutesForTesting(long)}.
-     */
-    public static volatile long MIN_RETENTION_SAFETY_BUFFER_MINUTES = 1L;
-
-    /**
-     * Override the safety buffer for integration tests so GC can run immediately after upload.
-     * Must be reset to 5L after the test.
-     *
-     * @param minutes new buffer value (use 0 for tests)
-     */
-    public static void setMinRetentionSafetyBufferMinutesForTesting(long minutes) {
-        MIN_RETENTION_SAFETY_BUFFER_MINUTES = minutes;
-    }
-
-    /**
      * Retention bounds for a shard: do not delete generations >= minGenerationToKeep in this primary term,
      * and do not delete any files from primary terms >= minPrimaryTermToKeep.
      * retentionMinutes is the configured index.translog.retention.age (in minutes, -1 = use default 60min).
@@ -74,11 +57,10 @@ public final class ArchiveDeletionHelper {
 
         /**
          * Returns the effective retention cutoff in minutes.
-         * The setting enforces a minimum of 5 minutes at the IndexSettings level, so this is always ≥ 5.
-         * The max() guard is a belt-and-suspenders safety in case retentionMinutes is set directly in tests.
+         * If retentionMinutes is -1 (two-arg constructor default), returns 0 (no time gate).
          */
         public long getEffectiveRetentionMinutes() {
-            return Math.max(retentionMinutes, MIN_RETENTION_SAFETY_BUFFER_MINUTES);
+            return retentionMinutes < 0 ? 0 : retentionMinutes;
         }
     }
 

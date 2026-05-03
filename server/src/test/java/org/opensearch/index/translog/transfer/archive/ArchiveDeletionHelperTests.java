@@ -101,40 +101,25 @@ public class ArchiveDeletionHelperTests extends OpenSearchTestCase {
     // ---- Retention time-gate tests ----
 
     public void testEffectiveRetentionMinutesUsesConfiguredValue() {
-        // retentionMinutes = 120 → use 120 (above safety floor)
         ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, 120L);
         assertThat(b.getEffectiveRetentionMinutes(), equalTo(120L));
     }
 
-    public void testEffectiveRetentionMinutesDefaultSetting() {
-        // Tests 10-minute retention (below new default of 2h, but still above safety floor of 5min)
-        ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, 10L);
-        assertThat(b.getEffectiveRetentionMinutes(), equalTo(10L));
-    }
-
-    public void testEffectiveRetentionMinutesEnforcesSafetyFloor() {
-        // retentionMinutes = 1 → below MIN_RETENTION_SAFETY_BUFFER_MINUTES (5), clamped to 5
-        // (In practice, the setting minimum of 5min prevents this, but belt-and-suspenders in tests)
+    public void testEffectiveRetentionMinutesSmallValue() {
+        // Small retention values are allowed (setting min is 1s); returned as-is
         ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, 1L);
-        assertThat(b.getEffectiveRetentionMinutes(), equalTo(ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES));
+        assertThat(b.getEffectiveRetentionMinutes(), equalTo(1L));
     }
 
-    public void testEffectiveRetentionMinutesAtExactSafetyFloor() {
-        // retentionMinutes == MIN_RETENTION_SAFETY_BUFFER_MINUTES (5) → exactly the floor
-        long floor = ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES;
-        ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, floor);
-        assertThat(b.getEffectiveRetentionMinutes(), equalTo(floor));
-    }
-
-    public void testEffectiveRetentionMinutesZeroUsesFloor() {
-        // retentionMinutes = 0 → below floor, clamped to MIN_RETENTION_SAFETY_BUFFER_MINUTES
+    public void testEffectiveRetentionMinutesZero() {
+        // retentionMinutes = 0 → returned as 0 (no time gate)
         ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L, 0L);
-        assertThat(b.getEffectiveRetentionMinutes(), equalTo(ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES));
+        assertThat(b.getEffectiveRetentionMinutes(), equalTo(0L));
     }
 
-    public void testDefaultConstructorUsesFloor() {
-        // Two-arg constructor sets retentionMinutes = -1 → clamped to MIN_RETENTION_SAFETY_BUFFER_MINUTES
+    public void testDefaultConstructorReturnZero() {
+        // Two-arg constructor sets retentionMinutes = -1 → returns 0 (no time gate)
         ArchiveDeletionHelper.RetentionBounds b = new ArchiveDeletionHelper.RetentionBounds(1L, 1L);
-        assertThat(b.getEffectiveRetentionMinutes(), equalTo(ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES));
+        assertThat(b.getEffectiveRetentionMinutes(), equalTo(0L));
     }
 }

@@ -15,7 +15,6 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.translog.TranslogArchiveTimerThreadLeakFilter;
 import org.opensearch.index.translog.TranslogArchiveCollector;
-import org.opensearch.index.translog.transfer.archive.ArchiveDeletionHelper;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.test.OpenSearchIntegTestCase;
@@ -47,14 +46,10 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
     @Override
     public void setUp() throws Exception {
         super.setUp();
-        // Zero the safety buffer so GC can run immediately after retention expires.
-        // Reset in tearDown to avoid leaking into other tests.
-        ArchiveDeletionHelper.setMinRetentionSafetyBufferMinutesForTesting(0L);
     }
 
     @Override
     public void tearDown() throws Exception {
-        ArchiveDeletionHelper.setMinRetentionSafetyBufferMinutesForTesting(1L); // restore to new default
         super.tearDown();
     }
 
@@ -86,12 +81,11 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
      * </ul>
      */
     public void testGcSchedulerIndexesTarsAndDeletesThem() throws Exception {
-        // Safety buffer = 1.5 minutes. GC interval = 1m (set in nodeSettings).
-        // TARs uploaded at t=0, safety buffer expires at t=1.5m.
+        // archive_retention = 1m (the time gate). GC interval = 1m (set in nodeSettings).
+        // TARs uploaded at t=0, retention expires at t=1m.
         // First GC run at t=1m: scans minute-dirs → writes .idx files (scanner phase).
-        // Second GC run at t=2m: buffer expired → deletes TARs (deletion phase).
+        // Second GC run at t=2m: retention expired → deletes TARs (deletion phase).
         // assertBusy timeout = 3m to give plenty of headroom.
-        ArchiveDeletionHelper.setMinRetentionSafetyBufferMinutesForTesting(1L);  // 1 minute buffer
 
         // Single node: both cluster-manager and data. GC resolves transfer service from local shards.
         final String nodeName = internalCluster().startNode();
@@ -103,6 +97,8 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
                     Settings.builder()
                         .put(remoteStoreIndexSettings(0, 1))
                         .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+                        // archive_retention = 1m — TARs can be deleted after 1m
+                        .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.getKey(), "1m")
                         .build()
                 )
         );
@@ -138,8 +134,8 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
             logger.info("gc_idx/ .idx files found: {}", idxFiles);
         }, 3, java.util.concurrent.TimeUnit.MINUTES);
 
-        // ── Phase 2: assert GC deletes TARs after safety buffer expires ────────
-        // Safety buffer = 1m. After the second GC run (~2m from start), all TARs should be deleted.
+        // ── Phase 2: assert GC deletes TARs after archive_retention expires ────
+        // archive_retention = 1m. After the second GC run (~2m from start), all TARs should be deleted.
         logger.info("=== Waiting for all TARs to be deleted by GC (up to 3m) ===");
         assertBusy(() -> {
             List<String> remaining = collectTarPaths(translogRepoPath);
@@ -154,19 +150,12 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
     }
 
     /**
-     * Verifies that GC preserves TARs when the safety buffer is set to a large value.
+     * Verifies that GC preserves TARs when {@code archive_retention} is set to a long value (60m).
      *
-     * <p>The checkpoint-based GC cutoff is {@code now - MIN_RETENTION_SAFETY_BUFFER_MINUTES}.
-     * With a large buffer (e.g. 60 min), recently-uploaded TARs ({@literal <} 60 min old) should not be deleted.
-     *
-     * <p>Note: {@code INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING} is NOT the GC cutoff
-     * in checkpoint-based GC — retention is checkpoint-gated, not time-gated. The safety buffer
-     * ({@link ArchiveDeletionHelper#MIN_RETENTION_SAFETY_BUFFER_MINUTES}) is the only time gate.
+     * <p>Since GC cutoff = {@code now - archive_retention}, recently-uploaded TARs ({@literal <} 60m old)
+     * should not be deleted even when GC is triggered immediately.
      */
-    public void testGcPreservesRecentTarsWhenSafetyBufferIsLarge() throws Exception {
-        // Override: use a large safety buffer so recently-uploaded TARs are protected.
-        ArchiveDeletionHelper.setMinRetentionSafetyBufferMinutesForTesting(60L);
-
+    public void testGcPreservesRecentTarsWhenRetentionIsLong() throws Exception {
         // Single node: both cluster-manager and data (GC requires local shards to resolve transfer service).
         internalCluster().startNode();
         ensureGreen();
@@ -177,6 +166,8 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
                     Settings.builder()
                         .put(remoteStoreIndexSettings(0, 1))
                         .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true)
+                        // 60m retention — TARs uploaded just now should NOT be deleted
+                        .put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.getKey(), "60m")
                         .build()
                 )
         );
@@ -195,15 +186,15 @@ public class TranslogArchiveGcIT extends BaseRemoteStoreRestoreIT {
         int tarsBeforeGc = collectTarPaths(translogRepoPath).size();
         assertTrue("Expected TARs before GC", tarsBeforeGc > 0);
 
-        // Trigger GC immediately — safety buffer is 60m so TARs uploaded < 60m ago should NOT be deleted
+        // Trigger GC immediately — retention is 60m so recently-uploaded TARs should NOT be deleted
         String clusterManagerNode = internalCluster().getMasterName();
         IndicesService indicesService = internalCluster().getInstance(IndicesService.class, clusterManagerNode);
         indicesService.getTranslogArchiveCollector().runRetentionForTesting();
 
         int tarsAfterGc = collectTarPaths(translogRepoPath).size();
-        logger.info("TARs before GC: {}, after GC: {} (60m safety buffer, should not delete)", tarsBeforeGc, tarsAfterGc);
+        logger.info("TARs before GC: {}, after GC: {} (60m retention, should not delete)", tarsBeforeGc, tarsAfterGc);
         assertEquals(
-            "GC should not have deleted recent TARs (60m safety buffer active), count changed from "
+            "GC should not have deleted recent TARs (60m archive_retention active), count changed from "
                 + tarsBeforeGc + " to " + tarsAfterGc,
             tarsBeforeGc,
             tarsAfterGc

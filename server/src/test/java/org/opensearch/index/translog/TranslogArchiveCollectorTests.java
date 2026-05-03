@@ -1186,9 +1186,11 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             assertThat("old TAR should exist before GC", archiveBlobCount(blobStore.blobContainer(oldDir).listBlobs()), equalTo(1L));
             assertThat("fresh TAR should exist before GC", archiveBlobCount(blobStore.blobContainer(freshDir).listBlobs()), equalTo(1L));
 
-            // Run hierarchical GC with 5-min safety cutoff (no scanner = timestamp-only mode)
+            // Run hierarchical GC with cutoff = 1 minute ago.
+            // Old TAR (2h ago) is past cutoff → deleted.
+            // Fresh TAR (now) is within cutoff → preserved.
             BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(basePath);
-            Instant cutoff = Instant.now().minus(java.time.Duration.ofMinutes(ArchiveDeletionHelper.MIN_RETENTION_SAFETY_BUFFER_MINUTES));
+            Instant cutoff = Instant.now().minus(Duration.ofMinutes(1));
             int deleted = TranslogArchiveCollector.deleteHierarchicalArchivesOlderThan(transferService, txlogRoot, cutoff);
 
             assertThat("old TAR should be deleted", deleted, equalTo(1));
@@ -1794,11 +1796,11 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
         verify(cancellable, times(1)).cancel();
     }
 
-    public void testTranslogArchiveGcIntervalDefaultIsTenMinutes() {
-        // The default gc_interval was changed to 10 minutes to reduce S3 LIST storms.
+    public void testTranslogArchiveGcIntervalDefaultIsTwoMinutes() {
+        // The default gc_interval is 2 minutes for more aggressive GC (reduced from 10m).
         TimeValue defaultInterval = RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_ARCHIVE_GC_INTERVAL.getDefault(
             org.opensearch.common.settings.Settings.EMPTY
         );
-        assertThat("gc_interval default should be 10 minutes", defaultInterval, equalTo(TimeValue.timeValueMinutes(10)));
+        assertThat("gc_interval default should be 2 minutes", defaultInterval, equalTo(TimeValue.timeValueMinutes(2)));
     }
 }
