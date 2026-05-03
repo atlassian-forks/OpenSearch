@@ -20,11 +20,9 @@ import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexService;
-import org.opensearch.index.IndexSettings;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.translog.transfer.FileSnapshot;
@@ -417,7 +415,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
      * <p>Algorithm (only runs on the elected cluster-manager):
      * <ol>
      *   <li>Resolve transfer service + base path from any eligible shard.</li>
-     *   <li>Compute retention cutoff = {@code now - min(archiveRetention across all live indices)}.</li>
+     *   <li>Compute retention cutoff = {@code now - archiveRetention} from that shard's index settings.</li>
      *   <li>Ensure {@link #gcScanner} is initialised; run {@code scanner.scan()} to index new minute-dirs.</li>
      *   <li>For every minute-dir in txlog/ that is older than the retention cutoff:
      *       ask {@code scanner.isSafeToDelete()} — delete only if checkpoint gate passes.</li>
@@ -425,33 +423,27 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
      * </ol>
      */
     private void runArchiveRetention() {
-        // Resolve transfer service + base path, and compute the minimum retention across all live indices.
-        // Using the minimum ensures we honour the most conservative retention setting when multiple
-        // indices share the same archive base path on this node.
+        // Resolve transfer service + base path from an eligible shard, and use that shard's
+        // per-index archive retention setting as the time gate.
         TransferService anyTransferService = null;
         BlobPath anyBasePath = null;
-        long minRetentionMillis = IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_RETENTION_SETTING.getDefault(Settings.EMPTY).millis();
+        Long retentionMillis = null;
 
         for (ShardId sid : getEligibleShardIds()) {
             IndexService indexService = indicesService.indexService(sid.getIndex());
             if (indexService == null) continue;
             IndexShard shard = indexService.getShardOrNull(sid.id());
             if (shard == null) continue;
-            // Collect minimum retention across all live archive-enabled indices
-            long shardRetentionMillis = shard.indexSettings().getTranslogArchiveRetention().millis();
-            if (shardRetentionMillis < minRetentionMillis) {
-                minRetentionMillis = shardRetentionMillis;
-            }
-            if (anyTransferService == null) {
-                Optional<TranslogTransferManager> tmOpt = shard.getTranslogTransferManager();
-                if (tmOpt.isPresent()) {
-                    anyTransferService = tmOpt.get().getTransferService();
-                    anyBasePath = tmOpt.get().getArchiveBasePath();
-                }
+            Optional<TranslogTransferManager> tmOpt = shard.getTranslogTransferManager();
+            if (tmOpt.isPresent()) {
+                anyTransferService = tmOpt.get().getTransferService();
+                anyBasePath = tmOpt.get().getArchiveBasePath();
+                retentionMillis = shard.indexSettings().getTranslogArchiveRetention().millis();
+                break;
             }
         }
 
-        if (anyTransferService == null || anyBasePath == null) {
+        if (anyTransferService == null || anyBasePath == null || retentionMillis == null) {
             return;
         }
 
@@ -484,7 +476,7 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         // it ensures TARs are only deleted when both conditions are met:
         //   1. The minute-dir is older than archive_retention (time gate)
         //   2. All shard checkpoints in the minute are committed to remote segments (checkpoint gate)
-        Instant retentionCutoff = Instant.now().minus(Duration.ofMillis(minRetentionMillis));
+        Instant retentionCutoff = Instant.now().minus(Duration.ofMillis(retentionMillis));
         BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(anyBasePath);
 
         try {
