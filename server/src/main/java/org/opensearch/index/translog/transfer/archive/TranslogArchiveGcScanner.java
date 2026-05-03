@@ -414,7 +414,20 @@ public final class TranslogArchiveGcScanner {
             try (InputStream is = transferService.downloadBlob(dayGcIdxPath, blobName)) {
                 bytes = is.readAllBytes();
             }
-            inMemoryIndex.put(minuteKey, MinuteGcIndex.deserialize(bytes));
+            MinuteGcIndex idx = MinuteGcIndex.deserialize(bytes);
+            inMemoryIndex.put(minuteKey, idx);
+            // Update rolling checkpoints — required for isSafeToDelete Phase 2.
+            // Without this, scanDay() calls that hit "already indexed" minutes via loadSingleIdx()
+            // would populate inMemoryIndex but leave rollingCheckpoints empty, causing Phase 2
+            // to always return false and blocking all GC deletions on the second and subsequent
+            // scan cycles (when all minutes already have .idx files).
+            for (String indexUUID : idx.indexUUIDs()) {
+                Map<Integer, Long> indexCheckpoints = rollingCheckpoints
+                    .computeIfAbsent(indexUUID, k -> new ConcurrentHashMap<>());
+                for (MinuteGcIndex.ShardRange shard : idx.shards(indexUUID).values()) {
+                    indexCheckpoints.merge(shard.getShardId(), shard.getMaxCheckpoint(), Math::max);
+                }
+            }
         } catch (IOException e) {
             logger.warn("GC scanner: failed to load {}: {}", blobName, e.getMessage());
         }

@@ -798,6 +798,93 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
     }
 
     /**
+     * Regression test: loadSingleIdx() must update rollingCheckpoints, not just inMemoryIndex.
+     *
+     * <p>Bug: when scan() runs and ALL minute-dirs already have .idx files, scanDay() calls
+     * loadSingleIdx() for each (not scanMinute()). The original loadSingleIdx() only populated
+     * inMemoryIndex but NOT rollingCheckpoints. On the second+ scan cycle, isSafeToDelete()
+     * Phase 2 checks rollingCheckpoints[indexUUID][shardId] — which is always null/empty —
+     * and returns false for every minute-dir, permanently blocking all GC deletions.
+     *
+     * <p>This scenario occurs in production when:
+     * 1. Cluster-manager comes up with existing gc_idx/ files (loadFromPersisted restores state OK).
+     * 2. First scan() cycles through and calls loadSingleIdx() for minutes already indexed.
+     * 3. No new minute-dirs exist, so scanMinute() is never called.
+     * 4. rollingCheckpoints remains empty → Phase 2 always fails → no TARs ever deleted.
+     */
+    public void testScanDayLoadsSingleIdxUpdatesRollingCheckpoints() throws IOException {
+        // Setup: two minutes already have .idx in gc_idx/, none in inMemoryIndex yet.
+        // minute 1000: shard 0, maxSeqNo=10, maxCheckpoint=8 → Phase 1 fails
+        // minute 1001: shard 0, maxSeqNo=15, maxCheckpoint=12 → Phase 1 fails
+        // After scan(), rollingCheckpoints[UUID_A][0] should be max(8, 12) = 12
+        // → Phase 2: minute 1000 safe (10 ≤ 12), minute 1001 not safe (15 > 12)
+
+        TransferService transferService = Mockito.mock(TransferService.class);
+        BlobPath archiveBasePath = new BlobPath().add("base");
+        BlobPath txlogRoot = archiveBasePath.add("txlog");
+        BlobPath gcIdxRoot = TranslogArchiveGcScanner.gcIdxRootPath(archiveBasePath);
+        BlobPath txlogDayPath = txlogRoot.add("20260503");
+        BlobPath gcIdxDayPath = gcIdxRoot.add("20260503");
+
+        // Build serialized .idx for both minutes
+        MinuteGcIndex.Builder b1000 = new MinuteGcIndex.Builder();
+        b1000.merge(List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 10L, 8L)));
+        byte[] idx1000 = b1000.build().serialize();
+
+        MinuteGcIndex.Builder b1001 = new MinuteGcIndex.Builder();
+        b1001.merge(List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 11L, 15L, 12L)));
+        byte[] idx1001 = b1001.build().serialize();
+
+        // txlog/ has the two minute dirs
+        Mockito.when(transferService.listFolders(txlogRoot)).thenReturn(Set.of("20260503"));
+        Mockito.when(transferService.listFolders(txlogDayPath)).thenReturn(Set.of("1000", "1001"));
+
+        // gc_idx/ already has .idx for both minutes (simulates second scan cycle)
+        BlobMetadata bm1000 = Mockito.mock(BlobMetadata.class);
+        Mockito.when(bm1000.name()).thenReturn("1000.idx");
+        BlobMetadata bm1001 = Mockito.mock(BlobMetadata.class);
+        Mockito.when(bm1001.name()).thenReturn("1001.idx");
+        Mockito.doAnswer(inv -> {
+            ActionListener<List<BlobMetadata>> listener = inv.getArgument(3);
+            listener.onResponse(List.of(bm1000, bm1001)); // both already indexed
+            return null;
+        }).when(transferService).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.eq(""), ArgumentMatchers.anyInt(),
+            ArgumentMatchers.any()
+        );
+
+        // downloadBlob for the idx files (called by loadSingleIdx)
+        Mockito.when(transferService.downloadBlob(gcIdxDayPath, "1000.idx"))
+            .thenReturn(new ByteArrayInputStream(idx1000));
+        Mockito.when(transferService.downloadBlob(gcIdxDayPath, "1001.idx"))
+            .thenReturn(new ByteArrayInputStream(idx1001));
+
+        // Create scanner with empty state (simulates fresh second scan cycle —
+        // no loadFromPersisted called, rollingCheckpoints starts empty)
+        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+
+        // Trigger scan() — all minutes already have .idx → scanDay calls loadSingleIdx for each
+        scanner.scan(java.time.Instant.now());
+
+        // Both minutes should be in inMemoryIndex
+        assertNotNull("minute 1000 should be in inMemoryIndex", scanner.getInMemoryIndex().get("20260503/1000"));
+        assertNotNull("minute 1001 should be in inMemoryIndex", scanner.getInMemoryIndex().get("20260503/1001"));
+
+        // rollingCheckpoints must be populated by loadSingleIdx (the bug: it wasn't)
+        assertNotNull("rollingCheckpoints should contain UUID_A", scanner.getRollingCheckpoints().get(UUID_A));
+        assertEquals("rollingCheckpoints[0] should be max(8,12)=12",
+            12L, (long) scanner.getRollingCheckpoints().get(UUID_A).get(0));
+
+        // Phase 2 gate: minute 1000 maxSeqNo=10 ≤ rollingCheckpoint=12 → SAFE
+        assertTrue("minute 1000 should be safe via Phase 2 rolling checkpoint",
+            scanner.isSafeToDelete("20260503/1000"));
+
+        // Phase 2 gate: minute 1001 maxSeqNo=15 > rollingCheckpoint=12 → NOT SAFE
+        assertFalse("minute 1001 should NOT be safe: maxSeqNo(15) > rollingCheckpoint(12)",
+            scanner.isSafeToDelete("20260503/1001"));
+    }
+
+    /**
      * Regression test: scanMinute() must persist gc_idx via uploadBlobStream() not uploadBlob().
      *
      * uploadBlob(InputStream,...) calls checksumOfChecksum() which expects bytes to already contain
