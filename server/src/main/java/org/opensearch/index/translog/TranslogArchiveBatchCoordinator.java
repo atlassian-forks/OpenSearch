@@ -145,6 +145,12 @@ public class TranslogArchiveBatchCoordinator {
         private final long generation;
         private final long minTranslogGeneration;
         private final List<TarArchiveBuilder.ArchiveBuildEntry> entries;
+        /** Lowest seqNo in this batch (local checkpoint at upload time). */
+        private final long minSeqNo;
+        /** Highest seqNo assigned in this batch. */
+        private final long maxSeqNo;
+        /** Last synced global checkpoint — used by GC scanner to decide when TAR is safe to delete. */
+        private final long globalCheckpoint;
 
         public ShardArchiveData(
             int shardId,
@@ -153,11 +159,27 @@ public class TranslogArchiveBatchCoordinator {
             long minTranslogGeneration,
             List<TarArchiveBuilder.ArchiveBuildEntry> entries
         ) {
+            this(shardId, primaryTerm, generation, minTranslogGeneration, entries, -1L, -1L, -1L);
+        }
+
+        public ShardArchiveData(
+            int shardId,
+            long primaryTerm,
+            long generation,
+            long minTranslogGeneration,
+            List<TarArchiveBuilder.ArchiveBuildEntry> entries,
+            long minSeqNo,
+            long maxSeqNo,
+            long globalCheckpoint
+        ) {
             this.shardId = shardId;
             this.primaryTerm = primaryTerm;
             this.generation = generation;
             this.minTranslogGeneration = minTranslogGeneration;
             this.entries = entries;
+            this.minSeqNo = minSeqNo;
+            this.maxSeqNo = maxSeqNo;
+            this.globalCheckpoint = globalCheckpoint;
         }
 
         public int getShardId() {
@@ -178,6 +200,18 @@ public class TranslogArchiveBatchCoordinator {
 
         public List<TarArchiveBuilder.ArchiveBuildEntry> getEntries() {
             return entries;
+        }
+
+        public long getMinSeqNo() {
+            return minSeqNo;
+        }
+
+        public long getMaxSeqNo() {
+            return maxSeqNo;
+        }
+
+        public long getGlobalCheckpoint() {
+            return globalCheckpoint;
         }
     }
 
@@ -390,10 +424,22 @@ public class TranslogArchiveBatchCoordinator {
      * Build and upload the ZIP archive for a batch.
      */
     private void uploadBatch(Map<Integer, ShardArchiveData> batch, TransferService transferService) throws IOException {
-        // Collect all entries
+        // Collect all entries and build GC summary entries for the scanner
         List<TarArchiveBuilder.ArchiveBuildEntry> allEntries = new ArrayList<>();
+        List<TarArchiveBuilder.GcShardEntry> gcEntries = new ArrayList<>(batch.size());
         for (ShardArchiveData data : batch.values()) {
             allEntries.addAll(data.getEntries());
+            // Embed GC summary in the TAR so the GC scanner can determine when it is safe to delete.
+            // Only include shards that provided seqNo stats (minSeqNo >= 0).
+            if (data.getMinSeqNo() >= 0) {
+                gcEntries.add(new TarArchiveBuilder.GcShardEntry(
+                    indexUUID,
+                    data.getShardId(),
+                    data.getMinSeqNo(),
+                    data.getMaxSeqNo(),
+                    data.getGlobalCheckpoint()
+                ));
+            }
         }
 
         if (allEntries.isEmpty()) {
@@ -402,7 +448,7 @@ public class TranslogArchiveBatchCoordinator {
         }
 
         // Compute TAR layout (deterministic from file sizes alone — no content reads needed)
-        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(allEntries);
+        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(allEntries, gcEntries);
         long contentLength = layout.getTotalSize();
 
         // Compute hierarchical path: txlog/{yyyyMMdd}/{HHmm}/

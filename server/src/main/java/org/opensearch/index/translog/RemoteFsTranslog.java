@@ -692,12 +692,19 @@ public class RemoteFsTranslog extends Translog {
                 archiveBatchCoordinator.initArchiveBasePath(translogTransferManager.getArchiveBasePath());
                 logger.trace("submitting to archive batch coordinator for primary term {} generation {}", primaryTerm, generation);
                 List<TarArchiveBuilder.ArchiveBuildEntry> entries = buildArchiveEntries(primaryTerm, generation);
+                // Provide seqNo stats so the batch coordinator can embed GC entries in the TAR.
+                // The GC scanner uses these to determine when it is safe to delete old TARs.
+                long minSeqNo = getMinUnreferencedSeqNoInSegments(globalCheckpointSupplier.getAsLong());
+                long globalCheckpoint = globalCheckpointSupplier.getAsLong();
                 TranslogArchiveBatchCoordinator.ShardArchiveData shardData = new TranslogArchiveBatchCoordinator.ShardArchiveData(
                     shardId.id(),
                     primaryTerm,
                     generation,
                     getMinFileGeneration(),
-                    entries
+                    entries,
+                    minSeqNo,
+                    maxSeqNo,
+                    globalCheckpoint
                 );
                 archiveBatchCoordinator.submitAndWait(shardData, translogTransferManager.getTransferService());
                 // No per-shard metadata upload — recovery uses TranslogArchiveRecovery to find

@@ -148,6 +148,50 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         );
     }
 
+    public void testGcEntriesEmbeddedInTar() throws Exception {
+        // Regression: coordinator-uploaded TARs must embed GC entries so the GC scanner
+        // can determine when it is safe to delete old minute-dirs.
+        // Before this fix, uploadBatch() called computeLayout(allEntries) with no gcEntries,
+        // resulting in numIndices=0 in the TAR index block → all .idx files were 2 bytes (empty).
+        TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
+
+        // Capture the actual bytes written to the transfer service
+        java.util.concurrent.atomic.AtomicReference<byte[]> uploadedBytes = new java.util.concurrent.atomic.AtomicReference<>();
+        TransferService transferService = mock(TransferService.class);
+        org.mockito.Mockito.doAnswer(inv -> {
+            java.io.InputStream is = inv.getArgument(0);
+            uploadedBytes.set(is.readAllBytes());
+            return null;
+        }).when(transferService).uploadBlobStream(
+            any(InputStream.class), anyLong(), any(BlobPath.class), anyString(), any(), any()
+        );
+
+        // Create shard data WITH seqNo stats
+        String path = "test-index-uuid/0/1/translog-5.tlog";
+        String ckpPath = "test-index-uuid/0/1/translog-5.ckp";
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = new ArrayList<>();
+        entries.add(TarArchiveBuilder.fromBytes(path, "tlog content".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        entries.add(TarArchiveBuilder.fromBytes(ckpPath, "ckp".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        TranslogArchiveBatchCoordinator.ShardArchiveData shardData =
+            new TranslogArchiveBatchCoordinator.ShardArchiveData(0, 1L, 5L, 3L, entries, 100L, 200L, 150L);
+
+        coordinator.submitAndWait(shardData, transferService);
+
+        assertNotNull("Upload should have happened", uploadedBytes.get());
+        byte[] tar = uploadedBytes.get();
+        assertTrue("TAR must be non-empty", tar.length > 512);
+
+        // Parse TAR index block: first 512 bytes = TAR header for synthetic '_index' entry
+        // Size field at offset 124, 12 bytes, null-terminated octal
+        String sizeOct = new String(tar, 124, 12, java.nio.charset.StandardCharsets.US_ASCII).replace("\0", "").strip();
+        int indexSize = Integer.parseInt(sizeOct, 8);
+        byte[] indexData = java.util.Arrays.copyOfRange(tar, 512, 512 + indexSize);
+
+        // First 2 bytes = numIndices (big-endian short)
+        int numIndices = java.nio.ByteBuffer.wrap(indexData, 0, 2).order(java.nio.ByteOrder.BIG_ENDIAN).getShort() & 0xFFFF;
+        assertTrue("TAR must embed at least 1 GC index entry (numIndices > 0); got " + numIndices, numIndices > 0);
+    }
+
     public void testTimerDispatchWithNoPending() {
         TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMinutes(1));
         TransferService transferService = mock(TransferService.class);
