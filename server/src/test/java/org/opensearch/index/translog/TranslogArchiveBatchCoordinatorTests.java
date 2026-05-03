@@ -183,7 +183,8 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         );
     }
 
-    public void testUploadPathContainsTranslogData() throws Exception {
+    public void testUploadPathUsesHierarchicalTxlogLayout() throws Exception {
+        // Regression test: upload path must use txlog/{yyyyMMdd}/{HHmm}/ NOT translog/data/{hash}/{hash}/
         TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
         TransferService transferService = mock(TransferService.class);
 
@@ -201,47 +202,60 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         );
 
         String path = pathCaptor.getValue().buildAsString();
-        assertThat(path, org.hamcrest.Matchers.startsWith("repo-root/translog/data/"));
-        assertThat(nameCaptor.getValue(), org.hamcrest.Matchers.endsWith(".tar"));
+        // Must use new hierarchical layout: repo-root/txlog/{yyyyMMdd}/{HHmm}/
+        assertThat(path, org.hamcrest.Matchers.startsWith("repo-root/txlog/"));
+        assertFalse("Path must NOT use old translog/data/ layout", path.contains("translog/data/"));
 
-        // Verify the second path component is hashTypeIndex and third is hashNodeId.
-        String expectedHashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
-            "test-index-uuid",
-            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-        );
-        String expectedHashNodeId = TranslogArchivePathHelper.hashNodeId(
-            "test-node-id",
-            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
-        );
-        assertThat(path, org.hamcrest.Matchers.containsString("translog/data/" + expectedHashTypeIndex + "/" + expectedHashNodeId + "/"));
+        // Path must have 3 components after repo-root: txlog/{day}/{minute}
+        String[] parts = path.split("/");
+        // parts: ["repo-root", "txlog", "{yyyyMMdd}", "{HHmm}", ""]
+        assertEquals("txlog", parts[1]);
+        assertTrue("Day component must be 8 digits (yyyyMMdd)", parts[2].matches("\\d{8}"));
+        assertTrue("Minute component must be 4 digits (HHmm)", parts[3].matches("\\d{4}"));
+
+        // Blob name: {ss}.{SSS}.{nodeIdShort}.tar
+        assertThat(nameCaptor.getValue(), org.hamcrest.Matchers.endsWith(".tar"));
+        assertTrue("Blob name must contain node ID", nameCaptor.getValue().contains("testnode"));
     }
 
-    public void testUploadPathUsesHashNodeIdNotGenBucket() throws Exception {
-        // Regression test: upload path must use hash(nodeId) not a hardcoded bucket like "0".
+    public void testUploadPathDoesNotUseHashedComponents() throws Exception {
+        // Regression test: new path is txlog/{day}/{minute}/ — no hashed nodeId or indexUUID components.
         TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
         TransferService transferService = mock(TransferService.class);
 
         coordinator.submitAndWait(createShardData(0, "hello"), transferService);
 
         org.mockito.ArgumentCaptor<BlobPath> pathCaptor = org.mockito.ArgumentCaptor.forClass(BlobPath.class);
+        org.mockito.ArgumentCaptor<String> nameCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
         verify(transferService).uploadBlobStream(
             any(InputStream.class),
             anyLong(),
             pathCaptor.capture(),
-            anyString(),
+            nameCaptor.capture(),
             eq(WritePriority.HIGH),
             eq(null)
         );
 
         String path = pathCaptor.getValue().buildAsString();
-        String expectedHashNodeId = TranslogArchivePathHelper.hashNodeId(
+        String hashNodeId = TranslogArchivePathHelper.hashNodeId(
             "test-node-id",
             RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
         );
+        String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(
+            "test-index-uuid",
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1
+        );
 
-        // Must contain hashNodeId — not a bare numeric bucket like "/0/"
-        assertThat("Path must contain hashNodeId", path, org.hamcrest.Matchers.containsString(expectedHashNodeId));
-        assertFalse("Path must NOT use bare bucket '0'", path.endsWith("/0/") || path.contains("/0/" + expectedHashNodeId));
+        // Path must NOT contain legacy hashed components — those are now in the blob name
+        assertFalse("Path must NOT contain hashed nodeId in directory", path.contains(hashNodeId));
+        assertFalse("Path must NOT contain hashed indexUUID in directory", path.contains(hashTypeIndex));
+        assertFalse("Path must NOT use old translog/data/ prefix", path.contains("translog/data/"));
+
+        // Path must start with txlog/
+        assertThat(path, org.hamcrest.Matchers.startsWith("repo-root/txlog/"));
+
+        // Node ID must be embedded in the blob name instead
+        assertThat("Node ID must be in blob name", nameCaptor.getValue(), org.hamcrest.Matchers.containsString("testnode"));
     }
 
     /**

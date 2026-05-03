@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
 import java.util.ArrayList;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -51,7 +52,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>
  * Bytes-based early dispatch ({@link #MAX_BATCH_BYTES}) is retained as a safety bound against OOM.
  * <p>
- * <b>Path layout:</b> {@code repoBase/translog/data/{hashTypeIndex}/{hashNodeId}/{timestamp}.zip}
+ * <b>Path layout:</b> {@code repoBase/txlog/{yyyyMMdd}/{HHmm}/{ss}.{SSS}.{nodeIdShort}.tar}
  *
  * @opensearch.internal
  */
@@ -387,18 +388,17 @@ public class TranslogArchiveBatchCoordinator {
             return;
         }
 
-        // Compute path: translog/data/{hashTypeIndex}/{hashNodeId}/
-        String hashTypeIndex = TranslogArchivePathHelper.hashTypeIndex(indexUUID, pathHashAlgorithm);
-        String hashNodeId = TranslogArchivePathHelper.hashNodeId(nodeId, pathHashAlgorithm);
-        BlobPath archivePath = archiveBasePath.add("translog").add("data").add(hashTypeIndex).add(hashNodeId);
-
         // Compute TAR layout (deterministic from file sizes alone — no content reads needed)
         TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(allEntries);
         long contentLength = layout.getTotalSize();
 
+        // Compute hierarchical path: txlog/{yyyyMMdd}/{HHmm}/
+        Instant uploadInstant = Instant.now();
+        BlobPath archivePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, uploadInstant);
+        String blobName = TranslogArchivePathHelper.tarBlobName(uploadInstant, nodeId);
+
         IOException lastFailure = null;
         for (int attempt = 0; attempt < UPLOAD_RETRY_MAX_ATTEMPTS; attempt++) {
-            String blobName = TranslogArchivePathHelper.tarBlobNameFromCurrentTime();
             try (PipedOutputStream pos = new PipedOutputStream(); PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)) {
                 AtomicReference<IOException> uploadError = new AtomicReference<>();
                 java.util.concurrent.CountDownLatch uploadLatch = new java.util.concurrent.CountDownLatch(1);
