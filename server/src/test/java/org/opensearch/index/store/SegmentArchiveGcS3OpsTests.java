@@ -46,8 +46,8 @@ public class SegmentArchiveGcS3OpsTests extends BaseRemoteSegmentStoreDirectoryT
     // Two metadata files: metadataFilename (active/newest) and metadataFilename2 (stale)
     // metadataFilename3 = oldest stale, will be deleted
     // archive blob names
-    private static final String ACTIVE_ARCHIVE_BLOB  = "segment_archive_active_12345.zip";
-    private static final String STALE_ARCHIVE_BLOB   = "segment_archive_stale_67890.zip";
+    private static final String ACTIVE_ARCHIVE_BLOB  = "segment_archive_active_12345.tar";
+    private static final String STALE_ARCHIVE_BLOB   = "segment_archive_stale_67890.tar";
     private static final long   ARCHIVE_BLOB_SIZE    = 512_000L; // 512 KB dummy size
 
     @Before
@@ -342,5 +342,97 @@ public class SegmentArchiveGcS3OpsTests extends BaseRemoteSegmentStoreDirectoryT
             staleFileCount, staleFileCount - archiveOnDataDeletes);
         logger.info("Archive ON total={}, Archive OFF total={} — saving {} DELETEs per GC",
             archiveOnTotalDeletes, archiveOffTotalDeletes, archiveOffTotalDeletes - archiveOnTotalDeletes);
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Orphaned TAR GC: archive blobs with no metadata reference are deleted
+    // -------------------------------------------------------------------------
+
+    /**
+     * Orphaned TAR cleanup test:
+     * An archive blob is "orphaned" when it was uploaded successfully but its metadata
+     * upload subsequently failed — leaving the TAR unreferenced by any metadata file.
+     * The normal stale-metadata GC loop cannot find it (no metadata references it).
+     *
+     * <p>Fix: {@code deleteStaleSegments()} now calls {@code remoteDataDirectory.listAll()}
+     * after the stale-metadata loop and uses {@link
+     * org.opensearch.index.store.remote.segment.archive.SegmentArchiveRetentionHelper#findStaleArchiveBlobs}
+     * to identify and delete any orphaned TAR blobs.
+     *
+     * <p>This test:
+     * <ol>
+     *   <li>Sets up 1 active metadata file referencing ACTIVE_ARCHIVE_BLOB.</li>
+     *   <li>Stubs {@code remoteDataDirectory.listAll()} to return:
+     *       ACTIVE_ARCHIVE_BLOB (referenced — must NOT be deleted) and
+     *       ORPHAN_ARCHIVE_BLOB (unreferenced — must be deleted).</li>
+     *   <li>Runs deleteStaleSegments(1) (nothing to delete from stale-metadata loop).</li>
+     *   <li>Verifies ORPHAN_ARCHIVE_BLOB is deleted exactly once, ACTIVE is untouched.</li>
+     * </ol>
+     */
+    public void testOrphanedArchiveBlobIsDeleted() throws IOException {
+        final String ORPHAN_ARCHIVE_BLOB = "segment_archive_orphan_99999.tar";
+
+        // Only 1 metadata file: it references ACTIVE_ARCHIVE_BLOB.
+        Map<String, String> activeSegments = getDummyMetadataForArchive("_1", 2, ACTIVE_ARCHIVE_BLOB);
+
+        when(remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
+            RemoteSegmentStoreDirectory.MetadataFilenameUtils.METADATA_PREFIX, METADATA_FILES_TO_FETCH
+        )).thenReturn(List.of(metadataFilename));
+
+        // Use 2 metadata files: metadataFilename (active/newest) and metadataFilename2 (stale).
+        // deleteStaleSegments(1) will try to delete metadataFilename2 — but since it's an
+        // archive-enabled metadata, it deletes the stale archive blob. The orphan is a THIRD
+        // TAR that is not referenced by either metadata file.
+        // For simplicity: use 2 files with the same active archive so the stale loop runs,
+        // then orphan cleanup finds the unreferenced ORPHAN_ARCHIVE_BLOB.
+        when(remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
+            RemoteSegmentStoreDirectory.MetadataFilenameUtils.METADATA_PREFIX, Integer.MAX_VALUE
+        )).thenReturn(List.of(metadataFilename, metadataFilename2));
+
+        Map<String, SegmentArchiveEntry> activeArchiveEntries = Map.of(
+            "_1.si", new SegmentArchiveEntry("_1.si", 0L, 100L, 0L)
+        );
+        when(remoteMetadataDirectory.getBlobStream(metadataFilename)).thenAnswer(
+            I -> createMetadataFileBytesWithArchive(
+                activeSegments,
+                indexShard.getLatestReplicationCheckpoint(),
+                segmentInfos,
+                ACTIVE_ARCHIVE_BLOB,
+                activeArchiveEntries,
+                ARCHIVE_BLOB_SIZE
+            )
+        );
+        // metadataFilename2 is the stale file: also references ACTIVE_ARCHIVE_BLOB (same archive).
+        // This means ACTIVE_ARCHIVE_BLOB won't be deleted (still in active set), and orphan cleanup
+        // finds ORPHAN_ARCHIVE_BLOB since it's not referenced by any metadata.
+        when(remoteMetadataDirectory.getBlobStream(metadataFilename2)).thenAnswer(
+            I -> createMetadataFileBytesWithArchive(
+                activeSegments,
+                indexShard.getLatestReplicationCheckpoint(),
+                segmentInfos,
+                ACTIVE_ARCHIVE_BLOB,
+                activeArchiveEntries,
+                ARCHIVE_BLOB_SIZE
+            )
+        );
+
+        // Stub listAll() to return both blobs: 1 active (referenced) + 1 orphan (unreferenced)
+        when(remoteDataDirectory.listAll()).thenReturn(
+            new String[]{ ACTIVE_ARCHIVE_BLOB, ORPHAN_ARCHIVE_BLOB, "some_non_archive_file.dat" }
+        );
+
+        remoteSegmentStoreDirectory.init();
+        remoteSegmentStoreDirectory.deleteStaleSegments(1);
+
+        // ORPHAN_ARCHIVE_BLOB must be deleted exactly once (unreferenced TAR)
+        verify(remoteDataDirectory, times(1)).deleteFile(ORPHAN_ARCHIVE_BLOB);
+
+        // ACTIVE_ARCHIVE_BLOB must NOT be deleted (still referenced by active metadata)
+        verify(remoteDataDirectory, never()).deleteFile(ACTIVE_ARCHIVE_BLOB);
+
+        // Non-archive file must NOT be affected by orphan cleanup
+        verify(remoteDataDirectory, never()).deleteFile("some_non_archive_file.dat");
+
+        logger.info("[Orphan TAR GC] PASSED: orphaned TAR deleted, active TAR and non-archive files untouched");
     }
 }

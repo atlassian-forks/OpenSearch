@@ -404,15 +404,15 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
         if (segmentRepoPath == null) {
             return archives;
         }
-        // Walk the segment repo for *.zip files under segments/data/
+        // Walk the segment repo for *.tar files under segments/data/
+        // Archive blobs are named: segment_archive_<timestamp>_<uuid>.tar
         java.nio.file.Files.walkFileTree(segmentRepoPath, new java.nio.file.SimpleFileVisitor<java.nio.file.Path>() {
             @Override
             public java.nio.file.FileVisitResult visitFile(java.nio.file.Path file, java.nio.file.attribute.BasicFileAttributes attrs) {
                 String name = file.getFileName().toString();
-                if (name.endsWith(".zip")) {
-                    // Only count ZIPs under a "data" parent (segment archives)
-                    java.nio.file.Path parent = file.getParent();
-                    if (parent != null && isUnderSegmentsDataPath(file)) {
+                if (name.endsWith(".tar") && name.startsWith("segment_archive_")) {
+                    // Only count TARs under a "segments" data path
+                    if (isUnderSegmentsDataPath(file)) {
                         archives.add(file.toString());
                     }
                 }
@@ -428,7 +428,7 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
     }
 
     private boolean isUnderSegmentsDataPath(java.nio.file.Path file) {
-        // Segment archives are stored under: {repoRoot}/{indexUUID}/{shardId}/segments/data/{hashPrefix}/*.zip
+        // Segment archives are stored under: {repoRoot}/{indexUUID}/{shardId}/segments/data/{hashPrefix}/*.tar
         java.nio.file.Path p = file.getParent();
         while (p != null) {
             if ("segments".equals(p.getFileName() != null ? p.getFileName().toString() : "")) {

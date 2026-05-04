@@ -460,7 +460,7 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         flushAndRefresh(INDEX_NAME);
 
         // Wait for archive upload
-        assertBusy(() -> assertFalse("Archive ZIP must exist", listSegmentArchives().isEmpty()), 30, TimeUnit.SECONDS);
+        assertBusy(() -> assertFalse("Archive TAR must exist", listSegmentArchives().isEmpty()), 30, TimeUnit.SECONDS);
 
         // Assert replica shard role
         assertReplicaShardStarted(INDEX_NAME, 0, actualReplicaNode);
@@ -484,7 +484,7 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
      * <p>For those files, {@code openInput()} falls through to the per-file download path
      * ({@code RemoteSegmentStoreDirectory.java} line 604–611). That path calls
      * {@code getExistingRemoteFilename(name)}, which returns the archive blob name
-     * (e.g., {@code segment_archive_<ts>_<uuid>.zip}) from
+     * (e.g., {@code segment_archive_<ts>_<uuid>.tar}) from
      * {@code segmentsUploadedToRemoteStore}. It then calls
      * {@code remoteDataDirectory.openInput(archiveBlobName, fileLength, context)} —
      * <b>opening the entire archive ZIP blob as if it were a single segment file</b> and
@@ -773,7 +773,8 @@ public class SegmentArchiveReplicationIT extends RemoteStoreBaseIntegTestCase {
         Files.walkFileTree(segmentRepoPath, new SimpleFileVisitor<Path>() {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                if (file.getFileName().toString().endsWith(".zip") && isUnderSegmentsDataPath(file)) {
+                String fname = file.getFileName().toString();
+                if (fname.endsWith(".tar") && fname.startsWith("segment_archive_") && isUnderSegmentsDataPath(file)) {
                     archives.add(file.toString());
                 }
                 return FileVisitResult.CONTINUE;
