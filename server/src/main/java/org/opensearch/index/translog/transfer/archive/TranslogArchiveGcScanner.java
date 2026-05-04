@@ -128,15 +128,18 @@ public final class TranslogArchiveGcScanner {
         BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(archiveBasePath);
         BlobPath gcIdxRoot = gcIdxRootPath(archiveBasePath);
 
-        try {
-            Set<String> dayDirs = transferService.listFolders(txlogRoot);
-            if (dayDirs == null || dayDirs.isEmpty()) return;
+        // Only scan today and yesterday: all older data has already been GC-deleted,
+        // so there is nothing to index there. This avoids an unbounded S3 LIST over
+        // all historical day-dirs (which could be 30+ dirs if the cluster was long-running).
+        String today = TranslogArchivePathHelper.dayDir(now);
+        String yesterday = TranslogArchivePathHelper.dayDir(now.minus(java.time.Duration.ofDays(1)));
 
-            for (String dayDir : dayDirs) {
+        for (String dayDir : new String[]{ yesterday, today }) {
+            try {
                 scanDay(txlogRoot, gcIdxRoot, dayDir);
+            } catch (Exception e) {
+                logger.warn("GC scanner: failed to scan txlog day dir {}: {}", dayDir, e.getMessage());
             }
-        } catch (IOException e) {
-            logger.warn("GC scanner: failed to list txlog root: {}", e.getMessage());
         }
     }
 
