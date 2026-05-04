@@ -41,7 +41,7 @@ import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandler;
 import org.opensearch.index.store.remote.metadata.SegmentArchiveEntry;
 import org.opensearch.index.store.remote.segment.archive.SegmentArchiveRetentionHelper;
-import org.opensearch.index.store.remote.segment.archive.ZipSegmentParser;
+import org.opensearch.index.store.remote.segment.archive.TarSegmentParser;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 import org.opensearch.node.remotestore.RemoteStorePinnedTimestampService;
 import org.opensearch.threadpool.ThreadPool;
@@ -52,12 +52,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
-import org.opensearch.common.blobstore.BlobMetadata;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -120,7 +118,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     static final class ArchiveState {
         final String blobName;
         final Map<String, SegmentArchiveEntry> entries;
-        /** Total byte length of the archive ZIP blob; -1 if unknown (old metadata). */
+        /** Total byte length of the archive TAR blob; -1 if unknown (old metadata). */
         final long blobLength;
 
         ArchiveState(String blobName, Map<String, SegmentArchiveEntry> entries) {
@@ -138,9 +136,9 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         new java.util.concurrent.atomic.AtomicReference<>(null);
 
     /**
-     * LRU cache for central-directory entries of *older* archive blobs.
+     * LRU cache for TAR _index entries of *older* archive blobs.
      * Allows {@link #readFileFromArchiveBlob} to use a range-GET for the
-     * file data instead of downloading the entire ZIP.
+     * file data instead of downloading the entire TAR.
      *
      * <p>Keyed by archive blob name; value is the map of filename →
      * {@link SegmentArchiveEntry} parsed from that blob's central directory.
@@ -149,8 +147,24 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      */
     static final int ARCHIVE_INDEX_CACHE_SIZE = 20;
 
-    /** Max bytes to range-read from the tail of a ZIP for central-directory parsing. */
-    private static final int ZIP_TAIL_BYTES = 65_536 + 22; // max EOCD search range + EOCD record
+    /**
+     * Bytes to read from the start of a TAR archive in one shot to cover the TAR header
+     * plus the full {@code _index} payload for typical segment archives.
+     *
+     * <p>The {@code _index} payload size for a refresh producing N segment files is approximately:
+     * {@code 2 (GC numIndices=0) + 4 (numEntries) + N * (2 + avgPathLen + 8 + 8)}.
+     * For N=100 files with avg path length 20 bytes: ~3806 bytes → padded to 4096.
+     * Total head = 512 (TAR header) + 4096 = 4608 bytes.
+     *
+     * <p>Reading 16 KB covers archives with up to ~400 segment files in a single refresh —
+     * well beyond the practical limit. This eliminates the 2-GET→1-GET round trip on cache
+     * miss for the vast majority of real-world archives: one range-GET reads header + full
+     * index payload, then a second range-GET reads just the target file's data.
+     *
+     * <p>If the initial read still does not cover the full index (very large archives), the
+     * code falls back to a targeted second read — correctness is always preserved.
+     */
+    static final int TAR_HEAD_INITIAL_READ_BYTES = 16 * 1024; // 16 KB
 
     @SuppressWarnings("serial")
     private final Map<String, Map<String, SegmentArchiveEntry>> archiveIndexCache =
@@ -653,23 +667,18 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         // Per-file download path.
         String remoteFilename = getExistingRemoteFilename(name);
         if (remoteFilename != null) {
-            // Guard: if remoteFilename is an archive blob, the file lives inside a ZIP —
+            // Guard: if remoteFilename is an archive blob, the file lives inside a TAR —
             // we must NOT open the raw archive as a regular segment file (that would read
-            // ZIP container bytes instead of the individual file's content).
+            // TAR container bytes instead of the individual file's content).
             // This happens when archiveState.entries only covers the latest archive but the
             // file was uploaded in an older archive blob.
             if (SegmentArchiveRetentionHelper.isArchiveBlob(remoteFilename)) {
                 logger.debug(
                     "File {} maps to archive blob {} but was not in current archiveState entries; "
-                        + "extracting from ZIP via streaming read",
+                        + "extracting from TAR via range-GET",
                     name,
                     remoteFilename
                 );
-                // Pass the known blob length from metadata if available, to avoid a LIST call in readFileFromArchiveBlob.
-                // archiveStateRef may refer to a different (newer) archive, so check if any older archive in the LRU cache
-                // has stored the length. We rely on the metadata's archiveBlobLength stored at upload time.
-                // For now use -1 (unknown) — the length will be stored in metadata when the archive was uploaded
-                // with the archiveBlobLength field, but for older archives it falls back to LIST.
                 // TODO: thread archiveBlobLength through UploadedSegmentMetadata for per-file lookup.
                 return readFileFromArchiveBlob(name, remoteFilename);
             }
@@ -681,20 +690,19 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     }
 
     /**
-     * Extracts a single file from an older archive ZIP blob using range-GETs.
+     * Extracts a single file from a segment TAR archive blob using range-GETs.
      *
      * <p><b>Strategy (2 S3 GETs on cache miss, 1 S3 GET on cache hit):</b>
      * <ol>
-     *   <li>Look up the archive's central-directory map in {@link #archiveIndexCache} (LRU, up to
+     *   <li>Look up the archive's index map in {@link #archiveIndexCache} (LRU, up to
      *       {@value #ARCHIVE_INDEX_CACHE_SIZE} blobs).</li>
-     *   <li>On <em>cache miss</em>: range-read the last {@value ZIP_TAIL_BYTES} bytes of the blob to
-     *       parse the ZIP central directory via {@link ZipSegmentParser}, populate the cache.</li>
+     *   <li>On <em>cache miss</em>: range-read the first {@value #TAR_HEAD_INITIAL_READ_BYTES} bytes
+     *       (the TAR header) to determine the index payload length, then read the full index payload
+     *       via {@link TarSegmentParser}, and populate the cache.</li>
      *   <li>Use the cached {@link SegmentArchiveEntry} to range-read just the target file's bytes.</li>
      * </ol>
      *
-     * <p>This replaces the previous full-blob download, reducing S3 bytes transferred from
-     * {@code archiveSize} to at most {@code ZIP_TAIL_BYTES + fileSize} per cache-miss call,
-     * and to just {@code fileSize} on a cache hit.
+     * <p>The TAR {@code _index} is at a fixed head position — no blob size or LIST needed on cache miss.
      *
      * @param name            the local segment filename to extract (e.g., {@code _a_Lucene90_0.dvm})
      * @param archiveBlobName the remote archive blob name
@@ -703,77 +711,45 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @throws IOException         on I/O failure
      */
     private IndexInput readFileFromArchiveBlob(String name, String archiveBlobName) throws IOException {
-        return readFileFromArchiveBlob(name, archiveBlobName, -1L);
-    }
-
-    private IndexInput readFileFromArchiveBlob(String name, String archiveBlobName, long knownBlobLength) throws IOException {
-        // Step 1: resolve central-directory entries (cache hit = 0 S3 GETs, miss = 1–2 range GETs)
+        // Step 1: resolve _index entries (cache hit = 0 S3 GETs, miss = 1–2 range GETs from HEAD)
         Map<String, SegmentArchiveEntry> entries = archiveIndexCache.get(archiveBlobName);
         if (entries == null) {
-            final long blobLength;
-            if (knownBlobLength > 0) {
-                // Blob length known from metadata — skip LIST entirely (0 extra S3 ops)
-                blobLength = knownBlobLength;
-                logger.debug("Using stored blobLength={} for archive blob {}, skipping LIST", blobLength, archiveBlobName);
+            // Read the first 512 bytes (TAR header for _index entry) to get the index payload length.
+            final byte[] header;
+            try (InputStream headerStream = remoteDataDirectory.getBlobContainer()
+                .readBlob(archiveBlobName, 0, TAR_HEAD_INITIAL_READ_BYTES)) {
+                header = headerStream.readAllBytes();
+            }
+            // Compute how many bytes of head to read (header + padded index payload)
+            int fullHeadLength = TarSegmentParser.computeHeadReadLength(header);
+            final byte[] head;
+            if (fullHeadLength <= TAR_HEAD_INITIAL_READ_BYTES) {
+                head = header;
             } else {
-                // Blob length unknown — do 1 LIST to get the size
-                Map<String, BlobMetadata> blobs =
-                    remoteDataDirectory.getBlobContainer().listBlobsByPrefix(archiveBlobName);
-                BlobMetadata meta = blobs.get(archiveBlobName);
-                if (meta == null) {
-                    throw new NoSuchFileException(archiveBlobName + " (blob not found)");
+                // Re-read including the full index payload
+                try (InputStream headStream = remoteDataDirectory.getBlobContainer()
+                    .readBlob(archiveBlobName, 0, fullHeadLength)) {
+                    head = headStream.readAllBytes();
                 }
-                blobLength = meta.length();
             }
-
-            // Range-read the tail of the ZIP to parse its central directory.
-            long tailOffset = Math.max(0, blobLength - ZIP_TAIL_BYTES);
-            long tailLength = blobLength - tailOffset;
-            final byte[] tail;
-            try (InputStream tailStream = remoteDataDirectory.getBlobContainer()
-                .readBlob(archiveBlobName, tailOffset, tailLength)) {
-                tail = tailStream.readAllBytes();
-            }
-            entries = ZipSegmentParser.parseToMap(tail, tailOffset);
-            if (entries != null) {
-                archiveIndexCache.put(archiveBlobName, entries);
-                logger.debug("Cached central directory for archive blob {} ({} entries)", archiveBlobName, entries.size());
-            }
+            entries = TarSegmentParser.parseToMap(head);
+            archiveIndexCache.put(archiveBlobName, entries);
+            logger.debug("Cached TAR _index for archive blob {} ({} entries)", archiveBlobName, entries.size());
         }
 
         // Step 2: range-read just the target file's bytes (1 S3 GET)
-        if (entries != null) {
-            SegmentArchiveEntry entry = entries.get(name);
-            if (entry != null) {
-                logger.debug(
-                    "Range-reading {} from archive {} at offset={} length={}",
-                    name, archiveBlobName, entry.getOffset(), entry.getLength()
-                );
-                try (InputStream fileStream = remoteDataDirectory.getBlobContainer()
-                    .readBlob(archiveBlobName, entry.getOffset(), entry.getLength())) {
-                    return new ByteArrayIndexInput(name, fileStream.readAllBytes());
-                }
+        SegmentArchiveEntry entry = entries.get(name);
+        if (entry != null) {
+            logger.debug(
+                "Range-reading {} from archive {} at offset={} length={}",
+                name, archiveBlobName, entry.getOffset(), entry.getLength()
+            );
+            try (InputStream fileStream = remoteDataDirectory.getBlobContainer()
+                .readBlob(archiveBlobName, entry.getOffset(), entry.getLength())) {
+                return new ByteArrayIndexInput(name, fileStream.readAllBytes());
             }
         }
 
-        // Fallback: full blob download (only if ZipSegmentParser couldn't parse the central directory)
-        logger.warn(
-            "ZipSegmentParser failed for archive blob {}; falling back to full blob download for {}",
-            archiveBlobName, name
-        );
-        final byte[] archiveBytes;
-        try (InputStream blobStream = remoteDataDirectory.getBlobContainer().readBlob(archiveBlobName)) {
-            archiveBytes = blobStream.readAllBytes();
-        }
-        try (ZipInputStream zis = new ZipInputStream(
-            new ByteArrayInputStream(archiveBytes))) {
-            ZipEntry zipEntry;
-            while ((zipEntry = zis.getNextEntry()) != null) {
-                if (name.equals(zipEntry.getName())) {
-                    return new ByteArrayIndexInput(name, zis.readAllBytes());
-                }
-            }
-        }
         throw new NoSuchFileException(name + " (not found inside archive blob " + archiveBlobName + ")");
     }
 
@@ -1067,7 +1043,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                         replicationCheckpoint,
                         true,
                         archiveBlobName,
-                        "zip_stored",
+                        "tar_stored",
                         archiveEntries
                     );
                     if (archiveBlobLength > 0) {
@@ -1328,7 +1304,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                     }
                 });
             // Note: when archive is ON, UploadedSegmentMetadata.uploadedFilename = archiveBlobName for ALL files
-            // in that archive. The Set deduplication above means the archive ZIP is deleted exactly once
+            // in that archive. The Set deduplication above means the archive TAR is deleted exactly once
             // via the staleSegmentRemoteFilenames loop — no explicit archive blob deletion needed here.
             if (deletionSuccessful.get()) {
                 logger.debug("Deleting stale metadata file {} from remote segment store", metadataFile);
@@ -1336,6 +1312,42 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             }
         }
         logger.debug("deletedSegmentFiles={}", deletedSegmentFiles);
+
+        // Orphaned TAR cleanup: delete archive blobs that were uploaded successfully but whose
+        // metadata upload subsequently failed (leaving the TAR unreferenced by any metadata file).
+        // These blobs are invisible to the stale-metadata loop above because no metadata file
+        // references them — they can only be found by listing the data directory.
+        //
+        // We piggyback on the activeSegmentRemoteFilenames set already built above:
+        // any TAR blob in the data dir that is NOT in activeSegmentRemoteFilenames and was NOT
+        // already deleted in this GC run is orphaned and safe to delete.
+        try {
+            String[] allDataBlobsRaw = remoteDataDirectory.listAll();
+            if (allDataBlobsRaw == null) {
+                // Mock or unavailable directory — skip orphan cleanup gracefully.
+                return;
+            }
+            List<String> orphanedArchives = SegmentArchiveRetentionHelper.findStaleArchiveBlobs(
+                new HashSet<>(Arrays.asList(allDataBlobsRaw)),
+                activeSegmentRemoteFilenames
+            );
+            for (String orphan : orphanedArchives) {
+                if (deletedSegmentFiles.contains(orphan)) {
+                    continue; // already deleted in stale-metadata loop above
+                }
+                try {
+                    logger.info("Deleting orphaned segment archive TAR (no metadata reference): {}", orphan);
+                    remoteDataDirectory.deleteFile(orphan);
+                } catch (NoSuchFileException e) {
+                    logger.debug("Orphaned archive {} already gone: {}", orphan, e.getMessage());
+                } catch (IOException e) {
+                    logger.warn("Failed to delete orphaned archive {}, will retry on next GC: {}", orphan, e.getMessage());
+                }
+            }
+        } catch (IOException e) {
+            // Non-fatal: orphan cleanup is best-effort. Normal stale-metadata GC still ran.
+            logger.warn("Failed to list data directory for orphaned archive cleanup: {}", e.getMessage());
+        }
     }
 
     public void deleteStaleSegmentsAsync(int lastNMetadataFilesToKeep) {

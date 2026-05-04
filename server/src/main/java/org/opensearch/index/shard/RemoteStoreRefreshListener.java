@@ -38,6 +38,7 @@ import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.SegmentArchiveEntry;
 import org.opensearch.index.store.remote.segment.archive.SegmentArchiveBuilder;
+import org.opensearch.index.translog.transfer.archive.TarArchiveBuilder;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
@@ -491,15 +492,18 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
     private static final int SEGMENT_ARCHIVE_UPLOAD_MAX_ATTEMPTS = 2;
 
     /**
-     * Maximum total bytes of segment files to include in a single archive ZIP.
+     * Maximum total bytes of segment files to include in a single archive TAR.
      * If the total exceeds this, falls back to per-file upload to avoid OOM.
      * 256 MB is generous for a single refresh; typical refreshes produce much less.
      */
     static final long MAX_SEGMENT_ARCHIVE_BYTES = 256 * 1024 * 1024L;
 
     /**
-     * Archive upload: bundles all new segment files into a single ZIP blob.
+     * Archive upload: bundles all new segment files into a single TAR blob.
      * One S3 PUT instead of N individual PUTs. Retries on transient failure.
+     * <p>
+     * TAR layout pre-computes all offsets from file sizes alone — no CRC pre-pass needed.
+     * True single-pass streaming with exact Content-Length known before upload begins.
      */
     private static final int SEGMENT_ARCHIVE_PIPE_BUFFER_BYTES = 256 * 1024;
 
@@ -509,12 +513,11 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         ActionListener<Void> listener
     ) {
         try {
-            logger.debug("Uploading {} segment files as archive ZIP", filteredFiles.size());
+            logger.debug("Uploading {} segment files as archive TAR", filteredFiles.size());
 
             Directory directory = ((FilterDirectory) (((FilterDirectory) storeDirectory).getDelegate())).getDelegate();
 
-            // Build file-backed entries (no readAllBytes — 2-pass streaming in SegmentArchiveBuilder).
-            // Check total size limit first to decide whether to fall back to per-file upload.
+            // Build file-backed entries. Check total size limit first.
             List<SegmentArchiveBuilder.SegmentArchiveBuildEntry> buildEntries = new ArrayList<>();
             long totalArchiveBytes = 0;
             for (String src : filteredFiles) {
@@ -526,24 +529,32 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                         totalArchiveBytes,
                         MAX_SEGMENT_ARCHIVE_BYTES
                     );
+                    // Clear stale archive state from a previous cycle so uploadMetadata does NOT
+                    // reference an old archive blob for files that are about to be uploaded per-file.
+                    // Without this, metadata would point to the previous TAR for current-cycle files,
+                    // causing NoSuchFileException during recovery range-reads.
+                    this.lastArchiveBlobName = null;
+                    this.lastArchiveEntries = null;
+                    this.lastArchiveBlobLength = -1L;
                     uploadNewSegmentsPerFile(filteredFiles, localSegmentsSizeMap, listener);
                     return;
                 }
                 buildEntries.add(SegmentArchiveBuilder.fromDirectory(src, storeDirectory));
             }
 
-            // Dry-run pass to get exact ZIP size (needed for writeBlob content-length).
-            // SegmentArchiveBuilder.computeSize does pass-1 (CRC) for each file-backed entry.
-            long archiveSize = SegmentArchiveBuilder.computeSize(buildEntries);
+            // Compute TAR layout from file sizes alone — no file content reads needed.
+            // This gives us the exact archive size and all per-entry offsets upfront.
+            TarArchiveBuilder.TarLayout layout = SegmentArchiveBuilder.computeLayout(buildEntries);
+            long archiveSize = layout.getTotalSize();
 
-            // Stream ZIP directly to S3 via Pipe — no ByteArrayOutputStream, no archiveBytes copy.
+            // Stream TAR directly to S3 via Pipe — single-pass, known Content-Length.
             BlobContainer blobContainer = ((RemoteDirectory) remoteDirectory.getDelegate()).getBlobContainer();
             String archiveBlobName = null;
             Map<String, SegmentArchiveEntry> archiveEntries = null;
             IOException lastFailure = null;
 
             for (int attempt = 0; attempt < SEGMENT_ARCHIVE_UPLOAD_MAX_ATTEMPTS; attempt++) {
-                archiveBlobName = "segment_archive_" + System.currentTimeMillis() + "_" + UUIDs.base64UUID() + ".zip";
+                archiveBlobName = "segment_archive_" + System.currentTimeMillis() + "_" + UUIDs.base64UUID() + ".tar";
                 try (
                     java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
                     java.io.PipedInputStream pis = new java.io.PipedInputStream(pos, SEGMENT_ARCHIVE_PIPE_BUFFER_BYTES)
@@ -554,10 +565,10 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                         new java.util.concurrent.atomic.AtomicReference<>();
                     final java.util.concurrent.CountDownLatch buildLatch = new java.util.concurrent.CountDownLatch(1);
 
-                    // Builder thread: pass-2 (write) streams into the pipe.
+                    // Builder thread: streams TAR into the pipe.
                     Thread builderThread = new Thread(() -> {
                         try {
-                            builtEntries.set(SegmentArchiveBuilder.buildAndExtractOffsets(pos, buildEntries));
+                            builtEntries.set(SegmentArchiveBuilder.buildAndExtractOffsets(pos, layout, buildEntries));
                             pos.close();
                         } catch (Exception e) {
                             buildError.set(e);
