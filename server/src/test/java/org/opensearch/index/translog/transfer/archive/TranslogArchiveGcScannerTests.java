@@ -972,6 +972,185 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         assertNotNull("gc_idx should be in memory after successful persist", scanner.getInMemoryIndex().get(minuteKey));
     }
 
+    // ── S3 operation count verification ──────────────────────────────────────
+
+    /**
+     * Verifies the exact S3 operation counts for a steady-state scan cycle where all minutes
+     * are already indexed and in memory — no new minutes, no orphans.
+     *
+     * Expected per scan():
+     *   LIST  = 1 (txlogRoot) + 1 (gc_idx day) + 1 (txlog day) = 3 total
+     *   GET   = 0  (all already in memory → loadSingleIdx skipped)
+     *   PUT   = 0  (no new minutes)
+     *   DELETE = 0 (no orphans)
+     */
+    public void testScanSteadyStateS3OpCounts() throws IOException {
+        TransferService ts = Mockito.mock(TransferService.class);
+        BlobPath base = new BlobPath().add("base");
+        BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(base);
+        BlobPath gcIdxRoot = TranslogArchiveGcScanner.gcIdxRootPath(base);
+        BlobPath txlogDayPath = txlogRoot.add("20260502");
+        BlobPath gcIdxDayPath = gcIdxRoot.add("20260502");
+
+        // Both minutes already indexed in memory (pre-seeded) — loadSingleIdx should NOT be called
+        MinuteGcIndex emptyIdx = new MinuteGcIndex.Builder().build();
+
+        // txlog has 2 minute dirs
+        Mockito.when(ts.listFolders(txlogRoot)).thenReturn(Set.of("20260502"));
+        Mockito.when(ts.listFolders(txlogDayPath)).thenReturn(Set.of("1000", "1001"));
+
+        // gc_idx has 2 .idx files
+        BlobMetadata bm1000 = Mockito.mock(BlobMetadata.class); Mockito.when(bm1000.name()).thenReturn("1000.idx");
+        BlobMetadata bm1001 = Mockito.mock(BlobMetadata.class); Mockito.when(bm1001.name()).thenReturn("1001.idx");
+        Mockito.doAnswer(inv -> {
+            inv.getArgument(3, org.opensearch.action.support.PlainActionFuture.class)
+                .onResponse(List.of(bm1000, bm1001));
+            return null;
+        }).when(ts).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.eq(""), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+
+        // For loadSingleIdx (should NOT be called — pre-seeded in memory)
+        Mockito.when(ts.downloadBlob(gcIdxDayPath, "1000.idx"))
+            .thenReturn(new ByteArrayInputStream(emptyIdx.serialize()));
+        Mockito.when(ts.downloadBlob(gcIdxDayPath, "1001.idx"))
+            .thenReturn(new ByteArrayInputStream(emptyIdx.serialize()));
+
+        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(ts, base);
+        // Pre-seed both minutes in memory so loadSingleIdx is not needed
+        scanner.getInMemoryIndex(); // read-only; use reflection or expose put for test
+        // Use loadFromPersisted to seed memory
+        Mockito.when(ts.listFolders(gcIdxRoot)).thenReturn(Set.of("20260502"));
+        Mockito.doAnswer(inv -> {
+            inv.getArgument(3, org.opensearch.action.support.PlainActionFuture.class)
+                .onResponse(List.of(bm1000, bm1001));
+            return null;
+        }).when(ts).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.eq(""), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+        Mockito.when(ts.downloadBlob(gcIdxDayPath, "1000.idx"))
+            .thenReturn(new ByteArrayInputStream(emptyIdx.serialize()));
+        Mockito.when(ts.downloadBlob(gcIdxDayPath, "1001.idx"))
+            .thenReturn(new ByteArrayInputStream(emptyIdx.serialize()));
+        scanner.loadFromPersisted();
+        Mockito.clearInvocations(ts); // reset counters — only count scan() ops below
+
+        // Act: scan() in steady state
+        scanner.scan(java.time.Instant.now());
+
+        // LIST: txlogRoot(1) + gcIdxDay(1) + txlogDay(1) = 3
+        Mockito.verify(ts, Mockito.times(1)).listFolders(txlogRoot);
+        Mockito.verify(ts, Mockito.times(1)).listFolders(txlogDayPath);
+        Mockito.verify(ts, Mockito.times(1)).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.any(), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+        // GET: 0 — both already in memory, loadSingleIdx not called
+        Mockito.verify(ts, Mockito.never()).downloadBlob(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.anyString()
+        );
+        // PUT: 0 — no new minutes
+        Mockito.verify(ts, Mockito.never()).uploadBlobStream(
+            ArgumentMatchers.any(), ArgumentMatchers.anyLong(), ArgumentMatchers.any(),
+            ArgumentMatchers.any(), ArgumentMatchers.any(), ArgumentMatchers.any()
+        );
+        // DELETE: 0 — no orphans
+        Mockito.verify(ts, Mockito.never()).deleteBlobs(ArgumentMatchers.any(), ArgumentMatchers.any());
+    }
+
+    /**
+     * Verifies S3 op counts for a scan cycle with K new minute-dirs, each having T TARs.
+     *
+     * Expected per scan() with K=2 new minutes, T=3 TARs each:
+     *   LIST   = 1 (txlogRoot) + 1 (gcIdxDay) + 1 (txlogDay) + K (one per new minuteDir) = 5
+     *   GET    = K × T (one range-GET per TAR) = 6
+     *   PUT    = K (one .idx upload per new minute) = 2
+     *   DELETE = 0 (no orphans)
+     */
+    public void testScanNewMinutesS3OpCounts() throws IOException {
+        TransferService ts = Mockito.mock(TransferService.class);
+        BlobPath base = new BlobPath().add("base");
+        BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(base);
+        BlobPath gcIdxRoot = TranslogArchiveGcScanner.gcIdxRootPath(base);
+        BlobPath txlogDayPath = txlogRoot.add("20260502");
+        BlobPath gcIdxDayPath = gcIdxRoot.add("20260502");
+
+        int K = 2; // new minutes
+        int T = 3; // TARs per minute
+
+        // txlog has K new minute dirs
+        Mockito.when(ts.listFolders(txlogRoot)).thenReturn(Set.of("20260502"));
+        Mockito.when(ts.listFolders(txlogDayPath)).thenReturn(Set.of("1000", "1001"));
+
+        // gc_idx has no .idx yet (all new)
+        Mockito.doAnswer(inv -> {
+            inv.getArgument(3, org.opensearch.action.support.PlainActionFuture.class).onResponse(List.of());
+            return null;
+        }).when(ts).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.any(), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+
+        // Build a minimal valid TAR with empty GC entries
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+            TarArchiveBuilder.fromBytes("uuid/0/1/t.tlog", "x".getBytes())
+        );
+        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(entries, List.of());
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        TarArchiveBuilder.build(baos, layout, entries);
+        byte[] tarBytes = baos.toByteArray();
+
+        // Each minute dir has T TAR blobs
+        for (String min : List.of("1000", "1001")) {
+            BlobPath minutePath = txlogDayPath.add(min);
+            List<BlobMetadata> tarBlobs = new java.util.ArrayList<>();
+            for (int i = 0; i < T; i++) {
+                BlobMetadata bm = Mockito.mock(BlobMetadata.class);
+                Mockito.when(bm.name()).thenReturn(String.format("%02d.000.node.tar", i));
+                tarBlobs.add(bm);
+                Mockito.when(ts.downloadBlob(
+                    ArgumentMatchers.eq(minutePath),
+                    ArgumentMatchers.eq(String.format("%02d.000.node.tar", i)),
+                    ArgumentMatchers.eq(0L),
+                    ArgumentMatchers.anyLong()
+                )).thenAnswer(inv -> new ByteArrayInputStream(tarBytes));
+            }
+            Mockito.doAnswer(inv -> {
+                inv.getArgument(3, org.opensearch.action.support.PlainActionFuture.class).onResponse(tarBlobs);
+                return null;
+            }).when(ts).listAllInSortedOrder(
+                ArgumentMatchers.eq(minutePath), ArgumentMatchers.any(), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+            );
+        }
+
+        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(ts, base);
+        scanner.scan(java.time.Instant.now());
+
+        // LIST: txlogRoot(1) + gcIdxDay(1) + txlogDay(1) + K minute dirs(K) = 3 + K
+        Mockito.verify(ts, Mockito.times(1)).listFolders(txlogRoot);
+        Mockito.verify(ts, Mockito.times(1)).listFolders(txlogDayPath);
+        Mockito.verify(ts, Mockito.times(1)).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.any(), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+        // Total listAllInSortedOrder calls = 1 (gcIdxDay) + K (minute dirs) = K+1
+        Mockito.verify(ts, Mockito.times(K + 1)).listAllInSortedOrder(
+            ArgumentMatchers.any(BlobPath.class),
+            ArgumentMatchers.any(), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+        // GET: K × T range-GETs (one per TAR blob)
+        Mockito.verify(ts, Mockito.times(K * T)).downloadBlob(
+            ArgumentMatchers.any(BlobPath.class),
+            ArgumentMatchers.anyString(),
+            ArgumentMatchers.eq(0L),
+            ArgumentMatchers.anyLong()
+        );
+        // PUT: K .idx uploads (one per new minute)
+        Mockito.verify(ts, Mockito.times(K)).uploadBlobStream(
+            ArgumentMatchers.any(), ArgumentMatchers.anyLong(), ArgumentMatchers.any(),
+            ArgumentMatchers.any(), ArgumentMatchers.any(), ArgumentMatchers.any()
+        );
+        // DELETE: 0
+        Mockito.verify(ts, Mockito.never()).deleteBlobs(ArgumentMatchers.any(), ArgumentMatchers.any());
+    }
+
     // ── evictAndDeleteIdx tests ───────────────────────────────────────────────
 
     public void testEvictAndDeleteIdxRemovesFromMemoryAndDeletesBlob() throws IOException {
