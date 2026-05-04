@@ -593,4 +593,42 @@ public final class TarArchiveBuilder {
             }
         };
     }
+
+    /**
+     * Creates a lazy streaming {@link ArchiveBuildEntry} from a {@link java.nio.file.Path}.
+     * <p>
+     * Unlike {@link #fromBytes}, this variant does <b>not</b> read the file into memory at
+     * creation time. The file is opened and streamed lazily when {@link ArchiveBuildEntry#getContent()}
+     * is called during TAR construction. This is the preferred factory when building a TAR from
+     * local translog files — it keeps peak memory bounded to the TAR pipe buffer size (256 KB)
+     * rather than the total size of all files in the batch.
+     *
+     * @param path    the entry path inside the TAR (e.g. {@code indexUUID/0/1/translog-3.tlog})
+     * @param file    the local file to stream
+     * @param size    the file size in bytes (must be accurate — used for the TAR header)
+     * @return a lazy {@link ArchiveBuildEntry}
+     */
+    public static ArchiveBuildEntry fromPath(String path, java.nio.file.Path file, long size) {
+        return new ArchiveBuildEntry() {
+            @Override
+            public String getPath() {
+                return path;
+            }
+
+            @Override
+            public InputStream getContent() throws IOException {
+                return java.nio.file.Files.newInputStream(file);
+            }
+
+            @Override
+            public long getSize() {
+                return size;
+            }
+
+            @Override
+            public byte[] getBackingBytes() {
+                return null; // not backed by bytes — streaming only
+            }
+        };
+    }
 }

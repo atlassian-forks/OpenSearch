@@ -682,9 +682,17 @@ public class RemoteFsTranslog extends Translog {
     }
 
     private boolean upload(long primaryTerm, long generation, long maxSeqNo) throws IOException {
-        // When archive upload is enabled, submit data to the per-index batch coordinator.
-        // The coordinator bundles all shards' data into a single ZIP and blocks until uploaded.
-        TranslogArchiveBatchCoordinator archiveBatchCoordinator = TranslogArchiveBatchCoordinator.get(shardId.getIndex().getUUID());
+        // When archive upload is enabled, submit data to the node-scoped batch coordinator.
+        // The coordinator is a singleton for the node (not per-index), obtained via TranslogConfig
+        // to avoid static lookup. It bundles all shards across ALL indices into a single TAR and
+        // blocks until the upload completes (durability=REQUEST preserved).
+        // Obtain the node-scoped coordinator from the static singleton (set during node start).
+        // This avoids threading TranslogArchiveCollector through 5 constructor layers while
+        // remaining safe: there is exactly one collector per JVM (OpenSearch node process).
+        TranslogArchiveCollector archiveCollector = TranslogArchiveCollector.getInstance();
+        TranslogArchiveBatchCoordinator archiveBatchCoordinator = archiveCollector != null
+            ? archiveCollector.getNodeCoordinator()
+            : null;
         if (indexSettings().isTranslogArchiveUploadEnabled() && archiveBatchCoordinator != null) {
             try {
                 // Provide the repo base path to the coordinator on first use so uploads and recovery
@@ -697,6 +705,7 @@ public class RemoteFsTranslog extends Translog {
                 long minSeqNo = getMinUnreferencedSeqNoInSegments(globalCheckpointSupplier.getAsLong());
                 long globalCheckpoint = globalCheckpointSupplier.getAsLong();
                 TranslogArchiveBatchCoordinator.ShardArchiveData shardData = new TranslogArchiveBatchCoordinator.ShardArchiveData(
+                    shardId.getIndex().getUUID(),  // indexUUID — required since coordinator is node-scoped
                     shardId.id(),
                     primaryTerm,
                     generation,
@@ -760,6 +769,9 @@ public class RemoteFsTranslog extends Translog {
         Path tlogFile = location.resolve(tlogFilename);
         Path ckpFile = location.resolve(ckpFilename);
 
+        // Use lazy streaming entries (fromPath) — no file content read into heap here.
+        // TarArchiveBuilder.build() streams each file through the TAR pipe during upload,
+        // keeping peak memory bounded to the pipe buffer (256 KB) regardless of file sizes.
         long totalBytes = 0;
         if (Files.exists(tlogFile)) {
             long tlogSize = Files.size(tlogFile);
@@ -776,8 +788,7 @@ public class RemoteFsTranslog extends Translog {
                         + generation
                 );
             }
-            byte[] tlogBytes = Files.readAllBytes(tlogFile);
-            entries.add(TarArchiveBuilder.fromBytes(prefix + tlogFilename, tlogBytes));
+            entries.add(TarArchiveBuilder.fromPath(prefix + tlogFilename, tlogFile, tlogSize));
         }
         if (Files.exists(ckpFile)) {
             long ckpSize = Files.size(ckpFile);
@@ -794,8 +805,7 @@ public class RemoteFsTranslog extends Translog {
                         + generation
                 );
             }
-            byte[] ckpBytes = Files.readAllBytes(ckpFile);
-            entries.add(TarArchiveBuilder.fromBytes(prefix + ckpFilename, ckpBytes));
+            entries.add(TarArchiveBuilder.fromPath(prefix + ckpFilename, ckpFile, ckpSize));
         }
 
         return entries;

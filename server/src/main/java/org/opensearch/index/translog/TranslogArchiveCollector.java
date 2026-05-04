@@ -89,9 +89,6 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
     /** Max blob names to pass per deleteBlobs call when batching deletes. */
     private static final int RETENTION_DELETE_BATCH_SIZE = 100;
 
-    /** Node-level upload lock — one TAR upload at a time per node. */
-    private static final Object NODE_UPLOAD_LOCK = new Object();
-
     private final IndicesService indicesService;
     private final ThreadPool threadPool;
     private final RemoteStoreSettings remoteStoreSettings;
@@ -104,8 +101,26 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
      * Null when not the cluster-manager.
      */
     private volatile TranslogArchiveGcScanner gcScanner;
-    /** Set of index UUIDs that use coordinator-based (school bus) uploads. */
-    private final Set<String> coordinatorEnabledIndices = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Node-scoped batch coordinator — single instance shared by ALL archive-enabled shards on this node.
+     * Created lazily on first archive-enabled index start. Null until then and after node stop.
+     *
+     * <p>All primary shards on this node submit their translog data here for batching. The coordinator
+     * groups shards into TAR uploads bounded by the archive max-wait and threshold settings,
+     * dispatching one TAR per batch.
+     *
+     * <p>Lifecycle: created in {@link #doStart()}, closed in {@link #doStop()}.
+     */
+    private volatile TranslogArchiveBatchCoordinator nodeCoordinator;
+
+    /**
+     * Node-scoped static accessor — set to the active collector during {@link #doStart()} and
+     * cleared in {@link #doStop()}. This allows {@link RemoteFsTranslog} to reach the node
+     * coordinator without threading it through 5 constructor layers.
+     * There is at most one collector per JVM (OpenSearch node), so a static field is safe.
+     */
+    private static volatile TranslogArchiveCollector INSTANCE;
 
     public TranslogArchiveCollector(IndicesService indicesService) {
         this(indicesService, null, null, null);
@@ -209,14 +224,84 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
 
     @Override
     protected void doStart() {
+        INSTANCE = this; // register as node singleton for RemoteFsTranslog lookup
         if (threadPool != null && remoteStoreSettings != null) {
+            // The scheduled task is now retention-only — translog uploads are handled
+            // synchronously by TranslogArchiveBatchCoordinator (the node-scoped batch coordinator).
+            // We keep the scheduled task only to trigger archive retention cleanup.
             TimeValue uploadInterval = remoteStoreSettings.getClusterRemoteTranslogBufferInterval();
-            scheduledTask = threadPool.scheduleWithFixedDelay(this::runBatch, uploadInterval, ThreadPool.Names.TRANSLOG_TRANSFER);
+            scheduledTask = threadPool.scheduleWithFixedDelay(
+                this::runRetentionCheck,
+                uploadInterval,
+                ThreadPool.Names.TRANSLOG_TRANSFER
+            );
+            // Create the node-scoped coordinator that all archive-enabled shards share.
+            // The coordinator is created here (not per-index) because it batches across ALL indices.
+            if (isAnyArchiveEnabled()) {
+                nodeCoordinator = createNodeCoordinator();
+            }
             // Register as cluster-manager listener so GC only runs on the elected master.
             if (clusterService != null) {
                 clusterService.addLocalNodeClusterManagerListener(this);
             }
         }
+    }
+
+    /**
+     * Returns true if ANY index on this node has translog archive upload enabled.
+     * Used to decide whether to create the node coordinator at startup.
+     * Individual shard submissions are gated by their own archive setting.
+     */
+    private boolean isAnyArchiveEnabled() {
+        for (IndexService indexService : indicesService) {
+            if (indexService.getIndexSettings().isTranslogArchiveUploadEnabled()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Creates the node-scoped {@link TranslogArchiveBatchCoordinator}.
+     * The base path is initialized lazily on first submission — no path needed here.
+     * Settings are read from {@link RemoteStoreSettings}.
+     */
+    private TranslogArchiveBatchCoordinator createNodeCoordinator() {
+        // nodeId and archiveBasePath are obtained lazily from the first submitting shard.
+        // We create the coordinator with a placeholder nodeId (overridden on first submit).
+        // Use the cluster-manager's local node ID. If clusterService is not available in tests,
+        // fall back to a placeholder — overridden when indicesService has no cluster service.
+        String nodeId = clusterService != null
+            ? clusterService.localNode().getId()
+            : "local";
+        // Archive max-wait and threshold are per-index settings but we use a node-level default
+        // (the coordinator is node-scoped). Individual shards may override via lazy submission.
+        // Use the OpenSearch-defined defaults: 200ms wait, threshold=10.
+        TimeValue maxWait = TimeValue.timeValueMillis(200);
+        int threshold = 10;
+        return new TranslogArchiveBatchCoordinator(
+            nodeId,
+            null, // archiveBasePath set lazily via initArchiveBasePath() on first submission
+            RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
+            maxWait,
+            threshold
+        );
+    }
+
+    /**
+     * Returns the node-scoped {@link TranslogArchiveBatchCoordinator}, or {@code null} if
+     * archive is not enabled on this node. All archive-enabled shards must use this instance.
+     */
+    public TranslogArchiveBatchCoordinator getNodeCoordinator() {
+        // Lazy create: if a shard starts with archive enabled after node startup, create coordinator.
+        if (nodeCoordinator == null && threadPool != null && remoteStoreSettings != null) {
+            synchronized (this) {
+                if (nodeCoordinator == null) {
+                    nodeCoordinator = createNodeCoordinator();
+                }
+            }
+        }
+        return nodeCoordinator;
     }
 
     @Override
@@ -230,6 +315,20 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             retentionScheduledTask.cancel();
             retentionScheduledTask = null;
         }
+        // Close the node coordinator — signals any waiting shard threads and shuts down timer.
+        if (nodeCoordinator != null) {
+            nodeCoordinator.close();
+            nodeCoordinator = null;
+        }
+        INSTANCE = null; // deregister singleton on stop
+    }
+
+    /**
+     * Returns the node-scoped collector instance, or {@code null} if not started.
+     * Used by {@link RemoteFsTranslog} to reach the node coordinator without static map lookup.
+     */
+    public static TranslogArchiveCollector getInstance() {
+        return INSTANCE;
     }
 
     @Override
@@ -303,105 +402,21 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         logger.debug("GC scanner: no eligible shard with transfer service found yet");
     }
 
-    private void runBatch() {
-        // When the school-bus batch coordinator is active, archive uploads are handled inline
-        // with the translog sync flow (via TranslogArchiveBatchCoordinator). The collector only
-        // performs retention cleanup. Skip the upload path to avoid double uploads.
-        if (isCoordinatorBasedUploadEnabled()) {
-            return;
-        }
-        List<ShardId> eligible = getEligibleShardIds();
-        if (eligible.isEmpty()) {
-            return;
-        }
-
-        // Collect all pending primary shards across ALL indices on this node (per-node grouping).
-        List<IndexShard> shardsWithPending = new ArrayList<>();
-        TransferService transferService = null;
-        BlobPath basePath = null;
-        String nodeId = null;
-        for (ShardId sid : eligible) {
-            IndexService indexService = indicesService.indexService(sid.getIndex());
-            if (indexService == null) continue;
-            IndexShard shard = indexService.getShardOrNull(sid.id());
-            if (shard == null || shard.routingEntry() == null || !shard.routingEntry().primary() || !shard.isSyncNeeded()) {
-                continue;
-            }
-            shardsWithPending.add(shard);
-            // Capture transfer service + basePath from the first shard that has one.
-            if (transferService == null) {
-                Optional<TranslogTransferManager> tmOpt = shard.getTranslogTransferManager();
-                Optional<String> nodeIdOpt = shard.getTranslogNodeId();
-                if (tmOpt.isPresent() && nodeIdOpt.isPresent()) {
-                    transferService = tmOpt.get().getTransferService();
-                    basePath = tmOpt.get().getArchiveBasePath();
-                    nodeId = nodeIdOpt.get();
-                }
-            }
-        }
-
-        if (shardsWithPending.isEmpty() || transferService == null || basePath == null || nodeId == null) {
-            return;
-        }
-
-        // Single node-level lock: one TAR upload at a time for this node.
-        synchronized (NODE_UPLOAD_LOCK) {
-            runBatchForNode(transferService, basePath, nodeId, shardsWithPending);
-        }
-    }
-
-    private void runBatchForNode(
-        TransferService transferService,
-        BlobPath basePath,
-        String nodeId,
-        List<IndexShard> shardsWithPending
-    ) {
-        List<TransferSnapshot> snapshots = new ArrayList<>();
-        List<Runnable> releases = new ArrayList<>();
-        List<String> pathPrefixes = new ArrayList<>();
-        List<IndexShard> contributingShards = new ArrayList<>();
-        collectSnapshotsFromShards(shardsWithPending, snapshots, releases, pathPrefixes, contributingShards);
-        if (snapshots.isEmpty()) {
-            return;
-        }
-        List<TarArchiveBuilder.ArchiveBuildEntry> allEntries = new ArrayList<>();
-        List<TarArchiveBuilder.GcShardEntry> gcEntries = new ArrayList<>(contributingShards.size());
+    /**
+     * Periodic retention check — triggered by the scheduled task.
+     * <p>
+     * Upload is now handled synchronously by {@link TranslogArchiveBatchCoordinator} (the node-scoped
+     * batch coordinator). This method only triggers archive retention cleanup.
+     * The old per-node TAR upload path ({@code runBatchForNode}) is no longer used.
+     */
+    private void runRetentionCheck() {
         try {
-            for (int i = 0; i < snapshots.size(); i++) {
-                allEntries.addAll(snapshotToEntries(snapshots.get(i), pathPrefixes.get(i)));
-
-                // Build GC summary entry for this shard embedding seqNo range + last synced global checkpoint.
-                //
-                // IMPORTANT: All values are in sequence number (seqNo) space — NOT translog generation space.
-                // Translog generation numbers are file counters and are NOT comparable to seqNos.
-                //
-                // We embed getLastSyncedGlobalCheckpoint() (the globalCheckpoint from the last Lucene
-                // segment commit / translog sync), NOT getLastKnownGlobalCheckpoint() (the in-memory
-                // replicated checkpoint). The synced checkpoint is what the remote segment store has
-                // committed — if checkpoint >= maxSeqNo, the ops are in uploaded segments and the translog
-                // is no longer needed for recovery (two-phase isSafeToDelete Phase 1 check).
-                IndexShard shard = contributingShards.get(i);
-                org.opensearch.index.seqno.SeqNoStats seqNoStats = shard.seqNoStats();
-                long minSeqNo = seqNoStats.getLocalCheckpoint();   // local checkpoint: ops confirmed processed
-                long maxSeqNo = seqNoStats.getMaxSeqNo();          // highest seqNo assigned in this batch
-                // Use last SYNCED checkpoint: the checkpoint written to the last committed Lucene segment.
-                // This is the checkpoint the remote segment store has durably uploaded — safe for GC decisions.
-                long syncedGlobalCheckpoint = shard.getLastSyncedGlobalCheckpoint();
-                String indexUUID = shard.indexSettings().getIndexMetadata().getIndexUUID();
-                gcEntries.add(new TarArchiveBuilder.GcShardEntry(indexUUID, shard.shardId().id(), minSeqNo, maxSeqNo, syncedGlobalCheckpoint));
-            }
-            if (allEntries.isEmpty()) {
-                logger.debug("Skipping translog archive upload: all snapshots are empty (no translog files to archive)");
-                return;
-            }
-            uploadArchiveNewPath(transferService, basePath, nodeId, snapshots, contributingShards, allEntries, gcEntries);
-        } catch (Exception ex) {
-            logger.error(() -> new ParameterizedMessage("Failed to build or upload translog archive for node {}", nodeId), ex);
-            runFallbackIfEnabled(contributingShards, snapshots);
-        } finally {
-            releaseSnapshots(snapshots, releases);
+            runArchiveRetention();
+        } catch (Exception e) {
+            logger.warn("Archive retention check failed", e);
         }
     }
+
 
     /**
      * Checkpoint-aware archive GC using the hierarchical txlog path.
@@ -784,200 +799,15 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         return deleted;
     }
 
-    private void collectSnapshotsFromShards(
-        List<IndexShard> shardsWithPending,
-        List<TransferSnapshot> snapshots,
-        List<Runnable> releases,
-        List<String> pathPrefixes,
-        List<IndexShard> contributingShards
-    ) {
-        for (IndexShard shard : shardsWithPending) {
-            if (shard.supportsArchiveSnapshot() == false) {
-                continue;
-            }
-            String pathPrefix = shard.indexSettings().getIndexMetadata().getIndexUUID() + "/" + shard.shardId().id();
-            try {
-                shard.buildSnapshotForArchive((snapshot, release) -> {
-                    snapshots.add(snapshot);
-                    releases.add(release);
-                    pathPrefixes.add(pathPrefix);
-                    contributingShards.add(shard);
-                });
-            } catch (IOException e) {
-                logger.warn(() -> new ParameterizedMessage("Failed to build snapshot for archive from shard {}", shard.shardId()), e);
-            }
-        }
-    }
-
-    private static final int PIPE_BUFFER_BYTES = 256 * 1024;
-    /** Max attempts for archive upload on blob name collision or transient failure. */
-    private static final int UPLOAD_RETRY_MAX_ATTEMPTS = 3;
-    /** Sleep between upload retries (ms). */
-    private static final int UPLOAD_RETRY_SLEEP_MS = 25;
-
-    private void uploadArchiveNewPath(
-        TransferService transferService,
-        BlobPath basePath,
-        String nodeId,
-        List<TransferSnapshot> snapshots,
-        List<IndexShard> contributingShards,
-        List<TarArchiveBuilder.ArchiveBuildEntry> allEntries,
-        List<TarArchiveBuilder.GcShardEntry> gcEntries
-    ) throws IOException {
-        // New hierarchical path: {base}/txlog/{yyyyMMdd}/{HHmm}/{ss}.{SSS}.{nodeIdShort}.tar
-        Instant now = Instant.now();
-        BlobPath archivePath = TranslogArchivePathHelper.tarBlobDir(basePath, now);
-
-        // TAR streaming: compute layout with embedded GC summary prefix.
-        // The GC scanner reads these entries (minGen, maxGen, globalCheckpoint per shard)
-        // via a single range-GET to build its rolling checkpoint map — no separate upload needed.
-        TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(allEntries, gcEntries);
-        long contentLength = layout.getTotalSize();
-
-        AtomicReference<String> uploadedBlobName = new AtomicReference<>();
-        IOException lastFailure = null;
-        for (int attempt = 0; attempt < UPLOAD_RETRY_MAX_ATTEMPTS; attempt++) {
-            String blobName = TranslogArchivePathHelper.tarBlobName(now, nodeId);
-            try (PipedOutputStream pos = new PipedOutputStream(); PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)) {
-                AtomicReference<IOException> uploadError = new AtomicReference<>();
-                CountDownLatch uploadLatch = new CountDownLatch(1);
-                ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "translog-archive-upload");
-                    t.setDaemon(true);
-                    return t;
-                });
-                executor.submit(() -> {
-                    try {
-                        transferService.uploadBlobStream(pis, contentLength, archivePath, blobName, WritePriority.HIGH, null);
-                    } catch (IOException e) {
-                        uploadError.set(e);
-                    } finally {
-                        uploadLatch.countDown();
-                    }
-                });
-                try {
-                    // Single-pass streaming: reads each file once, lazily, directly to the pipe.
-                    // Peak memory = one file read buffer (64 KB), not all shard translog bytes.
-                    TarArchiveBuilder.build(pos, layout, allEntries);
-                } finally {
-                    pos.close();
-                }
-                try {
-                    uploadLatch.await();
-                } catch (InterruptedException e) {
-                    executor.shutdownNow();
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while waiting for archive upload", e);
-                }
-                executor.shutdown();
-                if (uploadError.get() != null) {
-                    lastFailure = uploadError.get();
-                    if (attempt < UPLOAD_RETRY_MAX_ATTEMPTS - 1) {
-                        try {
-                            Thread.sleep(UPLOAD_RETRY_SLEEP_MS);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            throw new IOException("Interrupted during upload retry", e);
-                        }
-                        continue;
-                    }
-                    throw lastFailure;
-                }
-            } catch (IOException e) {
-                lastFailure = e;
-                if (attempt < UPLOAD_RETRY_MAX_ATTEMPTS - 1) {
-                    try {
-                        Thread.sleep(UPLOAD_RETRY_SLEEP_MS);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Interrupted during upload retry", ie);
-                    }
-                    continue;
-                }
-                throw e;
-            }
-            logger.debug(
-                "TAR archive uploaded path={} nodeId={} blob={} size={}",
-                archivePath.buildAsString(),
-                nodeId,
-                blobName,
-                contentLength
-            );
-            uploadedBlobName.set(blobName);
-            break;
-        }
-        logger.debug(
-            "TAR archive batch uploaded: path={} blob={} shards={}",
-            archivePath.buildAsString(),
-            uploadedBlobName.get(),
-            contributingShards.size()
-        );
-    }
-
-    private void runFallbackIfEnabled(List<IndexShard> contributingShards, List<TransferSnapshot> snapshots) {
-        if (remoteStoreSettings == null || remoteStoreSettings.getTranslogArchiveFallbackToPerShard() == false) {
-            return;
-        }
-        TranslogTransferListener noOpListener = new TranslogTransferListener() {
-            @Override
-            public void onUploadComplete(TransferSnapshot transferSnapshot) {}
-
-            @Override
-            public void onUploadFailed(TransferSnapshot transferSnapshot, Exception ex) {
-                logger.warn(() -> new ParameterizedMessage("Fallback per-shard upload failed"), ex);
-            }
-        };
-        for (int i = 0; i < contributingShards.size(); i++) {
-            final int shardIndex = i;
-            Optional<TranslogTransferManager> managerOpt = contributingShards.get(i).getTranslogTransferManager();
-            if (managerOpt.isPresent()) {
-                try {
-                    managerOpt.get().transferSnapshot(snapshots.get(i), noOpListener);
-                } catch (IOException io) {
-                    logger.warn(
-                        () -> new ParameterizedMessage(
-                            "Fallback per-shard upload failed for shard {}",
-                            contributingShards.get(shardIndex).shardId()
-                        ),
-                        io
-                    );
-                }
-            }
-        }
-    }
-
-    private void releaseSnapshots(List<TransferSnapshot> snapshots, List<Runnable> releases) {
-        for (int i = 0; i < snapshots.size(); i++) {
-            try {
-                if (snapshots.get(i) instanceof AutoCloseable) {
-                    try {
-                        ((AutoCloseable) snapshots.get(i)).close();
-                    } catch (Exception e) {
-                        logger.warn(() -> new ParameterizedMessage("Failed to close snapshot"), e);
-                    }
-                }
-            } finally {
-                releases.get(i).run();
-            }
-        }
-    }
 
     /**
      * Register an index as using coordinator-based (school bus) upload.
-     * When registered, the collector skips upload for that index — only retention runs.
-     * Orphaned archive ZIPs for deleted indices are detected via S3 folder scan in the GC.
-     */
-    public void registerCoordinatorIndex(String indexUUID) {
-        coordinatorEnabledIndices.add(indexUUID);
-    }
-
     /**
-     * Unregister an index from coordinator-based upload (e.g. on index deletion).
-     * Also evicts the index from the GC scanner's in-memory state so stale checkpoint data
-     * doesn't block GC for future indices that reuse the same shard IDs.
+     * Evicts an index from the GC scanner's in-memory state on index deletion.
+     * Call from {@code IndicesService.removeIndex()} to prevent stale checkpoint data
+     * from blocking GC for future indices that reuse the same shard IDs.
      */
-    public void unregisterCoordinatorIndex(String indexUUID) {
-        coordinatorEnabledIndices.remove(indexUUID);
+    public void onIndexDeleted(String indexUUID) {
         TranslogArchiveGcScanner scanner = gcScanner;
         if (scanner != null) {
             scanner.evictIndex(indexUUID);
@@ -985,19 +815,10 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
     }
 
     /**
-     * Returns true if the coordinator-based (school bus) upload model is active for any index.
-     * When true, the collector only runs retention — uploads are handled inline by
-     * {@link TranslogArchiveBatchCoordinator} in the sync path.
+     * Runs one retention check synchronously; for unit/integration tests only.
      */
-    private boolean isCoordinatorBasedUploadEnabled() {
-        return !coordinatorEnabledIndices.isEmpty();
-    }
-
-    /**
-     * Runs one upload batch synchronously; for unit tests only.
-     */
-    void runBatchForTesting() {
-        runBatch();
+    void runRetentionCheckForTesting() {
+        runRetentionCheck();
     }
 
     /**

@@ -53,8 +53,8 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
     private TranslogArchiveBatchCoordinator createCoordinator(TimeValue batchInterval) {
         // threshold=Integer.MAX_VALUE so only the time-based dispatch fires, matching old batchInterval semantics
+        // Coordinator is now node-scoped (no indexUUID parameter)
         TranslogArchiveBatchCoordinator c = new TranslogArchiveBatchCoordinator(
-            "test-index-uuid",
             "test-node-id",
             new BlobPath().add("repo-root"),
             RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
@@ -71,7 +71,8 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         List<TarArchiveBuilder.ArchiveBuildEntry> entries = new ArrayList<>();
         entries.add(TarArchiveBuilder.fromBytes(path, content.getBytes(StandardCharsets.UTF_8)));
         entries.add(TarArchiveBuilder.fromBytes(ckpPath, "ckp".getBytes(StandardCharsets.UTF_8)));
-        return new TranslogArchiveBatchCoordinator.ShardArchiveData(shardId, 1L, 5L, 3L, entries);
+        // indexUUID now required — coordinator is node-scoped and serves multiple indices
+        return new TranslogArchiveBatchCoordinator.ShardArchiveData("test-index-uuid", shardId, 1L, 5L, 3L, entries);
     }
 
     public void testSingleShardSubmitAndDispatch() throws Exception {
@@ -173,7 +174,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         entries.add(TarArchiveBuilder.fromBytes(path, "tlog content".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
         entries.add(TarArchiveBuilder.fromBytes(ckpPath, "ckp".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
         TranslogArchiveBatchCoordinator.ShardArchiveData shardData =
-            new TranslogArchiveBatchCoordinator.ShardArchiveData(0, 1L, 5L, 3L, entries, 100L, 200L, 150L);
+            new TranslogArchiveBatchCoordinator.ShardArchiveData("test-index-uuid", 0, 1L, 5L, 3L, entries, 100L, 200L, 150L);
 
         coordinator.submitAndWait(shardData, transferService);
 
@@ -207,6 +208,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
 
         // Empty entries
         TranslogArchiveBatchCoordinator.ShardArchiveData emptyData = new TranslogArchiveBatchCoordinator.ShardArchiveData(
+            "test-index-uuid",
             0,
             1L,
             5L,
@@ -289,43 +291,49 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     }
 
     /**
-     * Static registry: register, get, unregister lifecycle.
+     * Node-scoped coordinator: shards from different indices use batchKey() to avoid collisions.
+     * Replaces the old static registry test (COORDINATORS map was removed — coordinator is now
+     * a singleton per node, not per index).
      */
-    public void testStaticRegistryLifecycle() {
+    public void testMultiIndexBatchKeyUniqueness() {
         TranslogArchiveBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMinutes(1));
-        String uuid = coordinator.getIndexUUID();
 
-        // Initially not registered
-        assertNull("coordinator should not be registered yet", TranslogArchiveBatchCoordinator.get(uuid));
+        // Same shard ID on different indices must have unique batch keys
+        TranslogArchiveBatchCoordinator.ShardArchiveData shard0index1 =
+            new TranslogArchiveBatchCoordinator.ShardArchiveData("index-uuid-1", 0, 1L, 5L, 3L, List.of());
+        TranslogArchiveBatchCoordinator.ShardArchiveData shard0index2 =
+            new TranslogArchiveBatchCoordinator.ShardArchiveData("index-uuid-2", 0, 1L, 5L, 3L, List.of());
 
-        // Register
-        TranslogArchiveBatchCoordinator.register(coordinator);
-        assertSame("get should return registered coordinator", coordinator, TranslogArchiveBatchCoordinator.get(uuid));
+        assertNotEquals(
+            "Same shard ID on different indices must have distinct batch keys",
+            shard0index1.batchKey(), shard0index2.batchKey()
+        );
 
-        // Unregister
-        TranslogArchiveBatchCoordinator.unregister(uuid);
-        assertNull("coordinator should be unregistered", TranslogArchiveBatchCoordinator.get(uuid));
+        // Same index + shard ID must produce the same key (idempotent submission)
+        TranslogArchiveBatchCoordinator.ShardArchiveData shard0index1Again =
+            new TranslogArchiveBatchCoordinator.ShardArchiveData("index-uuid-1", 0, 1L, 5L, 3L, List.of());
+        assertEquals(
+            "Same shard on same index must produce the same batch key",
+            shard0index1.batchKey(), shard0index1Again.batchKey()
+        );
 
-        // Unregister again is no-op
-        TranslogArchiveBatchCoordinator.unregister(uuid);
-        assertNull(TranslogArchiveBatchCoordinator.get(uuid));
+        // Verify indexUUID is correctly carried in ShardArchiveData
+        assertEquals("index-uuid-1", shard0index1.getIndexUUID());
+        assertEquals("index-uuid-2", shard0index2.getIndexUUID());
+        assertEquals(0, shard0index1.getShardId());
     }
 
     /**
-     * Static registry: registering a second coordinator for the same index replaces the first.
+     * Node-scoped coordinator: a second coordinator can be created and used independently.
+     * Replaces the old static registry replacement test (COORDINATORS map removed).
      */
-    public void testStaticRegistryReplacesExisting() {
+    public void testTwoCoordinatorsAreIndependent() {
         TranslogArchiveBatchCoordinator c1 = createCoordinator(TimeValue.timeValueMinutes(1));
         TranslogArchiveBatchCoordinator c2 = createCoordinator(TimeValue.timeValueMinutes(2));
-        String uuid = c1.getIndexUUID();
 
-        TranslogArchiveBatchCoordinator.register(c1);
-        assertSame(c1, TranslogArchiveBatchCoordinator.get(uuid));
-
-        TranslogArchiveBatchCoordinator.register(c2);
-        assertSame("second register should replace", c2, TranslogArchiveBatchCoordinator.get(uuid));
-
-        TranslogArchiveBatchCoordinator.unregister(uuid);
+        // The two coordinators are separate instances — node-scoped, not per-index
+        assertNotSame("Two independently created coordinators must be different instances", c1, c2);
+        assertEquals("Both coordinators use the same nodeId", c1.getNodeId(), c2.getNodeId());
     }
 
     /**
@@ -664,13 +672,13 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
     public void testSingleCallerWaitsFullBatchIntervalProveDoubleBuffer() throws Exception {
         long batchIntervalMs = 100; // Short interval for test speed
         TranslogArchiveBatchCoordinator coordinator = new TranslogArchiveBatchCoordinator(
-            "index-uuid-double-buf",
             "node-1",
             new BlobPath().add("repo"),
             RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
             TimeValue.timeValueMillis(batchIntervalMs),
             Integer.MAX_VALUE
         );
+        coordinatorsToClose.add(coordinator);
 
         AtomicInteger uploadCount = new AtomicInteger(0);
         TransferService transferService = mock(TransferService.class);
@@ -685,7 +693,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
             TarArchiveBuilder.fromBytes("shard0/translog-1.tlog", "data".getBytes(StandardCharsets.UTF_8))
         );
         TranslogArchiveBatchCoordinator.ShardArchiveData shardData =
-            new TranslogArchiveBatchCoordinator.ShardArchiveData(0, 1L, 1L, 0L, entries);
+            new TranslogArchiveBatchCoordinator.ShardArchiveData("test-index-uuid", 0, 1L, 1L, 0L, entries);
 
         // Measure how long a single submitAndWait() call takes
         long startNs = System.nanoTime();
@@ -729,13 +737,13 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
         int numShards = 5;
         long batchIntervalMs = 100;
         TranslogArchiveBatchCoordinator coordinator = new TranslogArchiveBatchCoordinator(
-            "index-uuid-fix-verify",
             "node-1",
             new BlobPath().add("repo"),
             RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1,
             TimeValue.timeValueMillis(batchIntervalMs),
             Integer.MAX_VALUE
         );
+        coordinatorsToClose.add(coordinator);
 
         AtomicInteger uploadCount = new AtomicInteger(0);
         TransferService transferService = mock(TransferService.class);
@@ -761,7 +769,7 @@ public class TranslogArchiveBatchCoordinatorTests extends OpenSearchTestCase {
                             ("data-" + shard).getBytes(StandardCharsets.UTF_8))
                     );
                     TranslogArchiveBatchCoordinator.ShardArchiveData data =
-                        new TranslogArchiveBatchCoordinator.ShardArchiveData(shard, 1L, 1L, 0L, entries);
+                        new TranslogArchiveBatchCoordinator.ShardArchiveData("test-index-uuid", shard, 1L, 1L, 0L, entries);
                     coordinator.submitAndWait(data, transferService);
                 } catch (Exception e) {
                     firstError.compareAndSet(null, e);

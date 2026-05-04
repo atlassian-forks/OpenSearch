@@ -143,7 +143,6 @@ import org.opensearch.index.shard.IndexingStats.Stats.DocStatusStats;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.translog.InternalTranslogFactory;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
-import org.opensearch.index.translog.TranslogArchiveBatchCoordinator;
 import org.opensearch.index.translog.TranslogArchiveCollector;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogStats;
@@ -942,29 +941,18 @@ public class IndicesService extends AbstractLifecycleComponent
             indices = newMapBuilder(indices).put(index.getUUID(), indexService).immutableMap();
 
             // Wire archive batch coordinator for indices with archive upload enabled
+            // Inject the node-scoped archive collector into TranslogConfig so RemoteFsTranslog
+            // can reach the node coordinator without a static lookup.
+            // The coordinator itself is a singleton owned by translogArchiveCollector (no
+            // per-index coordinator creation needed — all shards share one node-level instance).
             if (indexService.getIndexSettings().isTranslogArchiveUploadEnabled()
                 && indexService.getIndexSettings().isRemoteTranslogStoreEnabled()) {
-                TimeValue archiveMaxWait = indexService.getIndexSettings().getTranslogArchiveMaxWait();
-                int archiveThreshold = indexService.getIndexSettings().getTranslogArchiveThreshold();
-                org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm hashAlgo = remoteStoreSettings != null
-                    ? remoteStoreSettings.getPathHashAlgorithm()
-                    : org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
-                String localNodeId = clusterService.getClusterApplierService().getLocalNodeIdUnsafe();
-                TranslogArchiveBatchCoordinator coordinator = new TranslogArchiveBatchCoordinator(
-                    index.getUUID(),
-                    localNodeId,
-                    new org.opensearch.common.blobstore.BlobPath(),
-                    hashAlgo,
-                    archiveMaxWait,
-                    archiveThreshold
-                );
-                TranslogArchiveBatchCoordinator.register(coordinator);
-                translogArchiveCollector.registerCoordinatorIndex(index.getUUID());
-                logger.info(
-                    "Registered translog archive batch coordinator for index {} (maxWait={}, threshold={})",
-                    index,
-                    archiveMaxWait,
-                    archiveThreshold
+                // The node-scoped coordinator (held by translogArchiveCollector) is accessible via
+                // TranslogArchiveCollector.getNodeInstance() — a static field set on collector start.
+                // RemoteFsTranslog reads it at upload time. No per-index wiring needed.
+                logger.debug(
+                    "Archive upload enabled for index {} — node-level coordinator will be used",
+                    index
                 );
             }
             if (writeDanglingIndices) {
@@ -1237,9 +1225,10 @@ public class IndicesService extends AbstractLifecycleComponent
 
     @Override
     public void removeIndex(final Index index, final IndexRemovalReason reason, final String extraInfo) {
-        // Unregister archive batch coordinator if present
-        TranslogArchiveBatchCoordinator.unregister(index.getUUID());
-        translogArchiveCollector.unregisterCoordinatorIndex(index.getUUID());
+        // Notify the archive collector that this index is gone so the GC scanner can
+        // evict its checkpoint data (prevents stale data blocking GC for future indices
+        // that might reuse the same shard IDs). No per-index coordinator to close.
+        translogArchiveCollector.onIndexDeleted(index.getUUID());
         final String indexName = index.getName();
         try {
             final IndexService indexService;

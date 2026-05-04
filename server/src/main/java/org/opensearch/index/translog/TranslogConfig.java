@@ -61,6 +61,13 @@ public final class TranslogConfig {
     private final String nodeId;
     private final boolean seedRemote;
     private boolean downloadRemoteTranslogOnInit = true;
+    /**
+     * Node-level translog archive collector, injected by {@code IndicesService}.
+     * Null when translog archive is disabled or during unit tests that don't need it.
+     * {@code RemoteFsTranslog} reads the node-scoped {@link TranslogArchiveBatchCoordinator}
+     * from this collector instead of using a static registry.
+     */
+    private TranslogArchiveCollector archiveCollector; // null when archive disabled or in unit tests
 
     /**
      * Creates a new TranslogConfig instance
@@ -148,5 +155,21 @@ public final class TranslogConfig {
 
     public void setDownloadRemoteTranslogOnInit(boolean downloadRemoteTranslogOnInit) {
         this.downloadRemoteTranslogOnInit = downloadRemoteTranslogOnInit;
+    }
+
+    /**
+     * Returns the node-level {@link TranslogArchiveCollector}, or {@code null} if archive is disabled.
+     * Use {@code getArchiveCollector().getNodeCoordinator()} to get the shared batch coordinator.
+     */
+    public TranslogArchiveCollector getArchiveCollector() {
+        return archiveCollector;
+    }
+
+    /**
+     * Sets the node-level archive collector. Called by {@code IndexShard} after the collector
+     * is wired by {@code IndicesService}.
+     */
+    public void setArchiveCollector(TranslogArchiveCollector archiveCollector) {
+        this.archiveCollector = archiveCollector;
     }
 }

@@ -38,21 +38,28 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Per-index synchronous batch coordinator for translog archive uploads (the "shared car" model).
+ * Node-scoped synchronous batch coordinator for translog archive uploads (the "shared car" model).
+ * <p>
+ * A single instance lives for the lifetime of the node (created by {@link TranslogArchiveCollector},
+ * injected via {@link TranslogConfig}). All primary shards on the node — regardless of index —
+ * submit their translog data here and share a single TAR upload per batch window.
  * <p>
  * Multiple shard sync threads call {@link #submitAndWait} to add their translog data to the current batch.
  * The batch dispatches when either:
  * <ul>
- *   <li>The number of pending shards reaches {@code archiveThreshold} (car seats full → depart early), or</li>
- *   <li>{@code archiveMaxWait} has elapsed since the <b>first</b> shard arrived (waiting too long → depart).</li>
+ *   <li>The number of pending shards reaches {@code archiveThreshold} (car full → depart early), or</li>
+ *   <li>{@code archiveMaxWait} ms have elapsed since the <b>first</b> shard arrived (timer expires).</li>
  * </ul>
  * After each upload the wait clock resets — the next batch starts fresh on the next arriving shard.
  * All waiting threads are released only after the upload completes, preserving the
- * durability guarantee that the client's indexing response is not sent until data is remotely persisted.
+ * durability guarantee that the client's indexing response is not sent until data is in S3.
  * <p>
- * Bytes-based early dispatch ({@link #MAX_BATCH_BYTES}) is retained as a safety bound against OOM.
+ * Bytes-based early dispatch ({@link #MAX_BATCH_BYTES}) is a safety bound against OOM.
  * <p>
  * <b>Path layout:</b> {@code repoBase/txlog/{yyyyMMdd}/{HHmm}/{ss}.{SSS}.{nodeIdShort}.tar}
+ * <p>
+ * <b>Lifecycle:</b> Created by {@link TranslogArchiveCollector} on node start, closed on node stop.
+ * Not tied to any individual index — all archive-enabled indices share this instance.
  *
  * @opensearch.internal
  */
@@ -60,30 +67,6 @@ import java.util.concurrent.locks.ReentrantLock;
 public class TranslogArchiveBatchCoordinator {
 
     private static final Logger logger = LogManager.getLogger(TranslogArchiveBatchCoordinator.class);
-
-    /** Global coordinator registry keyed by indexUUID. Looked up by RemoteFsTranslog at upload time. */
-    private static final java.util.concurrent.ConcurrentHashMap<String, TranslogArchiveBatchCoordinator> COORDINATORS =
-        new java.util.concurrent.ConcurrentHashMap<>();
-
-    /** Register a coordinator for an index. */
-    public static void register(TranslogArchiveBatchCoordinator coordinator) {
-        COORDINATORS.put(coordinator.getIndexUUID(), coordinator);
-    }
-
-    /** Unregister the coordinator for an index. */
-    public static void unregister(String indexUUID) {
-        TranslogArchiveBatchCoordinator coordinator = COORDINATORS.remove(indexUUID);
-        if (coordinator != null) {
-            coordinator.close();
-        }
-    }
-
-
-
-    /** Look up the coordinator for an index. Returns null if not registered. */
-    public static TranslogArchiveBatchCoordinator get(String indexUUID) {
-        return COORDINATORS.get(indexUUID);
-    }
 
     private static final int PIPE_BUFFER_BYTES = 256 * 1024;
     private static final int UPLOAD_RETRY_MAX_ATTEMPTS = 2;
@@ -94,7 +77,6 @@ public class TranslogArchiveBatchCoordinator {
      */
     static final long MAX_BATCH_BYTES = 128L * 1024 * 1024;
 
-    private final String indexUUID;
     private final String nodeId;
     /** Archive base path — set lazily via {@link #initArchiveBasePath} on first shard submission. */
     private volatile BlobPath archiveBasePath;
@@ -112,8 +94,11 @@ public class TranslogArchiveBatchCoordinator {
     private final Condition batchReady = lock.newCondition();
     private final Condition batchComplete = lock.newCondition();
 
-    /** Accumulated shard data for current batch. */
-    private final Map<Integer, ShardArchiveData> pendingShards = new HashMap<>();
+    /**
+     * Accumulated shard data for current batch.
+     * Keyed by "{indexUUID}:{shardId}" to correctly distinguish same shard IDs across different indices.
+     */
+    private final Map<String, ShardArchiveData> pendingShards = new HashMap<>();
     /** Running total of entry bytes in the current batch. */
     private long pendingBatchBytes;
     /** Latch released when the current batch upload completes (or fails). */
@@ -140,6 +125,8 @@ public class TranslogArchiveBatchCoordinator {
      */
     @ExperimentalApi
     public static final class ShardArchiveData {
+        /** Index UUID — carried here because the coordinator is node-scoped (not per-index). */
+        private final String indexUUID;
         private final int shardId;
         private final long primaryTerm;
         private final long generation;
@@ -153,16 +140,18 @@ public class TranslogArchiveBatchCoordinator {
         private final long globalCheckpoint;
 
         public ShardArchiveData(
+            String indexUUID,
             int shardId,
             long primaryTerm,
             long generation,
             long minTranslogGeneration,
             List<TarArchiveBuilder.ArchiveBuildEntry> entries
         ) {
-            this(shardId, primaryTerm, generation, minTranslogGeneration, entries, -1L, -1L, -1L);
+            this(indexUUID, shardId, primaryTerm, generation, minTranslogGeneration, entries, -1L, -1L, -1L);
         }
 
         public ShardArchiveData(
+            String indexUUID,
             int shardId,
             long primaryTerm,
             long generation,
@@ -172,6 +161,7 @@ public class TranslogArchiveBatchCoordinator {
             long maxSeqNo,
             long globalCheckpoint
         ) {
+            this.indexUUID = indexUUID;
             this.shardId = shardId;
             this.primaryTerm = primaryTerm;
             this.generation = generation;
@@ -180,6 +170,10 @@ public class TranslogArchiveBatchCoordinator {
             this.minSeqNo = minSeqNo;
             this.maxSeqNo = maxSeqNo;
             this.globalCheckpoint = globalCheckpoint;
+        }
+
+        public String getIndexUUID() {
+            return indexUUID;
         }
 
         public int getShardId() {
@@ -213,17 +207,27 @@ public class TranslogArchiveBatchCoordinator {
         public long getGlobalCheckpoint() {
             return globalCheckpoint;
         }
+
+        /** Unique key within a node-scoped batch: prevents collisions between same shardId on different indices. */
+        public String batchKey() {
+            return indexUUID + ":" + shardId;
+        }
     }
 
+    /**
+     * @param nodeId             this node's ID (used in TAR blob names to avoid multi-node conflicts)
+     * @param archiveBasePath    base blob path for the translog archive repo
+     * @param pathHashAlgorithm  path hashing algorithm for blob routing
+     * @param archiveMaxWait     maximum time to wait for additional shards before dispatching a batch
+     * @param archiveThreshold   number of pending shards that triggers early dispatch
+     */
     public TranslogArchiveBatchCoordinator(
-        String indexUUID,
         String nodeId,
         BlobPath archiveBasePath,
         RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm,
         TimeValue archiveMaxWait,
         int archiveThreshold
     ) {
-        this.indexUUID = indexUUID;
         this.nodeId = nodeId;
         this.archiveBasePath = archiveBasePath;
         this.pathHashAlgorithm = pathHashAlgorithm;
@@ -236,7 +240,7 @@ public class TranslogArchiveBatchCoordinator {
 
         // Shared single-thread scheduler; fires once per batch when the first shard arrives.
         this.timerExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "translog-archive-batch-timer-" + indexUUID);
+            Thread t = new Thread(r, "translog-archive-batch-timer-node");
             t.setDaemon(true);
             return t;
         });
@@ -244,7 +248,7 @@ public class TranslogArchiveBatchCoordinator {
 
     /**
      * Stops the timer executor when this coordinator is unregistered.
-     * Called from {@link #unregister(String)}.
+     * Called from {@link #close()}.
      * Signals any waiting threads and shuts down the timer cleanly.
      */
     public void close() {
@@ -286,7 +290,7 @@ public class TranslogArchiveBatchCoordinator {
 
         lock.lock();
         try {
-            pendingShards.put(shardData.getShardId(), shardData);
+            pendingShards.put(shardData.batchKey(), shardData);
             long shardBytes = shardData.getEntries().stream().mapToLong(TarArchiveBuilder.ArchiveBuildEntry::getSize).sum();
             pendingBatchBytes += shardBytes;
             myLatch = dispatchLatch;
@@ -305,9 +309,9 @@ public class TranslogArchiveBatchCoordinator {
                     }
                 }, archiveMaxWaitMillis, TimeUnit.MILLISECONDS);
                 logger.debug(
-                    "First shard arrived for index {}, scheduled batch dispatch in {} ms",
-                    indexUUID,
-                    archiveMaxWaitMillis
+                    "First shard arrived (node-level batch), scheduled dispatch in {} ms (pending={})",
+                    archiveMaxWaitMillis,
+                    pendingShards.size()
                 );
             }
 
@@ -316,8 +320,7 @@ public class TranslogArchiveBatchCoordinator {
             boolean byteLimitReached = pendingBatchBytes >= MAX_BATCH_BYTES;
             if ((thresholdReached || byteLimitReached) && !dispatching) {
                 logger.debug(
-                    "Dispatching early for index {}: shards={} threshold={} bytes={} byteLimit={}",
-                    indexUUID,
+                    "Dispatching early (node-level): shards={} threshold={} bytes={} byteLimit={}",
                     pendingShards.size(),
                     archiveThreshold,
                     pendingBatchBytes,
@@ -389,7 +392,7 @@ public class TranslogArchiveBatchCoordinator {
      */
     private void dispatchUnderLock(TransferService transferService) {
         dispatching = true;
-        Map<Integer, ShardArchiveData> batch = new HashMap<>(pendingShards);
+        Map<String, ShardArchiveData> batch = new HashMap<>(pendingShards);
         CountDownLatch currentLatch = dispatchLatch;
 
         // Reset state for next batch immediately — callers can start accumulating while upload runs
@@ -409,31 +412,40 @@ public class TranslogArchiveBatchCoordinator {
                 uploadBatch(batch, transferService);
             } catch (IOException e) {
                 uploadException = e;
-                logger.warn(() -> new ParameterizedMessage("Archive batch upload failed for index {}", indexUUID), e);
+                logger.warn(
+                    () -> new ParameterizedMessage("Archive batch upload failed (node-level, {} shards)", batch.size()),
+                    e
+                );
             } finally {
                 // Set error before releasing latch so submitAndWait() sees it after await()
                 dispatchError = uploadException;
                 currentLatch.countDown();
             }
-        }, "translog-archive-upload-" + indexUUID);
+        }, "translog-archive-upload-node");
         uploadThread.setDaemon(true);
         uploadThread.start();
     }
 
     /**
-     * Build and upload the ZIP archive for a batch.
+     * Build and stream-upload a TAR archive for a node-level batch.
+     * <p>
+     * All TAR entries are streamed through a {@link PipedOutputStream} → {@link PipedInputStream}
+     * pipe directly into the S3 upload — no full file content is held in memory simultaneously.
+     * GC summary entries are embedded per shard, using the per-shard {@code indexUUID} carried
+     * in {@link ShardArchiveData} (required since this coordinator is node-scoped, not per-index).
      */
-    private void uploadBatch(Map<Integer, ShardArchiveData> batch, TransferService transferService) throws IOException {
-        // Collect all entries and build GC summary entries for the scanner
+    private void uploadBatch(Map<String, ShardArchiveData> batch, TransferService transferService) throws IOException {
+        // Collect all TAR entries and GC summary entries from all shards in this batch.
         List<TarArchiveBuilder.ArchiveBuildEntry> allEntries = new ArrayList<>();
         List<TarArchiveBuilder.GcShardEntry> gcEntries = new ArrayList<>(batch.size());
         for (ShardArchiveData data : batch.values()) {
             allEntries.addAll(data.getEntries());
             // Embed GC summary in the TAR so the GC scanner can determine when it is safe to delete.
-            // Only include shards that provided seqNo stats (minSeqNo >= 0).
+            // indexUUID comes from ShardArchiveData (not a class-level field) because this coordinator
+            // is node-scoped and serves shards from multiple indices simultaneously.
             if (data.getMinSeqNo() >= 0) {
                 gcEntries.add(new TarArchiveBuilder.GcShardEntry(
-                    indexUUID,
+                    data.getIndexUUID(),  // per-shard indexUUID — correct for multi-index batches
                     data.getShardId(),
                     data.getMinSeqNo(),
                     data.getMaxSeqNo(),
@@ -443,55 +455,66 @@ public class TranslogArchiveBatchCoordinator {
         }
 
         if (allEntries.isEmpty()) {
-            logger.trace("No entries to upload for index {}", indexUUID);
+            logger.trace("Node-level batch had no TAR entries to upload (all shards empty)");
             return;
         }
 
-        // Compute TAR layout (deterministic from file sizes alone — no content reads needed)
+        // Compute TAR layout (pure arithmetic from sizes — no file content reads)
         TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(allEntries, gcEntries);
         long contentLength = layout.getTotalSize();
 
-        // Compute hierarchical path: txlog/{yyyyMMdd}/{HHmm}/
+        // Hierarchical path: txlog/{yyyyMMdd}/{HHmm}/
         Instant uploadInstant = Instant.now();
         BlobPath archivePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, uploadInstant);
         String blobName = TranslogArchivePathHelper.tarBlobName(uploadInstant, nodeId);
 
         IOException lastFailure = null;
         for (int attempt = 0; attempt < UPLOAD_RETRY_MAX_ATTEMPTS; attempt++) {
-            try (PipedOutputStream pos = new PipedOutputStream(); PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)) {
-                AtomicReference<IOException> uploadError = new AtomicReference<>();
-                java.util.concurrent.CountDownLatch uploadLatch = new java.util.concurrent.CountDownLatch(1);
-                java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "archive-upload-" + indexUUID);
-                    t.setDaemon(true);
-                    return t;
-                });
-                executor.submit(() -> {
+            // Pipe: TAR builder thread writes → upload thread reads and streams to S3.
+            // The pipe buffer (256 KB) is the only in-memory buffer — peak memory is bounded.
+            try (
+                PipedOutputStream pos = new PipedOutputStream();
+                PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)
+            ) {
+                // Use a volatile field instead of AtomicReference — CountDownLatch provides
+                // the happens-before guarantee, making AtomicReference unnecessary overhead.
+                final IOException[] uploadError = { null };
+                final java.util.concurrent.CountDownLatch uploadLatch = new java.util.concurrent.CountDownLatch(1);
+
+                // Reuse a raw Thread (not a new ExecutorService per attempt) to avoid thread pool
+                // creation overhead and the associated resource leak on timeout/exception paths.
+                Thread uploadThread = new Thread(() -> {
                     try {
                         transferService.uploadBlobStream(pis, contentLength, archivePath, blobName, WritePriority.HIGH, null);
                     } catch (IOException e) {
-                        uploadError.set(e);
+                        uploadError[0] = e;
                     } finally {
-                        uploadLatch.countDown();
+                        uploadLatch.countDown(); // happens-before: uploadError[0] visible after await()
                     }
-                });
+                }, "translog-archive-upload-attempt-" + attempt);
+                uploadThread.setDaemon(true);
+                uploadThread.start();
 
+                // Stream TAR bytes into the pipe — builder blocks when the pipe buffer is full,
+                // creating natural backpressure. No full-batch buffering occurs.
                 TarArchiveBuilder.build(pos, layout, allEntries);
                 pos.close();
 
                 if (!uploadLatch.await(uploadTimeoutMillis, TimeUnit.MILLISECONDS)) {
-                    executor.shutdownNow();
-                    throw new IOException("Archive upload timed out for index " + indexUUID);
+                    uploadThread.interrupt();
+                    throw new IOException(
+                        String.format("Archive upload timed out after %d ms (shards=%d)", uploadTimeoutMillis, batch.size())
+                    );
                 }
-                executor.shutdown();
-                if (uploadError.get() != null) {
-                    throw uploadError.get();
+                if (uploadError[0] != null) {
+                    throw uploadError[0];
                 }
 
                 logger.debug(
-                    "Archive uploaded path={} blob={} entries={} size={}",
+                    "Archive uploaded path={} blob={} shards={} entries={} size={}",
                     archivePath.buildAsString(),
                     blobName,
+                    batch.size(),
                     allEntries.size(),
                     contentLength
                 );
@@ -499,18 +522,27 @@ public class TranslogArchiveBatchCoordinator {
             } catch (IOException e) {
                 lastFailure = e;
                 final int attemptNum = attempt + 1;
-                logger.warn(() -> new ParameterizedMessage("Archive upload attempt {} failed for index {}", attemptNum, indexUUID), e);
+                logger.warn(
+                    () -> new ParameterizedMessage(
+                        "Archive upload attempt {} of {} failed (shards={})",
+                        attemptNum, UPLOAD_RETRY_MAX_ATTEMPTS, batch.size()
+                    ),
+                    e
+                );
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                throw new IOException("Interrupted during archive upload for index " + indexUUID, e);
+                throw new IOException("Interrupted during archive upload (shards=" + batch.size() + ")", e);
             }
         }
-        throw new IOException("Archive upload failed after " + UPLOAD_RETRY_MAX_ATTEMPTS + " attempts for index " + indexUUID, lastFailure);
+        throw new IOException(
+            "Archive upload failed after " + UPLOAD_RETRY_MAX_ATTEMPTS + " attempts (shards=" + batch.size() + ")",
+            lastFailure
+        );
     }
 
-    /** Returns the index UUID this coordinator manages. */
-    public String getIndexUUID() {
-        return indexUUID;
+    /** Returns this node's ID. Used by tests to verify node-scoped coordinator identity. */
+    public String getNodeId() {
+        return nodeId;
     }
 
     /** Returns current number of pending shards (for testing). */
