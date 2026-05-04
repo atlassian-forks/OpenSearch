@@ -794,6 +794,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             RemoteStoreSettings remoteStoreSettings = mock(RemoteStoreSettings.class);
             when(remoteStoreSettings.getClusterRemoteTranslogBufferInterval()).thenReturn(TimeValue.timeValueMinutes(1));
             when(remoteStoreSettings.getPathHashAlgorithm()).thenReturn(RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+            when(remoteStoreSettings.getTranslogArchiveRetention()).thenReturn(TimeValue.timeValueMinutes(5));
 
             TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
             collector.runRetentionForTesting();
@@ -1134,6 +1135,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             when(remoteStoreSettings.getClusterRemoteTranslogBufferInterval()).thenReturn(TimeValue.timeValueMinutes(1));
             when(remoteStoreSettings.getPathHashAlgorithm()).thenReturn(hashAlgo);
             when(remoteStoreSettings.getTranslogArchiveGcInterval()).thenReturn(TimeValue.timeValueMinutes(1));
+            when(remoteStoreSettings.getTranslogArchiveRetention()).thenReturn(TimeValue.timeValueHours(2));
 
             TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
             collector.runRetentionForTesting();
@@ -1369,6 +1371,7 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             RemoteStoreSettings remoteStoreSettings = mock(RemoteStoreSettings.class);
             when(remoteStoreSettings.getClusterRemoteTranslogBufferInterval()).thenReturn(TimeValue.timeValueMinutes(1));
             when(remoteStoreSettings.getPathHashAlgorithm()).thenReturn(RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1);
+            when(remoteStoreSettings.getTranslogArchiveRetention()).thenReturn(TimeValue.timeValueMinutes(5));
 
             TranslogArchiveCollector collector = new TranslogArchiveCollector(indicesService, threadPool, remoteStoreSettings);
             collector.runRetentionForTesting();
@@ -1802,5 +1805,59 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
             org.opensearch.common.settings.Settings.EMPTY
         );
         assertThat("gc_interval default should be 2 minutes", defaultInterval, equalTo(TimeValue.timeValueMinutes(2)));
+    }
+
+    /**
+     * Verifies that after deleteHierarchicalArchivesOlderThan() deletes a minute-dir's TARs,
+     * the corresponding gc_idx blob is also deleted from remote storage (hot-path cleanup).
+     */
+    public void testDeleteHierarchicalArchivesDeletesGcIdxBlobAfterMinuteDeletion() throws IOException {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            String uniqueBase = "base-" + randomAlphaOfLength(12);
+            BlobPath basePath = new BlobPath().add(uniqueBase);
+
+            byte[] tarBytes = new TranslogArchiveCollector(mock(IndicesService.class)).buildArchiveFromEntries(
+                Collections.singletonList(TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8)))
+            );
+
+            // Old TAR: 2 hours ago → past cutoff → should be GC'd
+            Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
+            BlobPath oldDir = TranslogArchivePathHelper.tarBlobDir(basePath, twoHoursAgo);
+            String oldName = TranslogArchivePathHelper.tarBlobName(twoHoursAgo, "node-x");
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(oldName, tarBytes, 0L), oldDir, WritePriority.HIGH);
+
+            // Run scan() to populate gc_idx for this minute
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, basePath);
+            scanner.scan(twoHoursAgo);
+
+            // Verify gc_idx blob was created
+            String dayDir = TranslogArchivePathHelper.dayDir(twoHoursAgo);
+            String minuteDir = TranslogArchivePathHelper.minuteDir(twoHoursAgo);
+            BlobPath gcIdxDayPath = TranslogArchiveGcScanner.gcIdxRootPath(basePath).add(dayDir);
+            Map<String, BlobMetadata> gcIdxBefore = blobStore.blobContainer(gcIdxDayPath).listBlobs();
+            assertThat("gc_idx blob should exist before GC", gcIdxBefore.containsKey(minuteDir + ".idx"), equalTo(true));
+
+            // Run hierarchical GC with scanner — old minute should be deleted along with its .idx
+            BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(basePath);
+            Instant cutoff = Instant.now().minus(Duration.ofMinutes(1));
+            int deleted = TranslogArchiveCollector.deleteHierarchicalArchivesOlderThan(transferService, txlogRoot, cutoff, scanner);
+
+            assertThat("old TAR should be deleted", deleted, equalTo(1));
+
+            // gc_idx blob should also be deleted
+            Map<String, BlobMetadata> gcIdxAfter = blobStore.blobContainer(gcIdxDayPath).listBlobs();
+            assertThat("gc_idx blob should be deleted after minute-dir GC",
+                gcIdxAfter.containsKey(minuteDir + ".idx"), equalTo(false));
+
+            // Scanner memory should be evicted
+            String minuteKey = dayDir + "/" + minuteDir;
+            assertNull("minute-key should be evicted from scanner memory after GC",
+                scanner.getInMemoryIndex().get(minuteKey));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
     }
 }

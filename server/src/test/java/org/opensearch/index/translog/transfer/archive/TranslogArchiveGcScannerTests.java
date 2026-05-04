@@ -1151,6 +1151,78 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         Mockito.verify(ts, Mockito.never()).deleteBlobs(ArgumentMatchers.any(), ArgumentMatchers.any());
     }
 
+    /**
+     * Verifies S3 op counts for a cold-restart scan cycle where all minutes are already indexed
+     * in gc_idx but NOT yet in memory (scanner just restarted).
+     *
+     * Expected per scan() with N=2 already-indexed minutes, cold memory:
+     *   LIST   = 1 (txlogRoot) + 1 (gcIdxDay) + 1 (txlogDay) = 3
+     *   GET    = N (one downloadBlob per .idx to reload into memory via loadSingleIdx)
+     *   PUT    = 0 (no new minutes)
+     *   DELETE = 0 (no orphans)
+     */
+    public void testScanColdRestartS3OpCounts() throws IOException {
+        TransferService ts = Mockito.mock(TransferService.class);
+        BlobPath base = new BlobPath().add("base");
+        BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(base);
+        BlobPath gcIdxRoot = TranslogArchiveGcScanner.gcIdxRootPath(base);
+        BlobPath txlogDayPath = txlogRoot.add("20260502");
+        BlobPath gcIdxDayPath = gcIdxRoot.add("20260502");
+
+        int N = 2; // minutes already indexed in gc_idx but NOT in memory
+
+        // txlog has N minute dirs
+        Mockito.when(ts.listFolders(txlogRoot)).thenReturn(Set.of("20260502"));
+        Mockito.when(ts.listFolders(txlogDayPath)).thenReturn(Set.of("1000", "1001"));
+
+        // gc_idx has N .idx files
+        BlobMetadata bm1000 = Mockito.mock(BlobMetadata.class); Mockito.when(bm1000.name()).thenReturn("1000.idx");
+        BlobMetadata bm1001 = Mockito.mock(BlobMetadata.class); Mockito.when(bm1001.name()).thenReturn("1001.idx");
+        Mockito.doAnswer(inv -> {
+            inv.getArgument(3, org.opensearch.action.support.PlainActionFuture.class)
+                .onResponse(List.of(bm1000, bm1001));
+            return null;
+        }).when(ts).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.any(), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+
+        // loadSingleIdx will download each .idx (GET) — empty index is valid
+        MinuteGcIndex emptyIdx = new MinuteGcIndex.Builder().build();
+        Mockito.when(ts.downloadBlob(gcIdxDayPath, "1000.idx"))
+            .thenReturn(new ByteArrayInputStream(emptyIdx.serialize()));
+        Mockito.when(ts.downloadBlob(gcIdxDayPath, "1001.idx"))
+            .thenReturn(new ByteArrayInputStream(emptyIdx.serialize()));
+
+        // Fresh scanner — empty memory (cold restart)
+        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(ts, base);
+        // Do NOT call loadFromPersisted — simulates cold restart where scan() does it inline
+        scanner.scan(java.time.Instant.now());
+
+        // LIST: txlogRoot(1) + gcIdxDay(1) + txlogDay(1) = 3
+        Mockito.verify(ts, Mockito.times(1)).listFolders(txlogRoot);
+        Mockito.verify(ts, Mockito.times(1)).listFolders(txlogDayPath);
+        Mockito.verify(ts, Mockito.times(1)).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.any(), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+        // GET: N downloads to load .idx into memory (one per already-indexed minute not in memory)
+        Mockito.verify(ts, Mockito.times(N)).downloadBlob(
+            ArgumentMatchers.eq(gcIdxDayPath), ArgumentMatchers.anyString()
+        );
+        // PUT: 0 — no new minutes
+        Mockito.verify(ts, Mockito.never()).uploadBlobStream(
+            ArgumentMatchers.any(), ArgumentMatchers.anyLong(), ArgumentMatchers.any(),
+            ArgumentMatchers.any(), ArgumentMatchers.any(), ArgumentMatchers.any()
+        );
+        // DELETE: 0 — no orphans
+        Mockito.verify(ts, Mockito.never()).deleteBlobs(ArgumentMatchers.any(), ArgumentMatchers.any());
+
+        // Memory should now be warm — both minutes loaded
+        assertNotNull("1000 should be in memory after cold-restart scan",
+            scanner.getInMemoryIndex().get("20260502/1000"));
+        assertNotNull("1001 should be in memory after cold-restart scan",
+            scanner.getInMemoryIndex().get("20260502/1001"));
+    }
+
     // ── evictAndDeleteIdx tests ───────────────────────────────────────────────
 
     public void testEvictAndDeleteIdxRemovesFromMemoryAndDeletesBlob() throws IOException {
