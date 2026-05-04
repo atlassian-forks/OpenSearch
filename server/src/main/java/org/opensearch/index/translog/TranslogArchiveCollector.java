@@ -609,7 +609,9 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
                 }
 
                 if (scanner != null) {
-                    scanner.evict(minuteKey);
+                    // evictAndDeleteIdx removes from memory AND deletes the gc_idx blob.
+                    // This keeps gc_idx/ size bounded; S3 delete failures are best-effort (reconciled on next scan).
+                    scanner.evictAndDeleteIdx(dayDir, minuteDir);
                 }
             }
         }

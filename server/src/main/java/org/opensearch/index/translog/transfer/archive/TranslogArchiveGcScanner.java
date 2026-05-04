@@ -335,6 +335,30 @@ public final class TranslogArchiveGcScanner {
     }
 
     /**
+     * Evicts a minute-key from the in-memory index and deletes the corresponding
+     * {@code gc_idx/{dayDir}/{minuteDir}.idx} blob from remote storage.
+     *
+     * <p>The S3 delete is best-effort: if it fails, the eviction from memory still proceeds
+     * and a warning is logged. The orphaned {@code .idx} file will be cleaned up on the next
+     * reconciliation pass in {@link #scanDay}.
+     *
+     * @param dayDir    e.g. {@code "20260502"}
+     * @param minuteDir e.g. {@code "1000"}
+     */
+    public void evictAndDeleteIdx(String dayDir, String minuteDir) {
+        String minuteKey = dayDir + "/" + minuteDir;
+        inMemoryIndex.remove(minuteKey);
+        BlobPath gcIdxDayPath = gcIdxRootPath(archiveBasePath).add(dayDir);
+        String idxBlobName = minuteDir + ".idx";
+        try {
+            transferService.deleteBlobs(gcIdxDayPath, List.of(idxBlobName));
+            logger.debug("GC scanner: deleted gc_idx {}/{}", dayDir, idxBlobName);
+        } catch (IOException e) {
+            logger.warn("GC scanner: failed to delete gc_idx {}/{}: {}", dayDir, idxBlobName, e.getMessage());
+        }
+    }
+
+    /**
      * Evicts all in-memory state for a deleted index.
      * Called when an index is deleted so stale checkpoint data doesn't block GC
      * of future indices that reuse the same shard IDs.
@@ -383,6 +407,17 @@ public final class TranslogArchiveGcScanner {
                 continue;
             }
             scanMinute(dayTxlogPath, dayGcIdxPath, dayDir, minuteDir);
+        }
+
+        // Reconciliation: delete orphaned gc_idx entries whose txlog minute-dir no longer exists.
+        // This happens when GC deletes all TARs in a minute but the .idx blob was not cleaned up
+        // (e.g. due to a transient failure or a prior code version that didn't delete .idx on evict).
+        Set<String> txlogMinutes = new java.util.HashSet<>(sortedMinuteDirs);
+        for (String indexedMinute : alreadyIndexed) {
+            if (!txlogMinutes.contains(indexedMinute)) {
+                logger.debug("GC scanner: orphaned gc_idx {}/{}.idx (no txlog minute-dir) — deleting", dayDir, indexedMinute);
+                evictAndDeleteIdx(dayDir, indexedMinute);
+            }
         }
     }
 

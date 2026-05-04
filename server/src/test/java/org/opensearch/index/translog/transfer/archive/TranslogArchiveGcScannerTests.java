@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.translog.transfer.TransferService;
+import org.opensearch.index.translog.transfer.TranslogArchivePathHelper;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;
@@ -969,5 +970,165 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         // gc_idx should be in-memory after successful persist
         String minuteKey = "20260503/1000";
         assertNotNull("gc_idx should be in memory after successful persist", scanner.getInMemoryIndex().get(minuteKey));
+    }
+
+    // ── evictAndDeleteIdx tests ───────────────────────────────────────────────
+
+    public void testEvictAndDeleteIdxRemovesFromMemoryAndDeletesBlob() throws IOException {
+        TransferService transferService = Mockito.mock(TransferService.class);
+        BlobPath archiveBasePath = new BlobPath().add("base");
+        BlobPath gcIdxRoot = TranslogArchiveGcScanner.gcIdxRootPath(archiveBasePath);
+        BlobPath gcDayPath = gcIdxRoot.add("20260502");
+
+        // Setup: load a minute idx into memory via loadFromPersisted
+        Mockito.when(transferService.listFolders(gcIdxRoot)).thenReturn(Set.of("20260502"));
+        BlobMetadata idxBlob = Mockito.mock(BlobMetadata.class);
+        Mockito.when(idxBlob.name()).thenReturn("1000.idx");
+        Mockito.doAnswer(inv -> {
+            inv.getArgument(3, org.opensearch.action.support.PlainActionFuture.class).onResponse(List.of(idxBlob));
+            return null;
+        }).when(transferService).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcDayPath), ArgumentMatchers.eq(""), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+        MinuteGcIndex emptyIdx = new MinuteGcIndex.Builder().build();
+        Mockito.when(transferService.downloadBlob(gcDayPath, "1000.idx"))
+            .thenReturn(new java.io.ByteArrayInputStream(emptyIdx.serialize()));
+
+        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+        scanner.loadFromPersisted();
+
+        String minuteKey = "20260502/1000";
+        assertNotNull("should be in memory before evict", scanner.getInMemoryIndex().get(minuteKey));
+
+        // Act
+        scanner.evictAndDeleteIdx("20260502", "1000");
+
+        // Assert: removed from memory
+        assertNull("should be removed from memory", scanner.getInMemoryIndex().get(minuteKey));
+
+        // Assert: deleteBlobs called on gc_idx/{day}/1000.idx
+        Mockito.verify(transferService).deleteBlobs(
+            ArgumentMatchers.eq(gcDayPath),
+            ArgumentMatchers.eq(List.of("1000.idx"))
+        );
+    }
+
+    public void testEvictAndDeleteIdxToleratesDeleteFailureSafe() throws IOException {
+        // evictAndDeleteIdx should evict from memory even if the S3 delete fails (best-effort)
+        TransferService transferService = Mockito.mock(TransferService.class);
+        BlobPath archiveBasePath = new BlobPath().add("base");
+        BlobPath gcIdxRoot = TranslogArchiveGcScanner.gcIdxRootPath(archiveBasePath);
+        BlobPath gcDayPath = gcIdxRoot.add("20260502");
+
+        // Seed memory via loadFromPersisted
+        Mockito.when(transferService.listFolders(gcIdxRoot)).thenReturn(Set.of("20260502"));
+        BlobMetadata idxBlob = Mockito.mock(BlobMetadata.class);
+        Mockito.when(idxBlob.name()).thenReturn("1000.idx");
+        Mockito.doAnswer(inv -> {
+            inv.getArgument(3, org.opensearch.action.support.PlainActionFuture.class).onResponse(List.of(idxBlob));
+            return null;
+        }).when(transferService).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcDayPath), ArgumentMatchers.eq(""), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+        MinuteGcIndex emptyIdx = new MinuteGcIndex.Builder().build();
+        Mockito.when(transferService.downloadBlob(gcDayPath, "1000.idx"))
+            .thenReturn(new java.io.ByteArrayInputStream(emptyIdx.serialize()));
+        // Make delete fail
+        Mockito.doThrow(new IOException("S3 error")).when(transferService)
+            .deleteBlobs(ArgumentMatchers.any(), ArgumentMatchers.any());
+
+        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+        scanner.loadFromPersisted();
+
+        // Should not throw — best-effort delete
+        scanner.evictAndDeleteIdx("20260502", "1000");
+
+        // Memory should still be evicted even on S3 failure
+        assertNull("should be evicted from memory even if S3 delete fails",
+            scanner.getInMemoryIndex().get("20260502/1000"));
+    }
+
+    // ── scanDay orphan gc_idx cleanup ─────────────────────────────────────────
+
+    public void testScanDayDeletesOrphanedGcIdxWhenMinuteDirMissingFromTxlog() throws IOException {
+        // Setup: gc_idx/20260502/1000.idx exists but txlog/20260502/1000/ does NOT exist
+        // scanDay() should delete the orphaned .idx and evict from memory
+        TransferService transferService = Mockito.mock(TransferService.class);
+        BlobPath archiveBasePath = new BlobPath().add("base");
+        BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(archiveBasePath);
+        BlobPath txlogDayPath = txlogRoot.add("20260502");
+        BlobPath gcIdxRoot = TranslogArchiveGcScanner.gcIdxRootPath(archiveBasePath);
+        BlobPath gcDayPath = gcIdxRoot.add("20260502");
+
+        // txlog/20260502/ has only minute "1001" — minute "1000" is missing
+        Mockito.when(transferService.listFolders(txlogDayPath)).thenReturn(Set.of("1001"));
+
+        // gc_idx/20260502/ has both "1000.idx" and "1001.idx"
+        BlobMetadata idx1000 = Mockito.mock(BlobMetadata.class);
+        Mockito.when(idx1000.name()).thenReturn("1000.idx");
+        BlobMetadata idx1001 = Mockito.mock(BlobMetadata.class);
+        Mockito.when(idx1001.name()).thenReturn("1001.idx");
+
+        // For minute 1001 (exists in txlog): needs scanMinute setup — make it look already indexed
+        // so getAlreadyIndexedMinutes returns both, and 1001 is loaded but 1000 is orphan
+        Mockito.doAnswer(inv -> {
+            inv.getArgument(3, org.opensearch.action.support.PlainActionFuture.class)
+                .onResponse(List.of(idx1000, idx1001));
+            return null;
+        }).when(transferService).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcDayPath), ArgumentMatchers.eq(""), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+
+        // idx files content (empty index — safe)
+        MinuteGcIndex emptyIdx = new MinuteGcIndex.Builder().build();
+        Mockito.when(transferService.downloadBlob(gcDayPath, "1000.idx"))
+            .thenReturn(new java.io.ByteArrayInputStream(emptyIdx.serialize()));
+        Mockito.when(transferService.downloadBlob(gcDayPath, "1001.idx"))
+            .thenReturn(new java.io.ByteArrayInputStream(emptyIdx.serialize()));
+
+        // For minute 1001 (present in txlog): loadSingleIdx will be called (already indexed)
+        // inMemoryIndex has 1001 already loaded
+
+        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+
+        // Seed 1000 in memory (simulating prior load)
+        // We do this by calling loadFromPersisted first with both
+        Mockito.when(transferService.listFolders(gcIdxRoot)).thenReturn(Set.of("20260502"));
+        Mockito.doAnswer(inv -> {
+            inv.getArgument(3, org.opensearch.action.support.PlainActionFuture.class)
+                .onResponse(List.of(idx1000, idx1001));
+            return null;
+        }).when(transferService).listAllInSortedOrder(
+            ArgumentMatchers.eq(gcDayPath), ArgumentMatchers.eq(""), ArgumentMatchers.anyInt(), ArgumentMatchers.any()
+        );
+        // Re-setup downloadBlob for loadFromPersisted (called again on each download)
+        Mockito.when(transferService.downloadBlob(gcDayPath, "1000.idx"))
+            .thenReturn(new java.io.ByteArrayInputStream(emptyIdx.serialize()));
+        Mockito.when(transferService.downloadBlob(gcDayPath, "1001.idx"))
+            .thenReturn(new java.io.ByteArrayInputStream(emptyIdx.serialize()));
+        scanner.loadFromPersisted();
+
+        assertTrue("1000 should be in memory before scanDay",
+            scanner.getInMemoryIndex().containsKey("20260502/1000"));
+        assertTrue("1001 should be in memory before scanDay",
+            scanner.getInMemoryIndex().containsKey("20260502/1001"));
+
+        // Act: scan() → internally calls scanDay — 1000 has no txlog minute-dir → should be cleaned up
+        // We need to set up listFolders(txlogRoot) to return the day dir
+        BlobPath txlogRoot2 = TranslogArchivePathHelper.txlogRootPath(archiveBasePath);
+        Mockito.when(transferService.listFolders(txlogRoot2)).thenReturn(Set.of("20260502"));
+        scanner.scan(java.time.Instant.now());
+
+        // Assert: 1000.idx deleted from S3
+        Mockito.verify(transferService).deleteBlobs(
+            ArgumentMatchers.eq(gcDayPath),
+            ArgumentMatchers.eq(List.of("1000.idx"))
+        );
+        // Assert: 1000 evicted from memory
+        assertNull("orphaned 1000 should be evicted from memory",
+            scanner.getInMemoryIndex().get("20260502/1000"));
+        // Assert: 1001 still in memory (has txlog minute-dir)
+        assertNotNull("1001 should still be in memory",
+            scanner.getInMemoryIndex().get("20260502/1001"));
     }
 }
