@@ -77,7 +77,7 @@ public class TranslogArchiveBatchCoordinator {
      */
     static final long MAX_BATCH_BYTES = 128L * 1024 * 1024;
 
-    private final String nodeId;
+    private volatile String nodeId;
     /** Archive base path — set lazily via {@link #initArchiveBasePath} on first shard submission. */
     private volatile BlobPath archiveBasePath;
     private final RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm;
@@ -361,14 +361,19 @@ public class TranslogArchiveBatchCoordinator {
     }
 
     /**
-     * Sets the archive base path from the repository root. Called by {@link RemoteFsTranslog} on
-     * first submission so the coordinator uses the same base path as recovery.
-     * Thread-safe: the field is volatile and only set once (first-write-wins is fine since all
-     * shards in an index share the same repository base path).
+     * Sets the archive base path and node ID from the calling shard on first submission.
+     * Called by {@link RemoteFsTranslog} before {@link #submitAndWait} so the coordinator
+     * uses the correct base path and real node ID (avoiding clusterService.localNode() calls
+     * which are forbidden on cluster-state applier threads).
+     * Thread-safe: both fields are volatile and only set once (first-write-wins is fine since all
+     * shards on the same node share the same repo base path and node ID).
      */
-    public void initArchiveBasePath(BlobPath repoBasePath) {
+    public void initArchiveBasePath(BlobPath repoBasePath, String nodeId) {
         if (this.archiveBasePath == null) {
             this.archiveBasePath = repoBasePath;
+        }
+        if (this.nodeId == null || this.nodeId.equals("local")) {
+            this.nodeId = nodeId;
         }
     }
 

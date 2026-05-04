@@ -697,7 +697,7 @@ public class RemoteFsTranslog extends Translog {
             try {
                 // Provide the repo base path to the coordinator on first use so uploads and recovery
                 // use the same root path (blobStoreRepository.basePath()).
-                archiveBatchCoordinator.initArchiveBasePath(translogTransferManager.getArchiveBasePath());
+                archiveBatchCoordinator.initArchiveBasePath(translogTransferManager.getArchiveBasePath(), config.getNodeId());
                 logger.trace("submitting to archive batch coordinator for primary term {} generation {}", primaryTerm, generation);
                 List<TarArchiveBuilder.ArchiveBuildEntry> entries = buildArchiveEntries(primaryTerm, generation);
                 // Provide seqNo stats so the batch coordinator can embed GC entries in the TAR.

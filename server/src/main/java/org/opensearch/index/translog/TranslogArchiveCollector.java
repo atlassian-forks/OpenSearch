@@ -269,11 +269,10 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
     private TranslogArchiveBatchCoordinator createNodeCoordinator() {
         // nodeId and archiveBasePath are obtained lazily from the first submitting shard.
         // We create the coordinator with a placeholder nodeId (overridden on first submit).
-        // Use the cluster-manager's local node ID. If clusterService is not available in tests,
-        // fall back to a placeholder — overridden when indicesService has no cluster service.
-        String nodeId = clusterService != null
-            ? clusterService.localNode().getId()
-            : "local";
+        // Do NOT call clusterService.localNode() here — this method may be called from a
+        // cluster state applier thread where ClusterService.state() is not yet available.
+        // The real nodeId is set lazily via initArchiveBasePath() on first submission.
+        String nodeId = "local";
         // Archive max-wait and threshold are per-index settings but we use a node-level default
         // (the coordinator is node-scoped). Individual shards may override via lazy submission.
         // Use the OpenSearch-defined defaults: 200ms wait, threshold=10.
