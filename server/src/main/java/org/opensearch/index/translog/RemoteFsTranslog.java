@@ -693,7 +693,20 @@ public class RemoteFsTranslog extends Translog {
         TranslogArchiveBatchCoordinator archiveBatchCoordinator = archiveCollector != null
             ? archiveCollector.getNodeCoordinator()
             : null;
-        if (indexSettings().isTranslogArchiveUploadEnabled() && archiveBatchCoordinator != null) {
+        if (indexSettings().isTranslogArchiveUploadEnabled()) {
+            if (archiveBatchCoordinator == null) {
+                // Archive is enabled but coordinator is not yet initialized (node still starting up).
+                // Do NOT fall through to the legacy non-archive upload path — that path uploads raw
+                // translog files individually and is incompatible with archive-on recovery.
+                // Skip this upload; the next sync will retry once the coordinator is ready.
+                logger.debug(
+                    "skipping archive upload for primary term {} generation {} — coordinator not yet ready",
+                    primaryTerm,
+                    generation
+                );
+                syncPermit.release(SYNC_PERMIT);
+                return false;
+            }
             try {
                 // Provide the repo base path to the coordinator on first use so uploads and recovery
                 // use the same root path (blobStoreRepository.basePath()).
