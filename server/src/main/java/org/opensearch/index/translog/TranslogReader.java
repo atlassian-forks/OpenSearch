@@ -33,9 +33,12 @@
 package org.opensearch.index.translog;
 
 import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.common.blobstore.transfer.RemoteTransferContainer;
 import org.opensearch.common.io.Channels;
+import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.seqno.SequenceNumbers;
 
@@ -118,7 +121,33 @@ public class TranslogReader extends BaseTranslogReader implements Closeable {
     public static TranslogReader open(final FileChannel channel, final Path path, final Checkpoint checkpoint, final String translogUUID)
         throws IOException {
         final TranslogHeader header = TranslogHeader.read(translogUUID, path, channel);
-        return new TranslogReader(checkpoint, channel, path, header, null);
+        // Compute the translog file checksum so it is available for remote upload (BlobStoreTransferService requires non-null checksum).
+        // The checksum is read from the last CHECKSUM_BYTES_LENGTH bytes of the file (stored CRC32 footer written by TranslogWriter).
+        final Long translogChecksum = computeTranslogFileChecksum(channel, path);
+        return new TranslogReader(checkpoint, channel, path, header, translogChecksum);
+    }
+
+    /**
+     * Length of the Lucene codec footer: 4 bytes magic + 4 bytes algorithm ID + 8 bytes CRC32 = 16 bytes.
+     * {@link org.apache.lucene.codecs.CodecUtil#retrieveChecksum} requires the full footer to be present.
+     */
+    static final int CHECKSUM_BYTES_LENGTH = 8;
+    private static final int CODEC_FOOTER_LENGTH = 16;
+
+    private static Long computeTranslogFileChecksum(FileChannel channel, Path path) {
+        try {
+            long fileSize = channel.size();
+            if (fileSize < CODEC_FOOTER_LENGTH) {
+                return null;
+            }
+            byte[] footer = new byte[CODEC_FOOTER_LENGTH];
+            channel.read(ByteBuffer.wrap(footer), fileSize - CODEC_FOOTER_LENGTH);
+            try (IndexInput indexInput = new ByteArrayIndexInput(path.toString(), footer)) {
+                return RemoteTransferContainer.checksumOfChecksum(indexInput, CHECKSUM_BYTES_LENGTH);
+            }
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
