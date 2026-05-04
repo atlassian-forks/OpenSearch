@@ -40,9 +40,11 @@ import org.opensearch.threadpool.ThreadPool;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -289,8 +291,9 @@ public class RemoteFsTranslog extends Translog {
                         );
                     }
                 } catch (FileNotFoundException | NoSuchFileException e) {
-                    // A generation's entry was not found in the metadata's ZIP — it may live in an
-                    // older ZIP (multi-cycle scenario). Fall back to 8-param ZIP scan with gen range.
+                    // A generation's entry was not found in the metadata's TAR — it may live in an
+                    // older TAR (multi-cycle scenario) or in per-shard format (OFF→ON toggle).
+                    // Fall back to TAR scan with gen range, then per-shard for any still-missing gens.
                     logger.info(
                         "Archive entry not found in metadata TAR, falling back to TAR scan gen=[{}-{}]",
                         translogMetadata.getMinTranslogGeneration(),
@@ -298,7 +301,7 @@ public class RemoteFsTranslog extends Translog {
                     );
                     IOUtils.rm(FileSystemUtils.files(location));
                     String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
-                    recoverFromArchiveWithGenRange(
+                    boolean allFound = recoverFromArchiveWithGenRange(
                         translogTransferManager,
                         indexUUID,
                         location,
@@ -306,6 +309,22 @@ public class RemoteFsTranslog extends Translog {
                         translogMetadata.getMinTranslogGeneration(),
                         translogMetadata.getGeneration()
                     );
+                    if (!allFound) {
+                        // Some gens not in any TAR — likely in per-shard format (OFF→ON toggle).
+                        // Download any still-missing gens from per-shard storage.
+                        Map<String, String> genToPrimary = translogMetadata.getGenerationToPrimaryTermMapper();
+                        for (long i = translogMetadata.getMinTranslogGeneration(); i <= translogMetadata.getGeneration(); i++) {
+                            String tlogFile = Translog.getFilename(i);
+                            if (Files.notExists(location.resolve(tlogFile))) {
+                                logger.debug("Gen {} missing from TARs, trying per-shard download (OFF→ON toggle)", i);
+                                try {
+                                    translogTransferManager.downloadTranslog(genToPrimary.get(Long.toString(i)), Long.toString(i), location);
+                                } catch (FileNotFoundException | NoSuchFileException ex) {
+                                    logger.debug("Gen {} not found in per-shard storage either, skipping", i);
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 // No archive offsets — try per-shard download first.
@@ -318,7 +337,7 @@ public class RemoteFsTranslog extends Translog {
                     }
                 } catch (FileNotFoundException | NoSuchFileException e) {
                     if (translogTransferManager.isTranslogArchiveUploadEnabled()) {
-                        // Per-shard files not found — archive mode, fall back to ZIP range-read.
+                        // Per-shard files not found — archive mode, fall back to TAR scan.
                         logger.info(
                             "Per-shard files not found in archive mode, falling back to TAR scan gen=[{}-{}]",
                             translogMetadata.getMinTranslogGeneration(),
@@ -326,7 +345,7 @@ public class RemoteFsTranslog extends Translog {
                         );
                         IOUtils.rm(FileSystemUtils.files(location));
                         String indexUUID = translogTransferManager.getShardId().getIndex().getUUID();
-                        recoverFromArchiveWithGenRange(
+                        boolean allFound = recoverFromArchiveWithGenRange(
                             translogTransferManager,
                             indexUUID,
                             location,
@@ -334,6 +353,22 @@ public class RemoteFsTranslog extends Translog {
                             translogMetadata.getMinTranslogGeneration(),
                             translogMetadata.getGeneration()
                         );
+                        if (!allFound) {
+                            // Some gens not in any TAR — likely in per-shard format (OFF→ON toggle).
+                            // Download any still-missing gens from per-shard storage.
+                            Map<String, String> genToPrimary = translogMetadata.getGenerationToPrimaryTermMapper();
+                            for (long i = translogMetadata.getMinTranslogGeneration(); i <= translogMetadata.getGeneration(); i++) {
+                                String tlogFile = Translog.getFilename(i);
+                                if (Files.notExists(location.resolve(tlogFile))) {
+                                    logger.debug("Gen {} missing from TARs, trying per-shard download (OFF→ON toggle)", i);
+                                    try {
+                                        translogTransferManager.downloadTranslog(genToPrimary.get(Long.toString(i)), Long.toString(i), location);
+                                    } catch (FileNotFoundException | NoSuchFileException ex) {
+                                        logger.debug("Gen {} not found in per-shard storage either, skipping", i);
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         throw e;
                     }
@@ -407,7 +442,13 @@ public class RemoteFsTranslog extends Translog {
      * Uses {@link TranslogArchiveRecovery#recoverFromHierarchicalPath} to scan the hierarchical txlog/ path.
      * Writes files directly to {@code location} (not via temp dir).
      */
-    private static void recoverFromArchiveWithGenRange(
+    /**
+     * Returns {@code true} if all generations in [minGeneration, maxGeneration] were found in TARs.
+     * Returns {@code false} if some gens were missing from TARs (e.g. they are in per-shard format —
+     * the OFF→ON toggle case). Callers that get {@code false} should attempt per-shard fallback for
+     * any still-missing generations.
+     */
+    private static boolean recoverFromArchiveWithGenRange(
         TranslogTransferManager translogTransferManager,
         String indexUUID,
         Path location,
@@ -425,7 +466,7 @@ public class RemoteFsTranslog extends Translog {
         // Fall back to old ZIP path if nothing found (backward compatibility).
         // Use Instant.now() as the segment timestamp so we scan from (now - 2 min) forward.
         // If nothing found in the recent window, the ZIP fallback handles older data.
-        boolean recoveredFromTar = TranslogArchiveRecovery.recoverFromHierarchicalPath(
+        boolean allFound = TranslogArchiveRecovery.recoverFromHierarchicalPath(
             translogTransferManager.getTransferService(),
             translogTransferManager.getArchiveBasePath(),
             indexUUID,
@@ -441,8 +482,9 @@ public class RemoteFsTranslog extends Translog {
             translogTransferManager.getShardId(),
             minGeneration,
             maxGeneration,
-            recoveredFromTar
+            allFound
         );
+        return allFound;
     }
 
     /**
@@ -642,7 +684,37 @@ public class RemoteFsTranslog extends Translog {
                     }
                     final TranslogReader reader = current.closeIntoReader();
                     readers.add(reader);
-                    copyCheckpointTo(location.resolve(getCommitCheckpointFileName(current.getGeneration())));
+                    Path perGenCkpPath = location.resolve(getCommitCheckpointFileName(current.getGeneration()));
+                    copyCheckpointTo(perGenCkpPath);
+                    // When archive upload is enabled, normalize globalCheckpoint == maxSeqNo in the
+                    // per-generation checkpoint file immediately after writing it.
+                    //
+                    // Background: copyCheckpointTo() copies translog.ckp (the live checkpoint) to
+                    // translog-N.ckp. The live checkpoint's globalCheckpoint is updated asynchronously
+                    // by the cluster-state applier thread and can lag behind maxSeqNo (all ops indexed).
+                    // On recovery of a closed index, NoOpEngine asserts maxSeqNo == globalCheckpoint
+                    // (ReadOnlyEngine.ensureMaxSeqNoEqualsToGlobalCheckpoint). If the TAR archive
+                    // embeds a .ckp with a stale globalCheckpoint, this assertion fires.
+                    //
+                    // The fix: at TAR upload time we know maxSeqNo exactly (computed above).
+                    // Normalizing the per-gen .ckp here ensures the TAR is self-consistent and
+                    // recovery never needs to patch the checkpoint.
+                    if (indexSettings().isTranslogArchiveUploadEnabled() && maxSeqNo >= 0) {
+                        Checkpoint ckp = Checkpoint.read(perGenCkpPath);
+                        if (ckp.globalCheckpoint < maxSeqNo) {
+                            Checkpoint normalized = new Checkpoint(
+                                ckp.offset, ckp.numOps, ckp.generation,
+                                ckp.minSeqNo, ckp.maxSeqNo,
+                                maxSeqNo,             // globalCheckpoint = maxSeqNo
+                                ckp.minTranslogGeneration, ckp.trimmedAboveSeqNo
+                            );
+                            Checkpoint.write(FileChannel::open, perGenCkpPath, normalized, StandardOpenOption.WRITE);
+                            logger.debug(
+                                "archive upload: normalized translog-{}.ckp globalCheckpoint {} → {}",
+                                current.getGeneration(), ckp.globalCheckpoint, maxSeqNo
+                            );
+                        }
+                    }
                     if (closed.get() == false) {
                         logger.trace("Creating new writer for gen: [{}]", current.getGeneration() + 1);
                         current = createWriter(current.getGeneration() + 1);
