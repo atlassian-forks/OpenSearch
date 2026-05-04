@@ -395,11 +395,15 @@ public class TranslogArchiveUploadIT extends BaseRemoteStoreRestoreIT {
             .setSettings(Settings.builder().put(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_ARCHIVE_UPLOAD_ENABLED_SETTING.getKey(), true))
             .get();
 
-        // Batch 2 with archive ON — uploaded as ZIP
+        // Batch 2 with archive ON — uploaded as TAR archive
         Map<String, String> batch2 = indexKnownDocs(INDEX_NAME, 20);
         waitForTranslogArchiveUpload();
+        // Flush so batch2 docs are committed to the remote segment store.
+        // A closed-index restore uses NoOpEngine which does NOT replay the translog —
+        // unflushed docs would be permanently lost. This ensures batch2 is recoverable.
+        flushAndRefresh(INDEX_NAME);
 
-        // Kill primary — batch2 only in ZIP, batch1 only in per-shard tlog
+        // Kill primary — batch2 in TAR, batch1 in per-shard tlog (both flushed to segments)
         internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNodeName(INDEX_NAME)));
         ensureRed(INDEX_NAME);
 
