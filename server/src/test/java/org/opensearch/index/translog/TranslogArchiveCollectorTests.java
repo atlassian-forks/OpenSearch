@@ -1808,6 +1808,165 @@ public class TranslogArchiveCollectorTests extends OpenSearchTestCase {
     }
 
     /**
+     * GC-001: When deleteStuckMinutePartially() finds an EMPTY minute-dir, it must call
+     * evictAndDeleteIdx() — not just evict() — so the gc_idx blob is also deleted from S3.
+     */
+    public void testDeleteStuckMinutePartiallyEmptyDirDeletesGcIdxBlob() throws IOException {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            BlobPath archiveBasePath = new BlobPath().add("base-" + randomAlphaOfLength(8));
+            Instant minuteTime = Instant.parse("2026-05-01T10:10:30Z");
+            BlobPath minutePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minuteTime);
+            String dayDir = TranslogArchivePathHelper.dayDir(minuteTime);
+            String minuteDir = TranslogArchivePathHelper.minuteDir(minuteTime);
+            String minuteKey = dayDir + "/" + minuteDir;
+
+            // Upload and scan a TAR to create the gc_idx entry, then delete the TAR manually
+            // to simulate an already-empty minute-dir (e.g. prior partial GC run)
+            List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+                TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8))
+            );
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(out, TarArchiveBuilder.computeLayout(entries, List.of()), entries);
+            String tarName = TranslogArchivePathHelper.tarBlobName(minuteTime, "node-a");
+            transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(tarName, out.toByteArray(), 0L), minutePath, WritePriority.HIGH);
+
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+            scanner.scan(minuteTime);
+
+            // Verify gc_idx blob was created
+            BlobPath gcIdxDayPath = TranslogArchiveGcScanner.gcIdxRootPath(archiveBasePath).add(dayDir);
+            assertTrue("gc_idx blob should exist before GC",
+                blobStore.blobContainer(gcIdxDayPath).listBlobs().containsKey(minuteDir + ".idx"));
+
+            // Now delete the TAR manually — minute-dir is now empty
+            blobStore.blobContainer(minutePath).deleteBlobsIgnoringIfNotExists(Collections.singletonList(tarName));
+
+            // deleteStuckMinutePartially on empty dir → should evictAndDeleteIdx (not just evict)
+            int deleted = TranslogArchiveCollector.deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner);
+            assertEquals("no TARs deleted from already-empty dir", 0, deleted);
+
+            // gc_idx blob MUST be deleted (GC-001 fix)
+            assertFalse("gc_idx blob should be deleted when minute-dir is empty",
+                blobStore.blobContainer(gcIdxDayPath).listBlobs().containsKey(minuteDir + ".idx"));
+
+            // Memory should be evicted
+            assertFalse("minute-key should be evicted from memory",
+                scanner.getInMemoryIndex().containsKey(minuteKey));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * GC-001: When deleteStuckMinutePartially() deletes ALL TARs in a stuck minute-dir,
+     * it must call evictAndDeleteIdx() — not just evict() — so the gc_idx blob is deleted.
+     */
+    public void testDeleteStuckMinutePartiallyAllTarsDeletedDeletesGcIdxBlob() throws IOException {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            BlobPath archiveBasePath = new BlobPath().add("base-" + randomAlphaOfLength(8));
+            Instant minuteTime = Instant.parse("2026-05-01T10:11:30Z");
+            BlobPath minutePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minuteTime);
+            String dayDir = TranslogArchivePathHelper.dayDir(minuteTime);
+            String minuteDir = TranslogArchivePathHelper.minuteDir(minuteTime);
+            String minuteKey = dayDir + "/" + minuteDir;
+
+            // Upload a safe TAR (checkpoint already covers maxSeqNo → phase 1 safe)
+            List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+                TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8))
+            );
+            List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
+                new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L) // checkpoint == maxSeqNo → safe
+            );
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(out, TarArchiveBuilder.computeLayout(entries, gcEntries), entries);
+            transferService.uploadBlob(
+                new FileSnapshot.TransferFileSnapshot("10.100.nodeA.tar", out.toByteArray(), 0L),
+                minutePath, WritePriority.HIGH
+            );
+
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+            scanner.scan(minuteTime);
+
+            BlobPath gcIdxDayPath = TranslogArchiveGcScanner.gcIdxRootPath(archiveBasePath).add(dayDir);
+            assertTrue("gc_idx blob should exist before GC",
+                blobStore.blobContainer(gcIdxDayPath).listBlobs().containsKey(minuteDir + ".idx"));
+
+            // deleteStuckMinutePartially → safe TAR deleted → minute-dir fully empty
+            int deleted = TranslogArchiveCollector.deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner);
+            assertEquals("safe TAR should be deleted", 1, deleted);
+            assertEquals("minute-dir should be empty", 0L,
+                archiveBlobCount(blobStore.blobContainer(minutePath).listBlobs()));
+
+            // gc_idx blob MUST be deleted (GC-001 fix)
+            assertFalse("gc_idx blob should be deleted after all TARs gone",
+                blobStore.blobContainer(gcIdxDayPath).listBlobs().containsKey(minuteDir + ".idx"));
+
+            // Memory should be evicted
+            assertFalse("minute-key should be evicted from memory",
+                scanner.getInMemoryIndex().containsKey(minuteKey));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * GC-002: Non-TAR blobs in a stuck minute-dir must NOT block eviction.
+     * They should be deleted (or excluded from remaining count) so GC can complete.
+     */
+    public void testDeleteStuckMinutePartiallyNonTarBlobDoesNotBlockEviction() throws IOException {
+        BlobStore blobStore = new FsBlobStore(randomIntBetween(1, 8) * 1024, createTempDir(), false);
+        ThreadPool threadPool = new TestThreadPool(getClass().getName());
+        try {
+            TransferService transferService = new BlobStoreTransferService(blobStore, threadPool);
+            BlobPath archiveBasePath = new BlobPath().add("base-" + randomAlphaOfLength(8));
+            Instant minuteTime = Instant.parse("2026-05-01T10:12:30Z");
+            BlobPath minutePath = TranslogArchivePathHelper.tarBlobDir(archiveBasePath, minuteTime);
+            String dayDir = TranslogArchivePathHelper.dayDir(minuteTime);
+            String minuteDir = TranslogArchivePathHelper.minuteDir(minuteTime);
+            String minuteKey = dayDir + "/" + minuteDir;
+
+            // Upload one safe TAR
+            List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
+                TarArchiveBuilder.fromBytes("idx-uuid/0/1/translog-1.tlog", "x".getBytes(StandardCharsets.UTF_8))
+            );
+            List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
+                new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L) // safe
+            );
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            TarArchiveBuilder.build(out, TarArchiveBuilder.computeLayout(entries, gcEntries), entries);
+            transferService.uploadBlob(
+                new FileSnapshot.TransferFileSnapshot("11.100.nodeA.tar", out.toByteArray(), 0L),
+                minutePath, WritePriority.HIGH
+            );
+
+            // Also upload a stray non-TAR blob (e.g. partial upload artifact)
+            transferService.uploadBlob(
+                new FileSnapshot.TransferFileSnapshot("stray.tmp", "junk".getBytes(StandardCharsets.UTF_8), 0L),
+                minutePath, WritePriority.HIGH
+            );
+
+            TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(transferService, archiveBasePath);
+            scanner.scan(minuteTime);
+
+            // deleteStuckMinutePartially → safe TAR deleted, non-TAR blob handled
+            int deleted = TranslogArchiveCollector.deleteStuckMinutePartially(transferService, minutePath, minuteKey, scanner);
+
+            // Non-TAR blob should NOT permanently block eviction
+            // (either deleted too, or at least not counted as a stuck TAR)
+            assertFalse("minute-key must be evicted — non-TAR blob must not block GC",
+                scanner.getInMemoryIndex().containsKey(minuteKey));
+        } finally {
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
      * Verifies that after deleteHierarchicalArchivesOlderThan() deletes a minute-dir's TARs,
      * the corresponding gc_idx blob is also deleted from remote storage (hot-path cleanup).
      */

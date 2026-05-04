@@ -412,11 +412,23 @@ public final class TranslogArchiveGcScanner {
         // Reconciliation: delete orphaned gc_idx entries whose txlog minute-dir no longer exists.
         // This happens when GC deletes all TARs in a minute but the .idx blob was not cleaned up
         // (e.g. due to a transient failure or a prior code version that didn't delete .idx on evict).
+        // Batch all orphan deletes into a single deleteBlobs() call (GC-003).
         Set<String> txlogMinutes = new java.util.HashSet<>(sortedMinuteDirs);
+        List<String> orphanBlobs = new ArrayList<>();
         for (String indexedMinute : alreadyIndexed) {
             if (!txlogMinutes.contains(indexedMinute)) {
-                logger.debug("GC scanner: orphaned gc_idx {}/{}.idx (no txlog minute-dir) — deleting", dayDir, indexedMinute);
-                evictAndDeleteIdx(dayDir, indexedMinute);
+                logger.debug("GC scanner: orphaned gc_idx {}/{}.idx (no txlog minute-dir) — queued for deletion", dayDir, indexedMinute);
+                inMemoryIndex.remove(dayDir + "/" + indexedMinute);
+                orphanBlobs.add(indexedMinute + ".idx");
+            }
+        }
+        if (!orphanBlobs.isEmpty()) {
+            BlobPath gcIdxDayPath = gcIdxRootPath(archiveBasePath).add(dayDir);
+            try {
+                transferService.deleteBlobs(gcIdxDayPath, orphanBlobs);
+                logger.debug("GC scanner: batch-deleted {} orphaned gc_idx blobs in {}", orphanBlobs.size(), dayDir);
+            } catch (IOException e) {
+                logger.warn("GC scanner: failed to batch-delete orphaned gc_idx blobs in {}: {}", dayDir, e.getMessage());
             }
         }
     }

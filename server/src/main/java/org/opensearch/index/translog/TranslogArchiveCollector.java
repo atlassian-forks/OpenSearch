@@ -664,8 +664,9 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             return 0;
         }
         if (remainingBlobs == null || remainingBlobs.isEmpty()) {
-            // Minute-dir is already empty — evict
-            scanner.evict(minuteKey);
+            // Minute-dir is already empty — evict from memory and delete gc_idx blob (GC-001)
+            String[] parts = minuteKey.split("/", 2);
+            scanner.evictAndDeleteIdx(parts[0], parts[1]);
             return 0;
         }
 
@@ -679,8 +680,10 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         for (BlobMetadata blob : remainingBlobs) {
             String blobName = blob.name();
             if (!blobName.endsWith(".tar")) {
-                // Non-TAR blobs: keep
-                remaining++;
+                // Non-TAR blobs don't belong in minute-dirs — delete them unconditionally (GC-002).
+                // Do NOT count them as "remaining TARs" or they would permanently block eviction.
+                logger.warn("GC per-TAR: unexpected non-TAR blob '{}' in stuck minute-dir '{}' — deleting", blobName, minuteKey);
+                safeToDelete.add(blobName);
                 continue;
             }
 
@@ -708,9 +711,10 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
             }
         }
 
-        // If all TARs are now gone, evict the minute-key from memory
+        // If all TARs are now gone, evict from memory and delete gc_idx blob (GC-001)
         if (remaining == 0 && deleted > 0) {
-            scanner.evict(minuteKey);
+            String[] parts = minuteKey.split("/", 2);
+            scanner.evictAndDeleteIdx(parts[0], parts[1]);
             logger.debug("GC per-TAR: minute {} fully cleaned after per-TAR pass", minuteKey);
         } else if (deleted > 0) {
             logger.debug("GC per-TAR: deleted {} safe TARs from stuck minute {}, {} still stuck", deleted, minuteKey, remaining);
