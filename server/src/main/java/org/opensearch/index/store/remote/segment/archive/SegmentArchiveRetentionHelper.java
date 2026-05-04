@@ -19,11 +19,11 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * Helper for cleaning up stale segment archive ZIP blobs that are no longer referenced
+ * Helper for cleaning up stale segment archive TAR blobs that are no longer referenced
  * by any active metadata file. An archive blob is stale if its name does not appear
  * as the {@code uploadedFilename} in any active metadata entry.
  * <p>
- * Archive blob names follow the pattern: {@code segment_archive_<timestamp>_<uuid>.zip}
+ * Archive blob names follow the pattern: {@code segment_archive_<timestamp>_<uuid>.tar}
  *
  * @opensearch.internal
  */
@@ -89,6 +89,6 @@ public final class SegmentArchiveRetentionHelper {
      * Returns true if the blob name matches the segment archive naming convention.
      */
     public static boolean isArchiveBlob(String blobName) {
-        return blobName != null && blobName.startsWith(SEGMENT_ARCHIVE_PREFIX) && blobName.endsWith(".zip");
+        return blobName != null && blobName.startsWith(SEGMENT_ARCHIVE_PREFIX) && blobName.endsWith(".tar");
     }
 }

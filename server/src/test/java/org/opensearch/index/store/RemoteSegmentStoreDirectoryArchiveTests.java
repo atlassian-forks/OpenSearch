@@ -246,7 +246,7 @@ public class RemoteSegmentStoreDirectoryArchiveTests extends OpenSearchTestCase 
 
         java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
         java.util.Map<String, SegmentArchiveEntry> archiveEntries = org.opensearch.index.store.remote.segment.archive.SegmentArchiveBuilder
-            .buildAndExtractOffsets(out, entries);
+            .buildAndExtractOffsets(out, org.opensearch.index.store.remote.segment.archive.SegmentArchiveBuilder.computeLayout(entries), entries);
         byte[] zipBytes = out.toByteArray();
 
         // When: extract via range-read and verify checksum
@@ -255,13 +255,9 @@ public class RemoteSegmentStoreDirectoryArchiveTests extends OpenSearchTestCase 
 
         byte[] extracted = java.util.Arrays.copyOfRange(zipBytes, (int) entry.getOffset(), (int) (entry.getOffset() + entry.getLength()));
 
-        // Compute CRC32 of extracted data
-        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
-        crc.update(extracted);
-        long computedChecksum = crc.getValue();
-
-        // Then: computed checksum should match stored checksum
-        assertThat("CRC32 checksum should match after range-read extraction", computedChecksum, equalTo(entry.getChecksum()));
+        // Then: TAR archives store checksum=0 (no per-entry CRC in TAR format)
+        // Verify content integrity by comparing extracted bytes directly
+        assertThat("TAR archive entries have checksum=0 (no per-entry CRC)", entry.getChecksum(), equalTo(0L));
         assertArrayEquals("Extracted content should match original", content, extracted);
     }
 
@@ -278,7 +274,7 @@ public class RemoteSegmentStoreDirectoryArchiveTests extends OpenSearchTestCase 
             java.util.Arrays.asList(org.opensearch.index.store.remote.segment.archive.SegmentArchiveBuilder.fromBytes(fileName, content));
 
         java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-        org.opensearch.index.store.remote.segment.archive.SegmentArchiveBuilder.buildAndExtractOffsets(out, entries);
+        org.opensearch.index.store.remote.segment.archive.SegmentArchiveBuilder.buildAndExtractOffsets(out, org.opensearch.index.store.remote.segment.archive.SegmentArchiveBuilder.computeLayout(entries), entries);
         byte[] archiveBytes = out.toByteArray();
 
         // When: simulating upload with retry logic
