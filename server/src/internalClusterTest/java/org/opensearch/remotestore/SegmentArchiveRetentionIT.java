@@ -254,6 +254,50 @@ public class SegmentArchiveRetentionIT extends RemoteStoreBaseIntegTestCase {
     }
 
     /**
+     * Regression test: all segment TAR archives must be deleted when the index is deleted.
+     *
+     * Bug: {@code deleteStaleSegments(0)} (called on shard close during index deletion) treated
+     * the newest TAR as "active" (protected by the keep-boundary logic) and skipped it, leaving
+     * orphaned TARs in S3 after deletion.
+     *
+     * Fix: when {@code lastNMetadataFilesToKeep==0}, treat all archives as stale.
+     *
+     * This test is NOT flaky: shard close (which calls {@code deleteStaleSegments(0)}) completes
+     * synchronously before the DELETE response returns, so no {@code assertBusy} or sleep is needed.
+     */
+    public void testAllTarsDeletedAfterIndexDeletion() throws Exception {
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(IndexSettings.INDEX_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.getKey(), "100ms")
+            .put("index.remote_store.segment.archive_upload_enabled", true)
+            .build();
+
+        createIndex(INDEX_NAME, indexSettings);
+        ensureGreen(INDEX_NAME);
+
+        // Index documents and refresh — this causes a segment archive TAR to be uploaded to S3.
+        indexDocuments(DOCS_PER_BATCH);
+        client().admin().indices().prepareRefresh(INDEX_NAME).get();
+
+        // Verify at least one TAR was created.
+        List<String> tarsBefore = listSegmentArchives();
+        assertTrue("Should have at least one TAR before deletion", tarsBefore.size() > 0);
+
+        // Delete the index — shard close calls deleteStaleSegments(0) synchronously.
+        // By the time assertAcked() returns, deleteStaleSegments(0) has already run.
+        assertAcked(client().admin().indices().delete(new DeleteIndexRequest(INDEX_NAME)).get());
+
+        // No assertBusy / Thread.sleep needed — cleanup is synchronous on shard close.
+        List<String> tarsAfter = listSegmentArchives();
+        assertEquals(
+            "All segment TAR archives must be deleted after index deletion (found: " + tarsAfter + ")",
+            0,
+            tarsAfter.size()
+        );
+    }
+
+    /**
      * Test recovery from archive after simulated node restart.
      * Index data → create archives → close and reopen index → verify data is recoverable.
      */
