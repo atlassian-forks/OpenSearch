@@ -1489,10 +1489,21 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         // The active boundary metadata files change only when new uploads happen (which changes
         // metadataUploadCounter and thus cachedMetadataListUploadCounter, invalidating this cache).
         // When the upload counter hasn't changed AND the filter set is identical, we skip re-reading.
+        //
+        // Special case: when lastNMetadataFilesToKeep == 0 (full cleanup on index deletion / shard close),
+        // there are NO active files to protect. We must NOT read any metadata file as "active" —
+        // otherwise the latest TAR archive (referenced by the newest metadata) would be incorrectly
+        // treated as active and skipped for deletion, leaving orphaned TARs after index delete.
         Map<String, UploadedSegmentMetadata> activeSegmentFilesMetadataMap;
         Set<String> activeSegmentRemoteFilenames;
         Set<String> activeArchiveBlobNames;
-        if (cachedActiveFilterSet != null && cachedActiveFilterSet.equals(metadataFilesToFilterActiveSegments)
+        if (lastNMetadataFilesToKeep == 0) {
+            // Full cleanup: nothing is "active" — delete everything
+            activeSegmentFilesMetadataMap = Collections.emptyMap();
+            activeSegmentRemoteFilenames = Collections.emptySet();
+            activeArchiveBlobNames = Collections.emptySet();
+            logger.debug("deleteStaleSegments(0): full cleanup mode — all segments and archives eligible for deletion");
+        } else if (cachedActiveFilterSet != null && cachedActiveFilterSet.equals(metadataFilesToFilterActiveSegments)
                 && cachedActiveSegmentFilenames != null) {
             activeSegmentFilesMetadataMap = cachedActiveSegmentMetadataMap;
             activeSegmentRemoteFilenames = cachedActiveSegmentFilenames;

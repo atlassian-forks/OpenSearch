@@ -63,7 +63,9 @@ import org.mockito.Mockito;
 import static org.opensearch.index.store.RemoteSegmentStoreDirectory.METADATA_FILES_TO_FETCH;
 import static org.opensearch.index.store.RemoteSegmentStoreDirectory.MetadataFilenameUtils.SEPARATOR;
 import static org.opensearch.test.RemoteStoreTestUtils.createMetadataFileBytes;
+import static org.opensearch.test.RemoteStoreTestUtils.createMetadataFileBytesWithArchive;
 import static org.opensearch.test.RemoteStoreTestUtils.getDummyMetadata;
+import static org.opensearch.test.RemoteStoreTestUtils.getDummyMetadataForArchive;
 import static org.hamcrest.CoreMatchers.is;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.any;
@@ -943,6 +945,54 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
 
         assertBusy(() -> assertThat(remoteSegmentStoreDirectory.canDeleteStaleCommits.get(), is(true)));
         verify(remoteMetadataDirectory, times(0)).openInput(any(String.class), eq(IOContext.DEFAULT));
+    }
+
+    /**
+     * Regression test for the TAR orphan leak on index deletion.
+     *
+     * When {@code deleteStaleSegments(0)} is called (full cleanup on shard close / index delete),
+     * ALL segment archives — including the latest TAR that is still referenced by the newest
+     * metadata file — MUST be deleted.
+     *
+     * Before the fix, {@code activeSegmentRemoteFilenames} was built from the "keep boundary"
+     * metadata files even when {@code lastNMetadataFilesToKeep==0}, causing the newest TAR to be
+     * treated as "active" and skipped for deletion. This left orphaned TARs in S3 after index delete.
+     */
+    public void testDeleteStaleSegmentsZeroKeepDeletesAllTars() throws Exception {
+        // Set up: one metadata file referencing a TAR archive blob (archive ON scenario)
+        final String archiveBlobName = "segment_archive_1234567890_abc123.tar";
+        final Map<String, String> archiveMetadata = getDummyMetadataForArchive("_0", 1, archiveBlobName);
+
+        when(
+            remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
+                RemoteSegmentStoreDirectory.MetadataFilenameUtils.METADATA_PREFIX,
+                Integer.MAX_VALUE
+            )
+        ).thenReturn(List.of(metadataFilename));  // only one metadata file
+
+        when(remoteMetadataDirectory.getBlobStream(metadataFilename)).thenAnswer(
+            I -> createMetadataFileBytesWithArchive(
+                archiveMetadata,
+                indexShard.getLatestReplicationCheckpoint(),
+                segmentInfos,
+                archiveBlobName,
+                Collections.emptyMap(),
+                -1L
+            )
+        );
+        when(mdLockManager.fetchLockedMetadataFiles(any())).thenReturn(Collections.emptySet());
+
+        remoteSegmentStoreDirectory.init();
+
+        // Full cleanup: lastNMetadataFilesToKeep = 0
+        remoteSegmentStoreDirectory.deleteStaleSegments(0);
+
+        // The TAR archive blob MUST be deleted — it is the uploadedFilename in the only metadata file.
+        // Before the fix this would NOT be deleted because it was treated as "active".
+        verify(remoteDataDirectory).deleteFile(archiveBlobName);
+
+        // The metadata file itself must also be deleted.
+        verify(remoteMetadataDirectory).deleteFile(metadataFilename);
     }
 
     @TestLogging(value = "_root:debug", reason = "Validate logging output")
