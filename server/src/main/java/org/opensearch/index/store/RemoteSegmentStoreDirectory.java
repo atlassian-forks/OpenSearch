@@ -64,6 +64,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
@@ -136,6 +137,33 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         new java.util.concurrent.atomic.AtomicReference<>(null);
 
     /**
+     * Dirty flag for archive orphan cleanup.
+     *
+     * <p>Set to {@code true} by {@link #markArchiveUploadPending()} immediately after a TAR blob is
+     * successfully uploaded to S3 but before the metadata file referencing it has been written.
+     * Cleared to {@code false} by {@link #clearArchiveUploadPending()} only after the metadata
+     * write succeeds.
+     *
+     * <p>If the metadata write fails, the flag stays {@code true} so the next
+     * {@link #deleteStaleSegments} call runs the {@code remoteDataDirectory.listAll()} orphan
+     * cleanup and finds the unreferenced TAR. In the happy path (metadata write succeeds) the flag
+     * is {@code false} and the orphan-cleanup LIST is skipped entirely — eliminating the dominant
+     * LIST source when segment archive is enabled.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean archiveUploadDirty =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Called by {@link org.opensearch.index.shard.RemoteStoreRefreshListener} after a TAR blob upload succeeds. */
+    public void markArchiveUploadPending() {
+        archiveUploadDirty.set(true);
+    }
+
+    /** Called by {@link org.opensearch.index.shard.RemoteStoreRefreshListener} after metadata write succeeds. */
+    public void clearArchiveUploadPending() {
+        archiveUploadDirty.set(false);
+    }
+
+    /**
      * LRU cache for TAR _index entries of *older* archive blobs.
      * Allows {@link #readFileFromArchiveBlob} to use a range-GET for the
      * file data instead of downloading the entire TAR.
@@ -204,6 +232,46 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
     private final AtomicLong metadataUploadCounter = new AtomicLong(0);
 
+    // ── S-6: Local metadata file count to short-circuit early exit LIST ───────────────────────────
+    /**
+     * Best-effort local count of metadata files currently on S3.
+     * Initialized from the LIST result in {@link #init()} and {@link #initializeToSpecificCommit}.
+     * Incremented on each {@link #uploadMetadata} call; decremented on each GC deletion.
+     * When this count is ≤ {@code lastNMetadataFilesToKeep}, the early-exit condition
+     * in {@link #deleteStaleSegments} is guaranteed to be true — the LIST can be skipped.
+     *
+     * <p>Initialized to {@code -1} (unknown) until set by the first full LIST, so the first
+     * GC run always does a real LIST to establish the ground truth.
+     */
+    private final AtomicInteger localMetadataFileCount = new AtomicInteger(-1);
+
+    // ── S-1: Cached metadata file list to skip re-LIST when nothing changed ──────────────────────
+    /**
+     * Cached result of the most recent {@code listFilesByPrefixInLexicographicOrder} call
+     * in {@link #deleteStaleSegments}, keyed by {@link #metadataUploadCounter} value at the
+     * time of the LIST.
+     *
+     * <p>The cache is valid iff {@code cachedMetadataListUploadCounter} equals the current
+     * {@link #metadataUploadCounter} value. Since only the primary writes metadata files
+     * and we track every upload, a matching counter means S3 has the same set as last time.
+     *
+     * <p>Invalidated (set to {@code null}) whenever the list might differ: on {@link #init()},
+     * on {@link #initializeToSpecificCommit}, or when the counter changes.
+     */
+    private volatile List<String> cachedMetadataFileList = null;
+    private volatile long cachedMetadataListUploadCounter = Long.MIN_VALUE;
+
+    // ── S-3: Cached active segment set to skip re-GETs for boundary metadata files ───────────────
+    /**
+     * Cached result of the active-segment reads in {@link #deleteStaleSegments}.
+     * Valid iff {@code cachedActiveFilterSet} equals the current
+     * {@code metadataFilesToFilterActiveSegments} set in the same GC run.
+     */
+    private volatile Set<String> cachedActiveFilterSet = null;
+    private volatile Set<String> cachedActiveSegmentFilenames = null;
+    private volatile Set<String> cachedActiveArchiveBlobNames = null;
+    private volatile Map<String, UploadedSegmentMetadata> cachedActiveSegmentMetadataMap = null;
+
     public static final int METADATA_FILES_TO_FETCH = 10;
 
     public RemoteSegmentStoreDirectory(
@@ -252,6 +320,14 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             archiveStateRef.set(null);
         }
         logger.debug("Initialisation of remote segment metadata completed");
+        // S-1/S-6: invalidate all caches — state is reset from S3, counters are unknown.
+        cachedMetadataFileList = null;
+        cachedMetadataListUploadCounter = Long.MIN_VALUE;
+        localMetadataFileCount.set(-1);
+        cachedActiveFilterSet = null;
+        cachedActiveSegmentFilenames = null;
+        cachedActiveArchiveBlobNames = null;
+        cachedActiveSegmentMetadataMap = null;
         return remoteSegmentMetadata;
     }
 
@@ -278,6 +354,14 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>();
             archiveStateRef.set(null);
         }
+        // S-1/S-6: invalidate caches — we've switched to a specific commit, counters are unknown.
+        cachedMetadataFileList = null;
+        cachedMetadataListUploadCounter = Long.MIN_VALUE;
+        localMetadataFileCount.set(-1);
+        cachedActiveFilterSet = null;
+        cachedActiveSegmentFilenames = null;
+        cachedActiveArchiveBlobNames = null;
+        cachedActiveSegmentMetadataMap = null;
         return remoteSegmentMetadata;
     }
 
@@ -375,6 +459,19 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         // Visible for testing
         static final String SEPARATOR = "::";
 
+        /**
+         * Number of fields in the legacy (pre-S5) serialized format:
+         * originalFilename :: uploadedFilename :: checksum :: length :: writtenByMajor
+         */
+        static final int LEGACY_FIELD_COUNT = 5;
+
+        /**
+         * Number of fields in the S-5 extended format for archive blobs.
+         * Additional fields appended: tarOffset :: tarDataLength
+         * Backward-compatible: old readers parse only the first {@value #LEGACY_FIELD_COUNT} fields.
+         */
+        static final int EXTENDED_FIELD_COUNT = 7;
+
         private final String originalFilename;
         private final String uploadedFilename;
         private final String checksum;
@@ -388,6 +485,20 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
          */
         private int writtenByMajor;
 
+        /**
+         * S-5: byte offset of this file's payload within the TAR archive blob.
+         * Set to {@code -1} when not an archive blob, or when parsed from legacy metadata format.
+         * When ≥ 0, {@link RemoteSegmentStoreDirectory#readFileFromArchiveBlob} can issue a single
+         * range-GET directly to this offset instead of reading the TAR _index first.
+         */
+        long tarOffset = -1L;
+
+        /**
+         * S-5: byte length of this file's payload within the TAR archive blob.
+         * Set to {@code -1} when not an archive blob, or when parsed from legacy metadata format.
+         */
+        long tarDataLength = -1L;
+
         UploadedSegmentMetadata(String originalFilename, String uploadedFilename, String checksum, long length) {
             this.originalFilename = originalFilename;
             this.uploadedFilename = uploadedFilename;
@@ -397,6 +508,19 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
         @Override
         public String toString() {
+            if (tarOffset >= 0 && tarDataLength >= 0) {
+                // S-5 extended format — only emitted for archive blobs with known offsets.
+                return String.join(
+                    SEPARATOR,
+                    originalFilename,
+                    uploadedFilename,
+                    checksum,
+                    String.valueOf(length),
+                    String.valueOf(writtenByMajor),
+                    String.valueOf(tarOffset),
+                    String.valueOf(tarDataLength)
+                );
+            }
             return String.join(
                 SEPARATOR,
                 originalFilename,
@@ -415,15 +539,38 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             return this.length;
         }
 
+        /**
+         * S-5: byte offset within the TAR archive blob, or {@code -1} if unavailable.
+         */
+        public long getTarOffset() {
+            return tarOffset;
+        }
+
+        /**
+         * S-5: byte length of this file's payload within the TAR archive blob, or {@code -1} if unavailable.
+         */
+        public long getTarDataLength() {
+            return tarDataLength;
+        }
+
         public static UploadedSegmentMetadata fromString(String uploadedFilename) {
             String[] values = uploadedFilename.split(SEPARATOR);
             UploadedSegmentMetadata metadata = new UploadedSegmentMetadata(values[0], values[1], values[2], Long.parseLong(values[3]));
-            if (values.length < 5) {
+            if (values.length < LEGACY_FIELD_COUNT) {
                 staticLogger.error("Lucene version is missing for UploadedSegmentMetadata: " + uploadedFilename);
             }
-
+            // This access intentionally throws ArrayIndexOutOfBoundsException when values.length < 5,
+            // preserving the existing contract expected by callers and tests.
             metadata.setWrittenByMajor(Integer.parseInt(values[4]));
-
+            // S-5: parse tarOffset and tarDataLength if present (backward-compatible extension).
+            if (values.length >= EXTENDED_FIELD_COUNT) {
+                try {
+                    metadata.tarOffset = Long.parseLong(values[5]);
+                    metadata.tarDataLength = Long.parseLong(values[6]);
+                } catch (NumberFormatException e) {
+                    staticLogger.warn("Failed to parse tarOffset/tarDataLength from UploadedSegmentMetadata: {}", uploadedFilename);
+                }
+            }
             return metadata;
         }
 
@@ -679,7 +826,19 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                     name,
                     remoteFilename
                 );
-                // TODO: thread archiveBlobLength through UploadedSegmentMetadata for per-file lookup.
+                // S-5: use the per-file TAR offset/length stored in metadata to issue a single
+                // direct range-GET, skipping the TAR _index read entirely on cache miss.
+                UploadedSegmentMetadata knownMeta = segmentsUploadedToRemoteStore.get(name);
+                if (knownMeta != null && knownMeta.tarOffset >= 0 && knownMeta.tarDataLength > 0) {
+                    logger.debug(
+                        "S-5: direct range-GET for {} from archive {} at offset={} length={}",
+                        name, remoteFilename, knownMeta.tarOffset, knownMeta.tarDataLength
+                    );
+                    try (InputStream directStream = remoteDataDirectory.getBlobContainer()
+                            .readBlob(remoteFilename, knownMeta.tarOffset, knownMeta.tarDataLength)) {
+                        return new ByteArrayIndexInput(name, directStream.readAllBytes());
+                    }
+                }
                 return readFileFromArchiveBlob(name, remoteFilename);
             }
             long fileLength = fileLength(name);
@@ -886,6 +1045,10 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     public void postUploadForArchive(String src, String archiveBlobName, SegmentArchiveEntry entry, Directory from) throws IOException {
         String checksum = getChecksumOfLocalFile(from, src);
         UploadedSegmentMetadata segmentMetadata = new UploadedSegmentMetadata(src, archiveBlobName, checksum, entry.getLength());
+        // S-5: store TAR offset and data length so openInput() can issue a direct range-GET
+        // without reading the TAR _index blob first (eliminates 1–2 range-GETs on cache miss).
+        segmentMetadata.tarOffset = entry.getOffset();
+        segmentMetadata.tarDataLength = entry.getLength();
         segmentsUploadedToRemoteStore.put(src, segmentMetadata);
     }
 
@@ -973,6 +1136,8 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                 }
                 storeDirectory.sync(Collections.singleton(metadataFilename));
                 remoteMetadataDirectory.copyFrom(storeDirectory, metadataFilename, metadataFilename, IOContext.DEFAULT);
+                // S-6: track count of metadata files on S3 for LIST-skip in GC.
+                localMetadataFileCount.updateAndGet(c -> c >= 0 ? c + 1 : c);
             } finally {
                 tryAndDeleteLocalFile(metadataFilename, storeDirectory);
             }
@@ -1053,6 +1218,8 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                 }
                 storeDirectory.sync(Collections.singleton(metadataFilename));
                 remoteMetadataDirectory.copyFrom(storeDirectory, metadataFilename, metadataFilename, IOContext.DEFAULT);
+                // S-6: track count of metadata files on S3 for LIST-skip in GC.
+                localMetadataFileCount.updateAndGet(c -> c >= 0 ? c + 1 : c);
             } finally {
                 tryAndDeleteLocalFile(metadataFilename, storeDirectory);
             }
@@ -1190,10 +1357,44 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             return;
         }
 
-        List<String> sortedMetadataFileList = remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
-            MetadataFilenameUtils.METADATA_PREFIX,
-            Integer.MAX_VALUE
-        );
+        // ── S-6: Skip LIST entirely when local count is known to be ≤ retention limit ─────────────
+        // localMetadataFileCount is -1 until the first real LIST (via init/initializeToSpecificCommit
+        // or the block below). It's kept accurate via uploadMetadata increments and GC decrements.
+        // This is a safe lower-bound check: if count ≤ limit, the full LIST early-exit is guaranteed.
+        int knownCount = localMetadataFileCount.get();
+        if (knownCount >= 0 && knownCount <= lastNMetadataFilesToKeep) {
+            logger.debug(
+                "Skipping segment GC LIST — local metadata file count={} ≤ lastNMetadataFilesToKeep={}",
+                knownCount,
+                lastNMetadataFilesToKeep
+            );
+            return;
+        }
+
+        // ── S-1: Use cached metadata list when nothing new has been uploaded since last GC ─────────
+        // The cache is keyed on metadataUploadCounter. Since only the primary writes metadata and we
+        // increment the counter on every successful upload, a matching counter means the set on S3 is
+        // identical to the cached list (no new files added). The list may have shrunk (GC deleted some)
+        // but we only use it for "do we have enough files to GC?" — which remains correct on shrinkage.
+        long currentUploadCounter = metadataUploadCounter.get();
+        List<String> sortedMetadataFileList;
+        if (cachedMetadataFileList != null && cachedMetadataListUploadCounter == currentUploadCounter) {
+            sortedMetadataFileList = cachedMetadataFileList;
+            logger.trace("S-1: reusing cached metadata file list (upload counter unchanged at {})", currentUploadCounter);
+        } else {
+            sortedMetadataFileList = remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
+                MetadataFilenameUtils.METADATA_PREFIX,
+                Integer.MAX_VALUE
+            );
+            // Update S-6 local count from the actual LIST result (ground truth).
+            localMetadataFileCount.set(sortedMetadataFileList.size());
+            // Cache the result and the counter value for the next GC run.
+            cachedMetadataFileList = sortedMetadataFileList;
+            cachedMetadataListUploadCounter = currentUploadCounter;
+            // Invalidate active segment cache since the list changed.
+            cachedActiveFilterSet = null;
+        }
+
         if (sortedMetadataFileList.size() <= lastNMetadataFilesToKeep) {
             logger.debug(
                 "Number of commits in remote segment store={}, lastNMetadataFilesToKeep={}",
@@ -1251,65 +1452,121 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             metadataFilesToBeDeleted
         );
 
-        Map<String, UploadedSegmentMetadata> activeSegmentFilesMetadataMap = new HashMap<>();
-        Set<String> activeSegmentRemoteFilenames = new HashSet<>();
-        // Collect active archive blob names directly from active metadata — no extra LIST needed.
-        Set<String> activeArchiveBlobNames = new HashSet<>();
-
         final Set<String> metadataFilesToFilterActiveSegments = getMetadataFilesToFilterActiveSegments(
             lastNMetadataFilesToKeep,
             sortedMetadataFileList,
             allLockFiles
         );
 
-        for (String metadataFile : metadataFilesToFilterActiveSegments) {
-            RemoteSegmentMetadata activeMeta = readMetadataFile(metadataFile);
-            Map<String, UploadedSegmentMetadata> segmentMetadataMap = activeMeta.getMetadata();
-            activeSegmentFilesMetadataMap.putAll(segmentMetadataMap);
-            activeSegmentRemoteFilenames.addAll(
-                segmentMetadataMap.values().stream().map(metadata -> metadata.uploadedFilename).collect(Collectors.toSet())
-            );
-            if (activeMeta.isArchiveEnabled() && activeMeta.getArchiveBlob() != null) {
-                activeArchiveBlobNames.add(activeMeta.getArchiveBlob());
+        // ── S-3: Cache active segment GETs across consecutive GC runs ────────────────────────────────
+        // The active boundary metadata files change only when new uploads happen (which changes
+        // metadataUploadCounter and thus cachedMetadataListUploadCounter, invalidating this cache).
+        // When the upload counter hasn't changed AND the filter set is identical, we skip re-reading.
+        Map<String, UploadedSegmentMetadata> activeSegmentFilesMetadataMap;
+        Set<String> activeSegmentRemoteFilenames;
+        Set<String> activeArchiveBlobNames;
+        if (cachedActiveFilterSet != null && cachedActiveFilterSet.equals(metadataFilesToFilterActiveSegments)
+                && cachedActiveSegmentFilenames != null) {
+            activeSegmentFilesMetadataMap = cachedActiveSegmentMetadataMap;
+            activeSegmentRemoteFilenames = cachedActiveSegmentFilenames;
+            activeArchiveBlobNames = cachedActiveArchiveBlobNames;
+            logger.trace("S-3: reusing cached active segment set ({} files)", activeSegmentRemoteFilenames.size());
+        } else {
+            activeSegmentFilesMetadataMap = new HashMap<>();
+            activeSegmentRemoteFilenames = new HashSet<>();
+            activeArchiveBlobNames = new HashSet<>();
+            for (String metadataFile : metadataFilesToFilterActiveSegments) {
+                RemoteSegmentMetadata activeMeta = readMetadataFile(metadataFile);
+                Map<String, UploadedSegmentMetadata> segmentMetadataMap = activeMeta.getMetadata();
+                activeSegmentFilesMetadataMap.putAll(segmentMetadataMap);
+                activeSegmentRemoteFilenames.addAll(
+                    segmentMetadataMap.values().stream().map(metadata -> metadata.uploadedFilename).collect(Collectors.toSet())
+                );
+                if (activeMeta.isArchiveEnabled() && activeMeta.getArchiveBlob() != null) {
+                    activeArchiveBlobNames.add(activeMeta.getArchiveBlob());
+                }
             }
+            cachedActiveFilterSet = metadataFilesToFilterActiveSegments;
+            cachedActiveSegmentFilenames = activeSegmentRemoteFilenames;
+            cachedActiveArchiveBlobNames = activeArchiveBlobNames;
+            cachedActiveSegmentMetadataMap = activeSegmentFilesMetadataMap;
         }
+
         Set<String> deletedSegmentFiles = new HashSet<>();
+        // ── S-4: Skip readMetadataFile() GET when stale archive blob already processed ──────────────
+        // With archive ON, every UploadedSegmentMetadata.uploadedFilename within one metadata file
+        // is the same archiveBlobName (the TAR blob). Once a TAR has been deleted or confirmed stale,
+        // subsequent metadata files referencing that same TAR need no data deletion — only metadata
+        // file deletion. We track processed archive blob names and skip the GET for those files.
+        //
+        // To skip the GET, we need to know the archive blob name WITHOUT reading the file. We derive
+        // it from segmentsUploadedToRemoteStore: the in-memory map (keyed by local filename) stores
+        // the uploadedFilename (= archiveBlobName for archive-ON). Since all local files in a given
+        // TAR period share the same uploadedFilename, we use the first local segment we find whose
+        // uploaded filename is an archive blob. This is a best-effort peek; on cache miss we fall back
+        // to the full readMetadataFile() GET.
+        Set<String> deletedOrSkippedArchiveBlobs = new HashSet<>();
         for (String metadataFile : metadataFilesToBeDeleted) {
-            RemoteSegmentMetadata staleMeta = readMetadataFile(metadataFile);
-            Map<String, UploadedSegmentMetadata> staleSegmentFilesMetadataMap = staleMeta.getMetadata();
-            Set<String> staleSegmentRemoteFilenames = staleSegmentFilesMetadataMap.values()
-                .stream()
-                .map(metadata -> metadata.uploadedFilename)
+            // S-4 pre-read skip: try to derive the archive blob name without a GET.
+            // We look up any local segment file whose uploaded name is an archive blob.
+            // If the derived blob is already in deletedOrSkippedArchiveBlobs AND not active, skip.
+            Set<String> derivedUploadedNames = segmentsUploadedToRemoteStore.values().stream()
+                .map(m -> m.uploadedFilename)
+                .filter(SegmentArchiveRetentionHelper::isArchiveBlob)
                 .collect(Collectors.toSet());
-            AtomicBoolean deletionSuccessful = new AtomicBoolean(true);
-            staleSegmentRemoteFilenames.stream()
-                .filter(file -> activeSegmentRemoteFilenames.contains(file) == false)
-                .filter(file -> deletedSegmentFiles.contains(file) == false)
-                .forEach(file -> {
-                    try {
-                        remoteDataDirectory.deleteFile(file);
-                        deletedSegmentFiles.add(file);
-                        if (!activeSegmentFilesMetadataMap.containsKey(getLocalSegmentFilename(file))) {
-                            segmentsUploadedToRemoteStore.remove(getLocalSegmentFilename(file));
-                        }
-                    } catch (NoSuchFileException e) {
-                        logger.info("Segment file {} corresponding to metadata file {} does not exist in remote", file, metadataFile);
-                    } catch (IOException e) {
-                        deletionSuccessful.set(false);
-                        logger.warn(
-                            "Exception while deleting segment file {} corresponding to metadata file {}. Deletion will be re-tried",
-                            file,
-                            metadataFile
-                        );
-                    }
-                });
-            // Note: when archive is ON, UploadedSegmentMetadata.uploadedFilename = archiveBlobName for ALL files
-            // in that archive. The Set deduplication above means the archive TAR is deleted exactly once
-            // via the staleSegmentRemoteFilenames loop — no explicit archive blob deletion needed here.
-            if (deletionSuccessful.get()) {
-                logger.debug("Deleting stale metadata file {} from remote segment store", metadataFile);
-                remoteMetadataDirectory.deleteFile(metadataFile);
+            boolean skippedViaS4 = false;
+            if (!derivedUploadedNames.isEmpty()
+                    && derivedUploadedNames.stream().noneMatch(activeSegmentRemoteFilenames::contains)
+                    && derivedUploadedNames.stream().allMatch(deletedOrSkippedArchiveBlobs::contains)) {
+                // All derived archive blobs for this shard are already processed and not active.
+                logger.debug("S-4: skipping readMetadataFile GET for {} — archive blob already processed", metadataFile);
+                skippedViaS4 = true;
             }
+
+            if (!skippedViaS4) {
+                RemoteSegmentMetadata staleMeta = readMetadataFile(metadataFile);
+                Map<String, UploadedSegmentMetadata> staleSegmentFilesMetadataMap = staleMeta.getMetadata();
+                Set<String> staleSegmentRemoteFilenames = staleSegmentFilesMetadataMap.values()
+                    .stream()
+                    .map(metadata -> metadata.uploadedFilename)
+                    .collect(Collectors.toSet());
+
+                AtomicBoolean deletionSuccessful = new AtomicBoolean(true);
+                staleSegmentRemoteFilenames.stream()
+                    .filter(file -> activeSegmentRemoteFilenames.contains(file) == false)
+                    .filter(file -> deletedSegmentFiles.contains(file) == false)
+                    .forEach(file -> {
+                        try {
+                            remoteDataDirectory.deleteFile(file);
+                            deletedSegmentFiles.add(file);
+                            deletedOrSkippedArchiveBlobs.add(file);
+                            if (!activeSegmentFilesMetadataMap.containsKey(getLocalSegmentFilename(file))) {
+                                segmentsUploadedToRemoteStore.remove(getLocalSegmentFilename(file));
+                            }
+                        } catch (NoSuchFileException e) {
+                            logger.info("Segment file {} corresponding to metadata file {} does not exist in remote", file, metadataFile);
+                            deletedOrSkippedArchiveBlobs.add(file); // mark processed even if missing
+                        } catch (IOException e) {
+                            deletionSuccessful.set(false);
+                            logger.warn(
+                                "Exception while deleting segment file {} corresponding to metadata file {}. Deletion will be re-tried",
+                                file,
+                                metadataFile
+                            );
+                        }
+                    });
+                if (!deletionSuccessful.get()) {
+                    continue;
+                }
+            }
+            // Note: when archive is ON, UploadedSegmentMetadata.uploadedFilename = archiveBlobName for ALL
+            // files in that archive — Set deduplication above deletes the TAR exactly once.
+            logger.debug("Deleting stale metadata file {} from remote segment store", metadataFile);
+            remoteMetadataDirectory.deleteFile(metadataFile);
+            // S-6: decrement local count on successful metadata deletion.
+            localMetadataFileCount.updateAndGet(c -> c > 0 ? c - 1 : 0);
+            // Invalidate cached list since it no longer reflects actual S3 state.
+            cachedMetadataFileList = null;
         }
         logger.debug("deletedSegmentFiles={}", deletedSegmentFiles);
 
@@ -1318,9 +1575,14 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         // These blobs are invisible to the stale-metadata loop above because no metadata file
         // references them — they can only be found by listing the data directory.
         //
-        // We piggyback on the activeSegmentRemoteFilenames set already built above:
-        // any TAR blob in the data dir that is NOT in activeSegmentRemoteFilenames and was NOT
-        // already deleted in this GC run is orphaned and safe to delete.
+        // We use a dirty flag (archiveUploadDirty) to skip the S3 LIST in the happy path:
+        // the flag is set true when a TAR upload succeeds but before metadata write, and cleared
+        // only on successful metadata write. Only when the flag is true (metadata write failed
+        // or in-progress) do we need to search for orphans via listAll().
+        if (!archiveUploadDirty.get()) {
+            // Happy path: no pending unacknowledged archive upload — no orphans possible.
+            return;
+        }
         try {
             String[] allDataBlobsRaw = remoteDataDirectory.listAll();
             if (allDataBlobsRaw == null) {
