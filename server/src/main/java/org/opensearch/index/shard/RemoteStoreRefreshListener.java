@@ -378,9 +378,29 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         resetBackOffDelayIterator();
         // Set the minimum sequence number for keeping translog
         ((InternalEngine) indexShard.getEngine()).translogManager().setMinSeqNoToKeep(lastRefreshedCheckpoint + 1);
+        // Embed the uploaded metadata filename so replicas can skip the S3 LIST (Option A optimization).
+        // lastUploadedMetadataFilename is set by uploadMetadata() earlier in the same sync cycle.
+        String metadataFilename = lastUploadedMetadataFilename;
+        ReplicationCheckpoint checkpointToPublish = metadataFilename != null
+            ? new ReplicationCheckpoint(
+                checkpoint.getShardId(),
+                checkpoint.getPrimaryTerm(),
+                checkpoint.getSegmentsGen(),
+                checkpoint.getSegmentInfosVersion(),
+                checkpoint.getLength(),
+                checkpoint.getCodec(),
+                checkpoint.getMetadataMap(),
+                metadataFilename
+            )
+            : checkpoint;
         // Publishing the new checkpoint which is used for remote store + segrep indexes
-        checkpointPublisher.publish(indexShard, checkpoint);
-        logger.debug("onSuccessfulSegmentsSync lastRefreshedCheckpoint={} checkpoint={}", lastRefreshedCheckpoint, checkpoint);
+        checkpointPublisher.publish(indexShard, checkpointToPublish);
+        logger.debug(
+            "onSuccessfulSegmentsSync lastRefreshedCheckpoint={} checkpoint={} metadataFilename={}",
+            lastRefreshedCheckpoint,
+            checkpoint,
+            metadataFilename
+        );
     }
 
     /**
@@ -434,6 +454,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
             throw new UnsupportedOperationException("Encountered null TranslogGeneration while uploading metadata to remote segment store");
         } else {
             long translogFileGeneration = translogGeneration.translogFileGeneration;
+            String uploadedMetadataFilename;
             if (indexShard.indexSettings().isSegmentArchiveUploadEnabled() && lastArchiveBlobName != null && lastArchiveEntries != null) {
                 // Snapshot archive state before upload — clear it unconditionally (success OR failure)
                 // to prevent stale archive references on the next refresh cycle.
@@ -445,7 +466,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                 this.lastArchiveEntries = null;
                 this.lastArchiveBlobLength = -1L;
                 // Upload metadata with archive fields (including blob length for zero-LIST recovery reads)
-                remoteDirectory.uploadMetadata(
+                uploadedMetadataFilename = remoteDirectory.uploadMetadata(
                     localSegmentsPostRefresh,
                     segmentInfosSnapshot,
                     storeDirectory,
@@ -457,7 +478,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                     archiveBlobLength
                 );
             } else {
-                remoteDirectory.uploadMetadata(
+                uploadedMetadataFilename = remoteDirectory.uploadMetadata(
                     localSegmentsPostRefresh,
                     segmentInfosSnapshot,
                     storeDirectory,
@@ -466,8 +487,19 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                     indexShard.getNodeId()
                 );
             }
+            // Embed the uploaded metadata filename into the checkpoint so replicas can skip the S3 LIST
+            // in RemoteSegmentStoreDirectory.init() and do a direct GET instead (Option A optimization).
+            lastUploadedMetadataFilename = uploadedMetadataFilename;
         }
     }
+
+    /**
+     * The filename of the most recently uploaded segment metadata file.
+     * Set after each successful {@link #uploadMetadata} call and embedded into the replication
+     * checkpoint via {@link #onSuccessfulSegmentsSync} so replicas can do a direct S3 GET
+     * instead of a LIST to discover the latest metadata.
+     */
+    volatile String lastUploadedMetadataFilename = null;
 
     private void uploadNewSegments(
         Collection<String> localSegmentsPostRefresh,

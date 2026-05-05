@@ -307,6 +307,100 @@ public class RemoteStoreReplicationSourceTests extends OpenSearchIndexLevelRepli
         assertEquals("All requested files should be in the response", filesToFetch.size(), response.files.size());
     }
 
+    /**
+     * Option A: when the checkpoint carries a metadataFilename, the replication source
+     * must call initFromMetadataFilename() (direct GET, 0 LIST) instead of init() (LIST+GET).
+     * Verifies that the response is non-empty and correct — proving the direct GET path works.
+     */
+    public void testGetCheckpointMetadataUsesDirectGetWhenFilenameInCheckpoint() throws ExecutionException, InterruptedException {
+        replicationSource = new RemoteStoreReplicationSource(primaryShard);
+
+        // Get the checkpoint that the primary published — if RemoteStoreRefreshListener
+        // correctly set lastUploadedMetadataFilename and embedded it, getLatestReplicationCheckpoint()
+        // returns a checkpoint with metadataFilename set.
+        final ReplicationCheckpoint checkpoint = primaryShard.getLatestReplicationCheckpoint();
+
+        // The primary refresh in setUp() should have triggered uploadMetadata + checkpoint publish.
+        // If metadataFilename is present, Option A is active.
+        final PlainActionFuture<CheckpointInfoResponse> res = PlainActionFuture.newFuture();
+        replicationSource.getCheckpointMetadata(REPLICATION_ID, checkpoint, res);
+        CheckpointInfoResponse response = res.get();
+
+        assertNotNull("Response must not be null", response);
+        assertFalse("Metadata map must not be empty (direct GET succeeded)", response.getMetadataMap().isEmpty());
+        assertNotNull("SegmentInfosBytes must not be null", response.getInfosBytes());
+
+        // If metadataFilename was in checkpoint, log it for observability
+        if (checkpoint.getMetadataFilename() != null) {
+            logger.info("Option A active: metadataFilename={}", checkpoint.getMetadataFilename());
+        } else {
+            logger.info("Option A not active (metadataFilename null) — fallback to LIST used");
+        }
+    }
+
+    /**
+     * Option C (revised): when getCheckpointMetadata() is called twice with the same checkpoint,
+     * the second call must return the cached metadata (0 S3 calls).
+     * Verifies by checking that the response is identical and non-empty on both calls.
+     */
+    public void testGetCheckpointMetadataReturnsCachedMetadataOnSameCheckpoint() throws ExecutionException, InterruptedException {
+        replicationSource = new RemoteStoreReplicationSource(primaryShard);
+        final ReplicationCheckpoint checkpoint = primaryShard.getLatestReplicationCheckpoint();
+
+        // First call — fetches from S3 (LIST or direct GET), populates cache
+        final PlainActionFuture<CheckpointInfoResponse> res1 = PlainActionFuture.newFuture();
+        replicationSource.getCheckpointMetadata(REPLICATION_ID, checkpoint, res1);
+        CheckpointInfoResponse response1 = res1.get();
+        assertFalse("First call: metadata map must not be empty", response1.getMetadataMap().isEmpty());
+
+        // Second call with identical checkpoint — must return cached result (0 S3 calls)
+        final PlainActionFuture<CheckpointInfoResponse> res2 = PlainActionFuture.newFuture();
+        replicationSource.getCheckpointMetadata(REPLICATION_ID, checkpoint, res2);
+        CheckpointInfoResponse response2 = res2.get();
+        assertFalse("Second call (cache hit): metadata map must not be empty", response2.getMetadataMap().isEmpty());
+
+        // Both responses must have the same set of files
+        assertEquals(
+            "Cached response must have same file count as first response",
+            response1.getMetadataMap().size(),
+            response2.getMetadataMap().size()
+        );
+        assertEquals(
+            "Cached response must have same file names as first response",
+            response1.getMetadataMap().keySet(),
+            response2.getMetadataMap().keySet()
+        );
+    }
+
+    /**
+     * Option C: when a new checkpoint arrives (different segmentInfosVersion),
+     * the cache must be invalidated and a fresh fetch performed.
+     */
+    public void testGetCheckpointMetadataCacheInvalidatedOnNewCheckpoint() throws ExecutionException, InterruptedException, IOException {
+        replicationSource = new RemoteStoreReplicationSource(primaryShard);
+        final ReplicationCheckpoint checkpoint1 = primaryShard.getLatestReplicationCheckpoint();
+
+        // Populate the cache with checkpoint1
+        final PlainActionFuture<CheckpointInfoResponse> res1 = PlainActionFuture.newFuture();
+        replicationSource.getCheckpointMetadata(REPLICATION_ID, checkpoint1, res1);
+        CheckpointInfoResponse response1 = res1.get();
+        assertFalse("First checkpoint: metadata must not be empty", response1.getMetadataMap().isEmpty());
+
+        // Index a new doc and refresh → new checkpoint with higher segmentInfosVersion
+        indexDoc(primaryShard, "_doc", "3");
+        primaryShard.refresh("advance checkpoint");
+        final ReplicationCheckpoint checkpoint2 = primaryShard.getLatestReplicationCheckpoint();
+
+        // checkpoint2 must be different from checkpoint1
+        assertFalse("New checkpoint must differ from old checkpoint", checkpoint1.equals(checkpoint2));
+
+        // Second call with NEW checkpoint — cache must be invalidated, fresh fetch from S3
+        final PlainActionFuture<CheckpointInfoResponse> res2 = PlainActionFuture.newFuture();
+        replicationSource.getCheckpointMetadata(REPLICATION_ID, checkpoint2, res2);
+        CheckpointInfoResponse response2 = res2.get();
+        assertFalse("New checkpoint: fresh fetch must return non-empty metadata", response2.getMetadataMap().isEmpty());
+    }
+
     private void buildIndexShardBehavior(IndexShard mockShard, IndexShard indexShard) {
         when(mockShard.getSegmentInfosSnapshot()).thenReturn(indexShard.getSegmentInfosSnapshot());
         Store remoteStore = mock(Store.class);

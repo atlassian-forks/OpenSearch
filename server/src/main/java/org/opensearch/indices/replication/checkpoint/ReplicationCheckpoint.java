@@ -38,6 +38,14 @@ public class ReplicationCheckpoint implements Writeable, Comparable<ReplicationC
     private final long length;
     private final String codec;
     private final Map<String, StoreFileMetadata> metadataMap;
+    /**
+     * The S3 metadata filename uploaded by the primary for this checkpoint.
+     * When non-null, replicas can skip the S3 LIST call in {@code RemoteSegmentStoreDirectory.init()}
+     * and do a direct GET instead ({@code readMetadataFile(metadataFilename)}).
+     * Null for checkpoints published by older nodes (backward compat — fallback to LIST).
+     */
+    @Nullable
+    private final String metadataFilename;
 
     public static ReplicationCheckpoint empty(ShardId shardId) {
         return empty(shardId, "");
@@ -55,6 +63,7 @@ public class ReplicationCheckpoint implements Writeable, Comparable<ReplicationC
         length = 0L;
         this.codec = codec;
         this.metadataMap = Collections.emptyMap();
+        this.metadataFilename = null;
     }
 
     public ReplicationCheckpoint(ShardId shardId, long primaryTerm, long segmentsGen, long segmentInfosVersion, String codec) {
@@ -70,6 +79,19 @@ public class ReplicationCheckpoint implements Writeable, Comparable<ReplicationC
         String codec,
         Map<String, StoreFileMetadata> metadataMap
     ) {
+        this(shardId, primaryTerm, segmentsGen, segmentInfosVersion, length, codec, metadataMap, null);
+    }
+
+    public ReplicationCheckpoint(
+        ShardId shardId,
+        long primaryTerm,
+        long segmentsGen,
+        long segmentInfosVersion,
+        long length,
+        String codec,
+        Map<String, StoreFileMetadata> metadataMap,
+        @Nullable String metadataFilename
+    ) {
         this.shardId = shardId;
         this.primaryTerm = primaryTerm;
         this.segmentsGen = segmentsGen;
@@ -77,6 +99,7 @@ public class ReplicationCheckpoint implements Writeable, Comparable<ReplicationC
         this.length = length;
         this.codec = codec;
         this.metadataMap = metadataMap;
+        this.metadataFilename = metadataFilename;
     }
 
     public ReplicationCheckpoint(StreamInput in) throws IOException {
@@ -95,6 +118,13 @@ public class ReplicationCheckpoint implements Writeable, Comparable<ReplicationC
             this.metadataMap = in.readMap(StreamInput::readString, StoreFileMetadata::new);
         } else {
             this.metadataMap = Collections.emptyMap();
+        }
+        // metadataFilename: written by nodes that support this optimization (fork-local)
+        // Use a version that is always true for our fork builds — read as optional string
+        if (in.available() > 0) {
+            this.metadataFilename = in.readOptionalString();
+        } else {
+            this.metadataFilename = null;
         }
     }
 
@@ -159,6 +189,18 @@ public class ReplicationCheckpoint implements Writeable, Comparable<ReplicationC
         if (out.getVersion().onOrAfter(Version.V_2_10_0)) {
             out.writeMap(metadataMap, StreamOutput::writeString, (valueOut, fc) -> fc.writeTo(valueOut));
         }
+        // Always write metadataFilename (fork-local field — all nodes in our cluster support this)
+        out.writeOptionalString(metadataFilename);
+    }
+
+    /**
+     * Returns the S3 metadata filename for this checkpoint, or {@code null} if not available.
+     * When non-null, replicas can skip the S3 LIST in {@code RemoteSegmentStoreDirectory.init()}
+     * and do a direct GET via {@code readMetadataFile(metadataFilename)}.
+     */
+    @Nullable
+    public String getMetadataFilename() {
+        return metadataFilename;
     }
 
     @Override

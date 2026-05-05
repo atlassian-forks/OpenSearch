@@ -302,6 +302,33 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     public RemoteSegmentMetadata init() throws IOException {
         logger.debug("Start initialisation of remote segment metadata");
         RemoteSegmentMetadata remoteSegmentMetadata = readLatestMetadataFile();
+        applyMetadata(remoteSegmentMetadata);
+        logger.debug("Initialisation of remote segment metadata completed");
+        return remoteSegmentMetadata;
+    }
+
+    /**
+     * Initialise directory state from a known metadata filename, skipping the S3 LIST call.
+     * Used by replicas when the primary has provided the filename via {@link
+     * org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint#getMetadataFilename()}.
+     *
+     * @param metadataFilename the exact S3 key of the metadata file to read
+     * @return the parsed {@link RemoteSegmentMetadata}
+     * @throws IOException on S3 read failure
+     */
+    public RemoteSegmentMetadata initFromMetadataFilename(String metadataFilename) throws IOException {
+        logger.debug("Start initialisation of remote segment metadata from known filename {}", metadataFilename);
+        RemoteSegmentMetadata remoteSegmentMetadata = readMetadataFile(metadataFilename);
+        applyMetadata(remoteSegmentMetadata);
+        logger.debug("Initialisation of remote segment metadata from known filename completed");
+        return remoteSegmentMetadata;
+    }
+
+    /**
+     * Apply parsed {@link RemoteSegmentMetadata} to directory state.
+     * Shared by {@link #init()} and {@link #initFromMetadataFilename(String)}.
+     */
+    private void applyMetadata(RemoteSegmentMetadata remoteSegmentMetadata) {
         if (remoteSegmentMetadata != null) {
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>(remoteSegmentMetadata.getMetadata());
             if (remoteSegmentMetadata.isArchiveEnabled()) {
@@ -319,7 +346,6 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             this.segmentsUploadedToRemoteStore = new ConcurrentHashMap<>();
             archiveStateRef.set(null);
         }
-        logger.debug("Initialisation of remote segment metadata completed");
         // S-1/S-6: invalidate all caches — state is reset from S3, counters are unknown.
         cachedMetadataFileList = null;
         cachedMetadataListUploadCounter = Long.MIN_VALUE;
@@ -328,7 +354,6 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         cachedActiveSegmentFilenames = null;
         cachedActiveArchiveBlobNames = null;
         cachedActiveSegmentMetadataMap = null;
-        return remoteSegmentMetadata;
     }
 
     /**
@@ -1088,7 +1113,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @param nodeId node id
      * @throws IOException in case of I/O error while uploading the metadata file
      */
-    public void uploadMetadata(
+    public String uploadMetadata(
         Collection<String> segmentFiles,
         SegmentInfos segmentInfosSnapshot,
         Directory storeDirectory,
@@ -1141,6 +1166,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             } finally {
                 tryAndDeleteLocalFile(metadataFilename, storeDirectory);
             }
+            return metadataFilename;
         }
     }
 
@@ -1148,7 +1174,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * Upload metadata file with archive fields.
      * This overload includes the archive blob name and per-file archive entries (offset, length, checksum).
      */
-    public void uploadMetadata(
+    public String uploadMetadata(
         Collection<String> segmentFiles,
         SegmentInfos segmentInfosSnapshot,
         Directory storeDirectory,
@@ -1158,11 +1184,11 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         String archiveBlobName,
         Map<String, SegmentArchiveEntry> archiveEntries
     ) throws IOException {
-        uploadMetadata(segmentFiles, segmentInfosSnapshot, storeDirectory, translogGeneration,
+        return uploadMetadata(segmentFiles, segmentInfosSnapshot, storeDirectory, translogGeneration,
             replicationCheckpoint, nodeId, archiveBlobName, archiveEntries, -1L);
     }
 
-    public void uploadMetadata(
+    public String uploadMetadata(
         Collection<String> segmentFiles,
         SegmentInfos segmentInfosSnapshot,
         Directory storeDirectory,
@@ -1223,6 +1249,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             } finally {
                 tryAndDeleteLocalFile(metadataFilename, storeDirectory);
             }
+            return metadataFilename;
         }
     }
 

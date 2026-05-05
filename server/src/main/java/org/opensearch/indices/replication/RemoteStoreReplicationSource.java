@@ -48,6 +48,15 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
     private final RemoteSegmentStoreDirectory remoteDirectory;
     private final CancellableThreads cancellableThreads = new CancellableThreads();
 
+    /**
+     * Option C (revised): cache the last successfully fetched metadata to avoid redundant S3 calls
+     * when the checkpoint hasn't changed (i.e. no new segments since last replication cycle).
+     * Guarded by the fact that ReplicationCheckpoint equality covers primaryTerm + segmentInfosVersion,
+     * so a new primary term or new segments always produces a different checkpoint → cache miss → fresh fetch.
+     */
+    private volatile ReplicationCheckpoint lastFetchedCheckpoint = null;
+    private volatile RemoteSegmentMetadata lastFetchedMetadata = null;
+
     public RemoteStoreReplicationSource(IndexShard indexShard) {
         this.indexShard = indexShard;
         FilterDirectory remoteStoreDirectory = (FilterDirectory) indexShard.remoteStore().directory();
@@ -62,10 +71,9 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
         ActionListener<CheckpointInfoResponse> listener
     ) {
         Map<String, StoreFileMetadata> metadataMap;
-        // TODO: Need to figure out a way to pass this information for segment metadata via remote store.
         try (final GatedCloseable<SegmentInfos> segmentInfosSnapshot = indexShard.getSegmentInfosSnapshot()) {
             final Version version = segmentInfosSnapshot.get().getCommitLuceneVersion();
-            final RemoteSegmentMetadata mdFile = getRemoteSegmentMetadata();
+            final RemoteSegmentMetadata mdFile = getRemoteSegmentMetadata(checkpoint);
             // During initial recovery flow, the remote store might not
             // have metadata as primary hasn't uploaded anything yet.
             if (mdFile == null && indexShard.state().equals(IndexShardState.STARTED) == false) {
@@ -151,9 +159,55 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
         return "RemoteStoreReplicationSource";
     }
 
-    private RemoteSegmentMetadata getRemoteSegmentMetadata() throws IOException {
+    /**
+     * Fetch remote segment metadata for the given checkpoint, applying two optimizations:
+     *
+     * <p><b>Option C (revised) — checkpoint cache:</b> If the incoming checkpoint equals the last
+     * successfully fetched checkpoint, return the cached {@link RemoteSegmentMetadata} immediately
+     * (0 S3 LIST, 0 S3 GET). Same checkpoint means same {@code primaryTerm + segmentInfosVersion},
+     * i.e. no new segments since the last cycle.
+     *
+     * <p><b>Option A — direct GET via known filename:</b> If the checkpoint carries a
+     * {@link ReplicationCheckpoint#getMetadataFilename()}, skip the S3 LIST and call
+     * {@link RemoteSegmentStoreDirectory#initFromMetadataFilename(String)} instead of
+     * {@link RemoteSegmentStoreDirectory#init()} (0 LIST, 1 GET).
+     *
+     * <p>Falls back to {@link RemoteSegmentStoreDirectory#init()} (1 LIST + 1 GET) when neither
+     * optimization applies (e.g. first fetch after startup, or checkpoint from an older primary).
+     *
+     * @param checkpoint the replication checkpoint received from the primary
+     * @return the fetched (or cached) segment metadata
+     * @throws IOException on S3 read failure
+     */
+    private RemoteSegmentMetadata getRemoteSegmentMetadata(ReplicationCheckpoint checkpoint) throws IOException {
+        // Option C: return cached metadata if checkpoint hasn't advanced
+        if (checkpoint.equals(lastFetchedCheckpoint) && lastFetchedMetadata != null) {
+            logger.trace(
+                "Returning cached segment metadata for unchanged checkpoint primaryTerm={} segmentInfosVersion={}",
+                checkpoint.getPrimaryTerm(),
+                checkpoint.getSegmentInfosVersion()
+            );
+            return lastFetchedMetadata;
+        }
+
         AtomicReference<RemoteSegmentMetadata> mdFile = new AtomicReference<>();
-        cancellableThreads.executeIO(() -> mdFile.set(remoteDirectory.init()));
-        return mdFile.get();
+        String metadataFilename = checkpoint.getMetadataFilename();
+        if (metadataFilename != null) {
+            // Option A: direct GET — primary told us the exact filename, no LIST needed
+            logger.trace("Fetching segment metadata via direct GET (filename={})", metadataFilename);
+            cancellableThreads.executeIO(() -> mdFile.set(remoteDirectory.initFromMetadataFilename(metadataFilename)));
+        } else {
+            // Fallback: LIST + GET (old behavior — no filename in checkpoint)
+            logger.trace("Fetching segment metadata via LIST (no filename in checkpoint)");
+            cancellableThreads.executeIO(() -> mdFile.set(remoteDirectory.init()));
+        }
+
+        RemoteSegmentMetadata result = mdFile.get();
+        // Update cache on success (result may be null during initial recovery)
+        if (result != null) {
+            lastFetchedCheckpoint = checkpoint;
+            lastFetchedMetadata = result;
+        }
+        return result;
     }
 }
