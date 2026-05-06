@@ -250,6 +250,10 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         try {
             try {
                 initializeRemoteDirectoryOnTermUpdate();
+                // Option A (fix): after init() on term update, seed lastUploadedMetadataFilename
+                // from the directory so the very first checkpoint post-restart embeds the filename,
+                // allowing replicas to use direct GET instead of LIST immediately.
+                seedLastUploadedMetadataFilenameFromDirectory();
                 // if a new segments_N file is present in local that is not uploaded to remote store yet, it
                 // is considered as a first refresh post commit. A cleanup of stale commit files is triggered.
                 // This is done to avoid delete post each refresh.
@@ -779,6 +783,27 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
      * has been uploaded to remote store successfully. This method also updates the segment tracker about the latest
      * uploaded segment files onto remote store.
      */
+    /**
+     * Seeds {@link #lastUploadedMetadataFilename} from the directory's latest known metadata file
+     * after a shard recovery or primary term update. Without this, the field starts {@code null}
+     * and checkpoints published before the first new segment upload have no embedded filename,
+     * forcing replicas to fall back to the expensive S3 LIST (Option A regression after restart).
+     *
+     * <p>Called after {@link org.opensearch.index.store.RemoteSegmentStoreDirectory#init()} has run
+     * during recovery, which seeds {@code latestMetadataFilename} on the directory from the LIST
+     * result. We simply mirror that value here.
+     */
+    void seedLastUploadedMetadataFilenameFromDirectory() {
+        String fromDirectory = remoteDirectory.getLatestMetadataFilename();
+        if (fromDirectory != null && lastUploadedMetadataFilename == null) {
+            lastUploadedMetadataFilename = fromDirectory;
+            logger.debug(
+                "Option A (fix): seeded lastUploadedMetadataFilename={} from directory after recovery",
+                fromDirectory
+            );
+        }
+    }
+
     private void initializeRemoteDirectoryOnTermUpdate() throws IOException {
         if (this.primaryTerm != indexShard.getOperationPrimaryTerm()) {
             logger.trace("primaryTerm update from={} to={}", primaryTerm, indexShard.getOperationPrimaryTerm());

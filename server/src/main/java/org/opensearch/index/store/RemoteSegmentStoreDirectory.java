@@ -245,6 +245,115 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      */
     private final AtomicInteger localMetadataFileCount = new AtomicInteger(-1);
 
+    // ── Option C (fixed): Persistent replication metadata cache ──────────────────────────────────
+    /**
+     * Cache for the last segment metadata fetched for segment replication.
+     * Keyed on {@link org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint} equality,
+     * which covers primaryTerm + segmentInfosVersion — a new checkpoint always busts the cache.
+     *
+     * <p>This cache lives on the {@link RemoteSegmentStoreDirectory} (shard lifetime) rather than
+     * on the ephemeral {@link org.opensearch.indices.replication.RemoteStoreReplicationSource}
+     * (per-replication-round lifetime). This means consecutive replication rounds for the same
+     * checkpoint (i.e. no new segments uploaded) hit the cache and skip the S3 LIST entirely.
+     *
+     * <p>Invalidated (set to {@code null}) on any {@link #applyMetadata} call (i.e. on {@link #init()}
+     * or {@link #initFromMetadataFilename}), since those indicate new state from S3.
+     */
+    private volatile org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint cachedReplicationCheckpoint = null;
+    private volatile org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata cachedReplicationMetadata = null;
+
+    /**
+     * Filename of the most-recently uploaded (or most-recently discovered) segment metadata file.
+     * Set by {@link #uploadMetadata} (via {@link #setLatestMetadataFilename}) and by {@link #init()}
+     * so that after a restart the primary can immediately embed this filename in replication
+     * checkpoints, allowing replicas to use a direct GET instead of a LIST (Option A).
+     */
+    private volatile String latestMetadataFilename = null;
+
+    /**
+     * Returns the filename of the latest segment metadata file known to this directory, or
+     * {@code null} if not yet determined (e.g. before the first {@link #init()} or
+     * {@link #uploadMetadata} call).
+     *
+     * <p>Used by {@link org.opensearch.index.shard.RemoteStoreRefreshListener} to seed
+     * {@code lastUploadedMetadataFilename} after shard recovery, enabling Option A optimization
+     * from the very first replication round post-restart.
+     */
+    public String getLatestMetadataFilename() {
+        return latestMetadataFilename;
+    }
+
+    /**
+     * Called by {@link #uploadMetadata} to record the newly uploaded metadata filename.
+     * Package-private for testing.
+     */
+    void setLatestMetadataFilename(String filename) {
+        this.latestMetadataFilename = filename;
+    }
+
+    /**
+     * Fetch segment metadata for a replication round, using a persistent shard-level cache.
+     *
+     * <p>If {@code checkpoint} equals the last successfully fetched checkpoint AND the cached
+     * metadata is non-null, return the cache without any S3 call. Otherwise, fetch from S3:
+     * <ul>
+     *   <li>If {@code metadataFilename} is non-null (Option A): direct GET — no LIST.</li>
+     *   <li>Otherwise (fallback): LIST + GET via {@link #init()}.</li>
+     * </ul>
+     *
+     * <p>The cache is keyed on checkpoint equality (primaryTerm + segmentInfosVersion). A new
+     * primary term or new segments always produces a different checkpoint → cache miss → fresh fetch.
+     *
+     * @param checkpoint      the replication checkpoint to fetch metadata for
+     * @param metadataFilename optional explicit S3 key (Option A); may be {@code null}
+     * @return the parsed {@link org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata},
+     *         or {@code null} during initial recovery before the first upload
+     * @throws IOException on S3 read failure
+     */
+    public org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata getOrFetchMetadataForReplication(
+        org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint checkpoint,
+        String metadataFilename
+    ) throws IOException {
+        // Option C (fixed): cache is on the directory — survives across source instances
+        if (checkpoint.equals(cachedReplicationCheckpoint) && cachedReplicationMetadata != null) {
+            logger.trace(
+                "replication-metadata-cache: HIT shard={} primaryTerm={} segmentInfosVersion={} — skipping S3 LIST/GET",
+                checkpoint.getShardId(),
+                checkpoint.getPrimaryTerm(),
+                checkpoint.getSegmentInfosVersion()
+            );
+            return cachedReplicationMetadata;
+        }
+
+        org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata result;
+        if (metadataFilename != null) {
+            // Option A: direct GET — primary told us the exact filename, no LIST needed
+            logger.trace(
+                "replication-metadata-cache: MISS (Option A direct-GET) shard={} primaryTerm={} segmentInfosVersion={} filename={}",
+                checkpoint.getShardId(),
+                checkpoint.getPrimaryTerm(),
+                checkpoint.getSegmentInfosVersion(),
+                metadataFilename
+            );
+            result = initFromMetadataFilename(metadataFilename);
+        } else {
+            // Fallback: LIST + GET (old behavior — no filename in checkpoint)
+            logger.trace(
+                "replication-metadata-cache: MISS (LIST fallback) shard={} primaryTerm={} segmentInfosVersion={} — metadataFilename null in checkpoint (Option A not active)",
+                checkpoint.getShardId(),
+                checkpoint.getPrimaryTerm(),
+                checkpoint.getSegmentInfosVersion()
+            );
+            result = init();
+        }
+
+        if (result != null) {
+            cachedReplicationCheckpoint = checkpoint;
+            cachedReplicationMetadata = result;
+        }
+        return result;
+    }
+
     // ── S-1: Cached metadata file list to skip re-LIST when nothing changed ──────────────────────
     /**
      * Cached result of the most recent {@code listFilesByPrefixInLexicographicOrder} call
@@ -354,6 +463,9 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         cachedActiveSegmentFilenames = null;
         cachedActiveArchiveBlobNames = null;
         cachedActiveSegmentMetadataMap = null;
+        // Option C: invalidate replication cache — directory state has changed.
+        cachedReplicationCheckpoint = null;
+        cachedReplicationMetadata = null;
     }
 
     /**
@@ -460,6 +572,10 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             String latestMetadataFile = metadataFiles.get(0);
             logger.trace("Reading latest Metadata file {}", latestMetadataFile);
             remoteSegmentMetadata = readMetadataFile(latestMetadataFile);
+            // Option A (fix): seed latestMetadataFilename from S3 so that RemoteStoreRefreshListener
+            // can immediately embed it in replication checkpoints after a restart, allowing replicas
+            // to use a direct GET instead of a LIST from the very first replication round.
+            latestMetadataFilename = latestMetadataFile;
         } else {
             logger.trace("No metadata file found, this can happen for new index with no data uploaded to remote segment store");
         }

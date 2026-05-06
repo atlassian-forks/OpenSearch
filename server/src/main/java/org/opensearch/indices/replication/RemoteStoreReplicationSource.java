@@ -48,14 +48,9 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
     private final RemoteSegmentStoreDirectory remoteDirectory;
     private final CancellableThreads cancellableThreads = new CancellableThreads();
 
-    /**
-     * Option C (revised): cache the last successfully fetched metadata to avoid redundant S3 calls
-     * when the checkpoint hasn't changed (i.e. no new segments since last replication cycle).
-     * Guarded by the fact that ReplicationCheckpoint equality covers primaryTerm + segmentInfosVersion,
-     * so a new primary term or new segments always produces a different checkpoint → cache miss → fresh fetch.
-     */
-    private volatile ReplicationCheckpoint lastFetchedCheckpoint = null;
-    private volatile RemoteSegmentMetadata lastFetchedMetadata = null;
+    // Option C cache has been moved to RemoteSegmentStoreDirectory.getOrFetchMetadataForReplication()
+    // so that the cache survives across new RemoteStoreReplicationSource instances (which are created
+    // fresh per replication round by SegmentReplicationSourceFactory).
 
     public RemoteStoreReplicationSource(IndexShard indexShard) {
         this.indexShard = indexShard;
@@ -180,34 +175,14 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
      * @throws IOException on S3 read failure
      */
     private RemoteSegmentMetadata getRemoteSegmentMetadata(ReplicationCheckpoint checkpoint) throws IOException {
-        // Option C: return cached metadata if checkpoint hasn't advanced
-        if (checkpoint.equals(lastFetchedCheckpoint) && lastFetchedMetadata != null) {
-            logger.trace(
-                "Returning cached segment metadata for unchanged checkpoint primaryTerm={} segmentInfosVersion={}",
-                checkpoint.getPrimaryTerm(),
-                checkpoint.getSegmentInfosVersion()
-            );
-            return lastFetchedMetadata;
-        }
-
+        // Delegate to the directory-level cache (Option C fix) + Option A direct GET.
+        // The cache in RemoteSegmentStoreDirectory persists across replication rounds
+        // because it lives on the shard's directory object, not on this ephemeral source instance.
         AtomicReference<RemoteSegmentMetadata> mdFile = new AtomicReference<>();
         String metadataFilename = checkpoint.getMetadataFilename();
-        if (metadataFilename != null) {
-            // Option A: direct GET — primary told us the exact filename, no LIST needed
-            logger.trace("Fetching segment metadata via direct GET (filename={})", metadataFilename);
-            cancellableThreads.executeIO(() -> mdFile.set(remoteDirectory.initFromMetadataFilename(metadataFilename)));
-        } else {
-            // Fallback: LIST + GET (old behavior — no filename in checkpoint)
-            logger.trace("Fetching segment metadata via LIST (no filename in checkpoint)");
-            cancellableThreads.executeIO(() -> mdFile.set(remoteDirectory.init()));
-        }
-
-        RemoteSegmentMetadata result = mdFile.get();
-        // Update cache on success (result may be null during initial recovery)
-        if (result != null) {
-            lastFetchedCheckpoint = checkpoint;
-            lastFetchedMetadata = result;
-        }
-        return result;
+        cancellableThreads.executeIO(
+            () -> mdFile.set(remoteDirectory.getOrFetchMetadataForReplication(checkpoint, metadataFilename))
+        );
+        return mdFile.get();
     }
 }
