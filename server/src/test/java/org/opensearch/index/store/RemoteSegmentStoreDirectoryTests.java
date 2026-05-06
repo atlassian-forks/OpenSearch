@@ -995,6 +995,51 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
         verify(remoteMetadataDirectory).deleteFile(metadataFilename);
     }
 
+    /**
+     * Regression test for S-6 early-exit bug: when {@code localMetadataFileCount == 0} and
+     * {@code lastNMetadataFilesToKeep == 0}, the early-exit condition {@code 0 <= 0} was true,
+     * causing {@code deleteStaleSegments(0)} to return before running orphan TAR cleanup.
+     * After the fix, {@code lastNMetadataFilesToKeep == 0} always bypasses the S-6 early exit.
+     */
+    public void testDeleteStaleSegmentsZeroKeepNeverSkipsViaS6EarlyExit() throws Exception {
+        // Reproduce the S-6 early-exit bug: manually seed localMetadataFileCount=0 (as if a prior
+        // GC run already set it from a LIST result showing 0 files). Before the fix, the condition
+        // knownCount(0) <= lastNMetadataFilesToKeep(0) was true → deleteStaleSegments(0) returned
+        // early without running orphan TAR cleanup, leaving orphaned TARs in S3 after index delete.
+        // After the fix: lastNMetadataFilesToKeep==0 always bypasses the S-6 early exit.
+        remoteSegmentStoreDirectory.localMetadataFileCount.set(0);
+
+        // The archive blob that would be orphaned
+        final String archiveBlobName = "segment_archive_orphan.tar";
+        final Map<String, String> archiveMetadata = getDummyMetadataForArchive("_0", 1, archiveBlobName);
+
+        when(
+            remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
+                RemoteSegmentStoreDirectory.MetadataFilenameUtils.METADATA_PREFIX,
+                Integer.MAX_VALUE
+            )
+        ).thenReturn(List.of(metadataFilename));
+
+        when(remoteMetadataDirectory.getBlobStream(metadataFilename)).thenAnswer(
+            I -> createMetadataFileBytesWithArchive(
+                archiveMetadata,
+                indexShard.getLatestReplicationCheckpoint(),
+                segmentInfos,
+                archiveBlobName,
+                Collections.emptyMap(),
+                -1L
+            )
+        );
+        when(mdLockManager.fetchLockedMetadataFiles(any())).thenReturn(Collections.emptySet());
+
+        // Full cleanup (index delete): must NOT be skipped by S-6 early exit (knownCount=0 ≤ lastN=0)
+        remoteSegmentStoreDirectory.deleteStaleSegments(0);
+
+        // TAR must be deleted even though localMetadataFileCount was 0 before the call
+        verify(remoteDataDirectory).deleteFile(archiveBlobName);
+        verify(remoteMetadataDirectory).deleteFile(metadataFilename);
+    }
+
     @TestLogging(value = "_root:debug", reason = "Validate logging output")
     public void testDeleteStaleCommitsActualDelete() throws Exception {
         try (final MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getRootLogger())) {

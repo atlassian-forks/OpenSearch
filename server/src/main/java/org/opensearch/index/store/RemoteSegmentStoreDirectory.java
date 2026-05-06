@@ -243,7 +243,8 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * <p>Initialized to {@code -1} (unknown) until set by the first full LIST, so the first
      * GC run always does a real LIST to establish the ground truth.
      */
-    private final AtomicInteger localMetadataFileCount = new AtomicInteger(-1);
+    // package-private for testing (S-6 early-exit regression test)
+    final AtomicInteger localMetadataFileCount = new AtomicInteger(-1);
 
     // ── Option C (fixed): Persistent replication metadata cache ──────────────────────────────────
     /**
@@ -1502,10 +1503,15 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
         // ── S-6: Skip LIST entirely when local count is known to be ≤ retention limit ─────────────
         // localMetadataFileCount is -1 until the first real LIST (via init/initializeToSpecificCommit
-        // or the block below). It's kept accurate via uploadMetadata increments and GC decrements.
+        // or the block below). It\'s kept accurate via uploadMetadata increments and GC decrements.
         // This is a safe lower-bound check: if count ≤ limit, the full LIST early-exit is guaranteed.
+        //
+        // IMPORTANT: when lastNMetadataFilesToKeep == 0 (force-delete on index close/delete), we must
+        // NEVER skip — even if the local count is 0 — because we need to run the orphan TAR cleanup
+        // path (archiveUploadDirty check + listAll). Orphaned TARs have no metadata reference and are
+        // only found via listAll; the early-exit here would skip that entirely, leaving orphaned TARs.
         int knownCount = localMetadataFileCount.get();
-        if (knownCount >= 0 && knownCount <= lastNMetadataFilesToKeep) {
+        if (lastNMetadataFilesToKeep > 0 && knownCount >= 0 && knownCount <= lastNMetadataFilesToKeep) {
             logger.debug(
                 "Skipping segment GC LIST — local metadata file count={} ≤ lastNMetadataFilesToKeep={}",
                 knownCount,
@@ -1733,7 +1739,11 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         // the flag is set true when a TAR upload succeeds but before metadata write, and cleared
         // only on successful metadata write. Only when the flag is true (metadata write failed
         // or in-progress) do we need to search for orphans via listAll().
-        if (!archiveUploadDirty.get()) {
+        // When lastNMetadataFilesToKeep == 0 (force-delete on index close/delete), always scan for
+        // orphaned TARs regardless of the dirty flag — the dirty flag only tracks in-flight uploads
+        // from the current process, not TARs that may have been orphaned in a previous lifecycle
+        // (e.g. a TAR uploaded, metadata written, but GC never ran before the index was deleted).
+        if (!archiveUploadDirty.get() && lastNMetadataFilesToKeep != 0) {
             // Happy path: no pending unacknowledged archive upload — no orphans possible.
             return;
         }
