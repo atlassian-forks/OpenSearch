@@ -323,6 +323,22 @@ public class BlobStoreTransferService implements TransferService {
 
     @Override
     public Set<String> listAll(Iterable<String> path) throws IOException {
+        if (logger.isTraceEnabled()) {
+            StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+            StringBuilder caller = new StringBuilder();
+            int end = Math.min(8, stack.length);
+            for (int i = 2; i < end; i++) {
+                String frame = stack[i].getClassName() + "." + stack[i].getMethodName() + ":" + stack[i].getLineNumber();
+                if (frame.contains("opensearch")) {
+                    caller.append(" ← ").append(frame);
+                }
+            }
+            logger.trace(
+                "s3-list-request: BlobStoreTransferService.listAll path={} caller={}",
+                path,
+                caller.length() > 0 ? caller.toString() : "(non-opensearch)"
+            );
+        }
         return blobStore.blobContainer((BlobPath) path).listBlobs().keySet();
     }
 
@@ -343,6 +359,24 @@ public class BlobStoreTransferService implements TransferService {
     }
 
     public void listAllInSortedOrder(Iterable<String> path, String filenamePrefix, int limit, ActionListener<List<BlobMetadata>> listener) {
+        if (logger.isTraceEnabled()) {
+            StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+            StringBuilder caller = new StringBuilder();
+            int end = Math.min(8, stack.length);
+            for (int i = 2; i < end; i++) {
+                String frame = stack[i].getClassName() + "." + stack[i].getMethodName() + ":" + stack[i].getLineNumber();
+                if (frame.contains("opensearch")) {
+                    caller.append(" ← ").append(frame);
+                }
+            }
+            logger.trace(
+                "s3-list-request: BlobStoreTransferService.listAllInSortedOrder path={} prefix={} limit={} caller={}",
+                path,
+                filenamePrefix,
+                limit,
+                caller.length() > 0 ? caller.toString() : "(non-opensearch)"
+            );
+        }
         blobStore.blobContainer((BlobPath) path).listBlobsByPrefixInSortedOrder(filenamePrefix, limit, LEXICOGRAPHIC, listener);
     }
 

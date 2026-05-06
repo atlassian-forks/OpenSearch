@@ -101,6 +101,21 @@ public class RemoteDirectory extends Directory {
      */
     @Override
     public String[] listAll() throws IOException {
+        if (logger.isTraceEnabled()) {
+            StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+            StringBuilder caller = new StringBuilder();
+            int end = Math.min(8, stack.length);
+            for (int i = 2; i < end; i++) {
+                String frame = stack[i].getClassName() + "." + stack[i].getMethodName() + ":" + stack[i].getLineNumber();
+                if (frame.contains("opensearch")) {
+                    caller.append(" ← ").append(frame);
+                }
+            }
+            logger.trace(
+                "s3-list-request: listAll caller={}",
+                caller.length() > 0 ? caller.toString() : "(non-opensearch)"
+            );
+        }
         return blobContainer.listBlobs().keySet().stream().sorted().toArray(String[]::new);
     }
 
@@ -115,6 +130,24 @@ public class RemoteDirectory extends Directory {
     }
 
     public List<String> listFilesByPrefixInLexicographicOrder(String filenamePrefix, int limit) throws IOException {
+        if (logger.isTraceEnabled()) {
+            StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+            // Print up to 6 OpenSearch caller frames (skip getStackTrace[0] and this method[1])
+            StringBuilder caller = new StringBuilder();
+            int end = Math.min(8, stack.length);
+            for (int i = 2; i < end; i++) {
+                String frame = stack[i].getClassName() + "." + stack[i].getMethodName() + ":" + stack[i].getLineNumber();
+                if (frame.contains("opensearch")) {
+                    caller.append(" ← ").append(frame);
+                }
+            }
+            logger.trace(
+                "s3-list-request: listFilesByPrefixInLexicographicOrder prefix={} limit={} caller={}",
+                filenamePrefix,
+                limit,
+                caller.length() > 0 ? caller.toString() : "(non-opensearch)"
+            );
+        }
         List<String> sortedBlobList = new ArrayList<>();
         AtomicReference<Exception> exception = new AtomicReference<>();
         final CountDownLatch latch = new CountDownLatch(1);
