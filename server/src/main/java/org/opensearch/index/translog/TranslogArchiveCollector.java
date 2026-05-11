@@ -93,7 +93,6 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
     private final ThreadPool threadPool;
     private final RemoteStoreSettings remoteStoreSettings;
     private final ClusterService clusterService;
-    private volatile Scheduler.Cancellable scheduledTask;
     /** Retention GC task — only runs when this node is the elected cluster-manager. */
     private volatile Scheduler.Cancellable retentionScheduledTask;
     /**
@@ -226,15 +225,6 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
     protected void doStart() {
         INSTANCE = this; // register as node singleton for RemoteFsTranslog lookup
         if (threadPool != null && remoteStoreSettings != null) {
-            // The scheduled task is now retention-only — translog uploads are handled
-            // synchronously by TranslogArchiveBatchCoordinator (the node-scoped batch coordinator).
-            // We keep the scheduled task only to trigger archive retention cleanup.
-            TimeValue uploadInterval = remoteStoreSettings.getClusterRemoteTranslogBufferInterval();
-            scheduledTask = threadPool.scheduleWithFixedDelay(
-                this::runRetentionCheck,
-                uploadInterval,
-                ThreadPool.Names.TRANSLOG_TRANSFER
-            );
             // Create the node-scoped coordinator that all archive-enabled shards share.
             // The coordinator is created here (not per-index) because it batches across ALL indices.
             if (isAnyArchiveEnabled()) {
@@ -305,10 +295,6 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
 
     @Override
     protected void doStop() {
-        if (scheduledTask != null) {
-            scheduledTask.cancel();
-            scheduledTask = null;
-        }
         // GC task is cancelled via offClusterManager; cancel here too as a safety net.
         if (retentionScheduledTask != null) {
             retentionScheduledTask.cancel();
@@ -400,22 +386,6 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         }
         logger.debug("GC scanner: no eligible shard with transfer service found yet");
     }
-
-    /**
-     * Periodic retention check — triggered by the scheduled task.
-     * <p>
-     * Upload is now handled synchronously by {@link TranslogArchiveBatchCoordinator} (the node-scoped
-     * batch coordinator). This method only triggers archive retention cleanup.
-     * The old per-node TAR upload path ({@code runBatchForNode}) is no longer used.
-     */
-    private void runRetentionCheck() {
-        try {
-            runArchiveRetention();
-        } catch (Exception e) {
-            logger.warn("Archive retention check failed", e);
-        }
-    }
-
 
     /**
      * Checkpoint-aware archive GC using the hierarchical txlog path.
@@ -811,13 +781,6 @@ public final class TranslogArchiveCollector extends AbstractLifecycleComponent i
         if (scanner != null) {
             scanner.evictIndex(indexUUID);
         }
-    }
-
-    /**
-     * Runs one retention check synchronously; for unit/integration tests only.
-     */
-    void runRetentionCheckForTesting() {
-        runRetentionCheck();
     }
 
     /**
