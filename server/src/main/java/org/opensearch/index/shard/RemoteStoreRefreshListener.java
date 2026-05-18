@@ -29,6 +29,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.remote.RemoteSegmentTransferTracker;
+import org.opensearch.index.remote.SegmentRemoteStoreStrategy;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.CompositeDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
@@ -93,12 +94,14 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
     private volatile Iterator<TimeValue> backoffDelayIterator;
     private final SegmentReplicationCheckpointPublisher checkpointPublisher;
     private final RemoteStoreSettings remoteStoreSettings;
+    private final SegmentRemoteStoreStrategy segmentStrategy;
 
     public RemoteStoreRefreshListener(
         IndexShard indexShard,
         SegmentReplicationCheckpointPublisher checkpointPublisher,
         RemoteSegmentTransferTracker segmentTracker,
-        RemoteStoreSettings remoteStoreSettings
+        RemoteStoreSettings remoteStoreSettings,
+        SegmentRemoteStoreStrategy segmentStrategy
     ) {
         super(indexShard.getThreadPool());
         logger = Loggers.getLogger(getClass(), indexShard.shardId());
@@ -122,6 +125,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         resetBackOffDelayIterator();
         this.checkpointPublisher = checkpointPublisher;
         this.remoteStoreSettings = remoteStoreSettings;
+        this.segmentStrategy = segmentStrategy;
     }
 
     @Override
@@ -431,37 +435,14 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         ActionListener<Void> listener
     ) {
         Collection<String> filteredFiles = localSegmentsPostRefresh.stream().filter(file -> !skipUpload(file)).collect(Collectors.toList());
-        if (filteredFiles.size() == 0) {
+        if (filteredFiles.isEmpty()) {
             logger.debug("No new segments to upload in uploadNewSegments");
             listener.onResponse(null);
             return;
         }
 
         logger.debug("Effective new segments files to upload {}", filteredFiles);
-        ActionListener<Collection<Void>> mappedListener = ActionListener.map(listener, resp -> null);
-        GroupedActionListener<Void> batchUploadListener = new GroupedActionListener<>(mappedListener, filteredFiles.size());
-        Directory directory = ((FilterDirectory) (((FilterDirectory) storeDirectory).getDelegate())).getDelegate();
-
-        for (String src : filteredFiles) {
-            // Initializing listener here to ensure that the stats increment operations are thread-safe
-            UploadListener statsListener = createUploadListener(localSegmentsSizeMap);
-            ActionListener<Void> aggregatedListener = ActionListener.wrap(resp -> {
-                statsListener.onSuccess(src);
-                batchUploadListener.onResponse(resp);
-                if (directory instanceof CompositeDirectory) {
-                    ((CompositeDirectory) directory).afterSyncToRemote(src);
-                }
-            }, ex -> {
-                logger.warn(() -> new ParameterizedMessage("Exception: [{}] while uploading segment files", ex), ex);
-                if (ex instanceof CorruptIndexException) {
-                    indexShard.failShard(ex.getMessage(), ex);
-                }
-                statsListener.onFailure(src);
-                batchUploadListener.onFailure(ex);
-            });
-            statsListener.beforeUpload(src);
-            remoteDirectory.copyFrom(storeDirectory, src, IOContext.DEFAULT, aggregatedListener, isLowPriorityUpload());
-        }
+        segmentStrategy.upload(filteredFiles, localSegmentsSizeMap, storeDirectory, remoteDirectory, indexShard, listener);
     }
 
     boolean isLowPriorityUpload() {

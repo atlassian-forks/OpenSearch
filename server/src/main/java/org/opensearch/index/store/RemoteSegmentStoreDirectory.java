@@ -268,6 +268,18 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         // Visible for testing
         static final String SEPARATOR = "::";
 
+        /**
+         * Number of fields in the legacy metadata format (original filename, uploaded filename, checksum, length, writtenByMajor).
+         */
+        static final int LEGACY_FIELD_COUNT = 5;
+
+        /**
+         * Number of fields in the S-5 extended format for archive blobs.
+         * Additional fields appended: tarOffset :: tarDataLength.
+         * Backward-compatible: old readers parse only the first {@value #LEGACY_FIELD_COUNT} fields.
+         */
+        static final int EXTENDED_FIELD_COUNT = 7;
+
         private final String originalFilename;
         private final String uploadedFilename;
         private final String checksum;
@@ -275,11 +287,20 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
         /**
          * The Lucene major version that wrote the original segment files.
-         * As part of the Lucene version compatibility check, this version information stored in the metadata
-         * will be used to skip downloading the segment files unnecessarily
-         * if they were written by an incompatible Lucene version.
          */
         private int writtenByMajor;
+
+        /**
+         * S-5: byte offset of this file's payload within the TAR archive blob.
+         * Set to {@code -1} when not an archive blob or when parsed from legacy metadata format.
+         */
+        long tarOffset = -1L;
+
+        /**
+         * S-5: byte length of this file's payload within the TAR archive blob.
+         * Set to {@code -1} when not an archive blob or when parsed from legacy metadata format.
+         */
+        long tarDataLength = -1L;
 
         UploadedSegmentMetadata(String originalFilename, String uploadedFilename, String checksum, long length) {
             this.originalFilename = originalFilename;
@@ -290,6 +311,19 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
         @Override
         public String toString() {
+            if (tarOffset >= 0 && tarDataLength >= 0) {
+                // S-5 extended format — emitted for archive blobs with known offsets.
+                return String.join(
+                    SEPARATOR,
+                    originalFilename,
+                    uploadedFilename,
+                    checksum,
+                    String.valueOf(length),
+                    String.valueOf(writtenByMajor),
+                    String.valueOf(tarOffset),
+                    String.valueOf(tarDataLength)
+                );
+            }
             return String.join(
                 SEPARATOR,
                 originalFilename,
@@ -308,15 +342,38 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             return this.length;
         }
 
+        /**
+         * S-5: byte offset within the TAR archive blob, or {@code -1} if unavailable.
+         */
+        public long getTarOffset() {
+            return tarOffset;
+        }
+
+        /**
+         * S-5: byte length of this file's payload within the TAR archive blob, or {@code -1} if unavailable.
+         */
+        public long getTarDataLength() {
+            return tarDataLength;
+        }
+
         public static UploadedSegmentMetadata fromString(String uploadedFilename) {
             String[] values = uploadedFilename.split(SEPARATOR);
             UploadedSegmentMetadata metadata = new UploadedSegmentMetadata(values[0], values[1], values[2], Long.parseLong(values[3]));
-            if (values.length < 5) {
+            if (values.length < LEGACY_FIELD_COUNT) {
                 staticLogger.error("Lucene version is missing for UploadedSegmentMetadata: " + uploadedFilename);
             }
-
+            // This access intentionally throws ArrayIndexOutOfBoundsException when values.length < 5,
+            // preserving the existing contract expected by callers and tests.
             metadata.setWrittenByMajor(Integer.parseInt(values[4]));
-
+            // S-5: parse tarOffset and tarDataLength if present (backward-compatible extension).
+            if (values.length >= EXTENDED_FIELD_COUNT) {
+                try {
+                    metadata.tarOffset = Long.parseLong(values[5]);
+                    metadata.tarDataLength = Long.parseLong(values[6]);
+                } catch (NumberFormatException e) {
+                    staticLogger.warn("Failed to parse tarOffset/tarDataLength from UploadedSegmentMetadata: {}", uploadedFilename);
+                }
+            }
             return metadata;
         }
 
@@ -627,6 +684,31 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             );
         }
         return metadataFiles.get(0);
+    }
+
+    /**
+     * Registers a segment file as uploaded via a TAR archive blob.
+     * <p>
+     * The remote filename is set to the archive blob name, and the TAR byte offset and data length
+     * are stored in the metadata to enable direct range-GET downloads without re-reading the TAR index.
+     * <p>
+     * This is the archive equivalent of {@link #postUpload(Directory, String, String, String)}.
+     *
+     * @param src             the local segment filename
+     * @param archiveBlobName the remote archive blob name (shared by all files in the same TAR)
+     * @param tarOffset       the byte offset of this file's payload within the TAR blob
+     * @param tarDataLength   the byte length of this file's payload within the TAR blob
+     * @param from            the local directory containing {@code src}
+     * @throws IOException if the file checksum cannot be computed
+     */
+    public void postUploadForArchive(String src, String archiveBlobName, long tarOffset, long tarDataLength, Directory from)
+        throws IOException {
+        String checksum = getChecksumOfLocalFile(from, src);
+        UploadedSegmentMetadata segmentMetadata = new UploadedSegmentMetadata(src, archiveBlobName, checksum, tarDataLength);
+        // S-5: store TAR offset and data length for direct range-GET downloads.
+        segmentMetadata.tarOffset = tarOffset;
+        segmentMetadata.tarDataLength = tarDataLength;
+        segmentsUploadedToRemoteStore.put(src, segmentMetadata);
     }
 
     private void postUpload(Directory from, String src, String remoteFilename, String checksum) throws IOException {

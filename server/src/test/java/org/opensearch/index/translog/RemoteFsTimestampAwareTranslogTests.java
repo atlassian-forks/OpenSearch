@@ -148,7 +148,8 @@ public class RemoteFsTimestampAwareTranslogTests extends RemoteFsTranslogTests {
             threadPool,
             primaryMode::get,
             new RemoteTranslogTransferTracker(shardId, 10),
-            DefaultRemoteStoreSettings.INSTANCE
+            DefaultRemoteStoreSettings.INSTANCE,
+            null
         );
     }
 
@@ -598,7 +599,8 @@ public class RemoteFsTimestampAwareTranslogTests extends RemoteFsTranslogTests {
                 threadPool,
                 () -> Boolean.TRUE,
                 new RemoteTranslogTransferTracker(shardId, 10),
-                DefaultRemoteStoreSettings.INSTANCE
+                DefaultRemoteStoreSettings.INSTANCE,
+                null
             ) {
                 @Override
                 ChannelFactory getChannelFactory() {

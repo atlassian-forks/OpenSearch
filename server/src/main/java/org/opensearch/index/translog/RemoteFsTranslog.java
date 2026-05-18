@@ -25,7 +25,9 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.index.translog.transfer.FileTransferTracker;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
+import org.opensearch.common.Nullable;
 import org.opensearch.index.translog.transfer.TranslogCheckpointTransferSnapshot;
+import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.TranslogTransferMetadata;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
@@ -71,6 +73,13 @@ public class RemoteFsTranslog extends Translog {
     protected final FileTransferTracker fileTransferTracker;
     protected final BooleanSupplier startedPrimarySupplier;
     private final RemoteTranslogTransferTracker remoteTranslogTransferTracker;
+    /**
+     * Optional plugin-provided translog strategy. When non-null, upload/download/GC
+     * operations are delegated to this strategy instead of the default per-file logic.
+     * Null means "use built-in default behaviour".
+     */
+    @Nullable
+    protected final TranslogRemoteStoreStrategy translogStrategy;
     private volatile long maxRemoteTranslogGenerationUploaded;
 
     private volatile long minSeqNoToKeep;
@@ -104,12 +113,14 @@ public class RemoteFsTranslog extends Translog {
         ThreadPool threadPool,
         BooleanSupplier startedPrimarySupplier,
         RemoteTranslogTransferTracker remoteTranslogTransferTracker,
-        RemoteStoreSettings remoteStoreSettings
+        RemoteStoreSettings remoteStoreSettings,
+        @Nullable TranslogRemoteStoreStrategy translogStrategy
     ) throws IOException {
         super(config, translogUUID, deletionPolicy, globalCheckpointSupplier, primaryTermSupplier, persistedSequenceNumberConsumer);
         logger = Loggers.getLogger(getClass(), shardId);
         this.startedPrimarySupplier = startedPrimarySupplier;
         this.remoteTranslogTransferTracker = remoteTranslogTransferTracker;
+        this.translogStrategy = translogStrategy;
         fileTransferTracker = new FileTransferTracker(shardId, remoteTranslogTransferTracker);
         isTranslogMetadataEnabled = indexSettings().isTranslogMetadataEnabled();
         this.translogTransferManager = buildTranslogTransferManager(

@@ -36,6 +36,8 @@ import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory.MetadataFilenameUtils;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
+import org.opensearch.index.remote.DefaultSegmentRemoteStoreStrategy;
+import org.opensearch.index.remote.RemoteSegmentTransferTracker;
 import org.opensearch.indices.DefaultRemoteStoreSettings;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.indices.recovery.RecoveryState;
@@ -100,7 +102,8 @@ public class RemoteStoreRefreshListenerTests extends IndexShardTestCase {
             indexShard,
             SegmentReplicationCheckpointPublisher.EMPTY,
             tracker,
-            DefaultRemoteStoreSettings.INSTANCE
+            DefaultRemoteStoreSettings.INSTANCE,
+            new DefaultSegmentRemoteStoreStrategy(mock(RemoteSegmentTransferTracker.class))
         );
     }
 
@@ -168,7 +171,8 @@ public class RemoteStoreRefreshListenerTests extends IndexShardTestCase {
             shard,
             SegmentReplicationCheckpointPublisher.EMPTY,
             mock(RemoteSegmentTransferTracker.class),
-            DefaultRemoteStoreSettings.INSTANCE
+            DefaultRemoteStoreSettings.INSTANCE,
+            new DefaultSegmentRemoteStoreStrategy(mock(RemoteSegmentTransferTracker.class))
         );
         assertTrue(remoteStoreRefreshListener.isLocalOrSnapshotRecoveryOrSeeding());
         assertTrue(remoteStoreRefreshListener.isLowPriorityUpload());
@@ -236,7 +240,8 @@ public class RemoteStoreRefreshListenerTests extends IndexShardTestCase {
             shard,
             SegmentReplicationCheckpointPublisher.EMPTY,
             mock(RemoteSegmentTransferTracker.class),
-            DefaultRemoteStoreSettings.INSTANCE
+            DefaultRemoteStoreSettings.INSTANCE,
+            new DefaultSegmentRemoteStoreStrategy(mock(RemoteSegmentTransferTracker.class))
         );
 
         // Validate that the stream of metadata file of remoteMetadataDirectory has been opened only once and the
@@ -836,7 +841,8 @@ public class RemoteStoreRefreshListenerTests extends IndexShardTestCase {
             shard,
             emptyCheckpointPublisher,
             tracker,
-            remoteStoreSettings
+            remoteStoreSettings,
+            new DefaultSegmentRemoteStoreStrategy(mock(RemoteSegmentTransferTracker.class))
         );
         refreshListener.afterRefresh(true);
         return Tuple.tuple(refreshListener, remoteStoreStatsTrackerFactory);

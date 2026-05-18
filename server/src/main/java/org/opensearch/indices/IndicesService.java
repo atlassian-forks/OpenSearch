@@ -129,6 +129,8 @@ import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.recovery.RecoveryStats;
 import org.opensearch.index.refresh.RefreshStats;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
+import org.opensearch.index.remote.RemoteStoreStrategyProvider;
+import org.opensearch.plugins.RemoteStorePlugin;
 import org.opensearch.index.search.stats.SearchStats;
 import org.opensearch.index.seqno.RetentionLeaseStats;
 import org.opensearch.index.seqno.RetentionLeaseSyncer;
@@ -350,6 +352,7 @@ public class IndicesService extends AbstractLifecycleComponent
     private volatile boolean allowExpensiveQueries;
     private final RecoverySettings recoverySettings;
     private final RemoteStoreSettings remoteStoreSettings;
+    private final RemoteStoreStrategyProvider remoteStoreStrategyProvider;
     @Nullable
     private final OpenSearchThreadPoolExecutor danglingIndicesThreadPoolExecutor;
     private final Set<Index> danglingIndicesToWrite = Sets.newConcurrentHashSet();
@@ -493,19 +496,23 @@ public class IndicesService extends AbstractLifecycleComponent
         this.allowExpensiveQueries = ALLOW_EXPENSIVE_QUERIES.get(clusterService.getSettings());
         clusterService.getClusterSettings().addSettingsUpdateConsumer(ALLOW_EXPENSIVE_QUERIES, this::setAllowExpensiveQueries);
         this.remoteDirectoryFactory = remoteDirectoryFactory;
+        this.recoverySettings = recoverySettings;
+        this.remoteStoreSettings = remoteStoreSettings;
+        this.remoteStoreStrategyProvider = RemoteStoreStrategyProvider.fromPlugins(
+            pluginsService.filterPlugins(RemoteStorePlugin.class)
+        );
         this.translogFactorySupplier = getTranslogFactorySupplier(
             repositoriesServiceSupplier,
             threadPool,
             remoteStoreStatsTrackerFactory,
             settings,
-            remoteStoreSettings
+            remoteStoreSettings,
+            this.remoteStoreStrategyProvider
         );
         this.searchRequestStats = searchRequestStats;
         this.clusterDefaultRefreshInterval = CLUSTER_DEFAULT_INDEX_REFRESH_INTERVAL_SETTING.get(clusterService.getSettings());
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(CLUSTER_DEFAULT_INDEX_REFRESH_INTERVAL_SETTING, this::onRefreshIntervalUpdate);
-        this.recoverySettings = recoverySettings;
-        this.remoteStoreSettings = remoteStoreSettings;
         this.compositeIndexSettings = compositeIndexSettings;
         this.fileCache = fileCache;
         this.replicator = replicator;
@@ -659,25 +666,30 @@ public class IndicesService extends AbstractLifecycleComponent
         ThreadPool threadPool,
         RemoteStoreStatsTrackerFactory remoteStoreStatsTrackerFactory,
         Settings settings,
-        RemoteStoreSettings remoteStoreSettings
+        RemoteStoreSettings remoteStoreSettings,
+        RemoteStoreStrategyProvider remoteStoreStrategyProvider
     ) {
         return (indexSettings, shardRouting) -> {
             if (indexSettings.isRemoteTranslogStoreEnabled() && shardRouting.primary()) {
-                return new RemoteBlobStoreInternalTranslogFactory(
+                RemoteBlobStoreInternalTranslogFactory factory = new RemoteBlobStoreInternalTranslogFactory(
                     repositoriesServiceSupplier,
                     threadPool,
                     indexSettings.getRemoteStoreTranslogRepository(),
                     remoteStoreStatsTrackerFactory.getRemoteTranslogTransferTracker(shardRouting.shardId()),
                     remoteStoreSettings
                 );
+                factory.setRemoteStoreStrategyProvider(remoteStoreStrategyProvider);
+                return factory;
             } else if (isRemoteDataAttributePresent(settings) && shardRouting.primary()) {
-                return new RemoteBlobStoreInternalTranslogFactory(
+                RemoteBlobStoreInternalTranslogFactory factory = new RemoteBlobStoreInternalTranslogFactory(
                     repositoriesServiceSupplier,
                     threadPool,
                     RemoteStoreNodeAttribute.getRemoteStoreTranslogRepo(indexSettings.getNodeSettings()),
                     remoteStoreStatsTrackerFactory.getRemoteTranslogTransferTracker(shardRouting.shardId()),
                     remoteStoreSettings
                 );
+                factory.setRemoteStoreStrategyProvider(remoteStoreStrategyProvider);
+                return factory;
             }
             return new InternalTranslogFactory();
         };
@@ -1027,6 +1039,7 @@ public class IndicesService extends AbstractLifecycleComponent
             indexModule.addIndexOperationListener(operationListener);
         }
         pluginsService.onIndexModule(indexModule);
+        indexModule.setRemoteStoreStrategyProvider(this.remoteStoreStrategyProvider);
         for (IndexEventListener listener : builtInListeners) {
             indexModule.addIndexEventListener(listener);
         }
@@ -2176,6 +2189,10 @@ public class IndicesService extends AbstractLifecycleComponent
 
     private TimeValue getClusterDefaultRefreshInterval() {
         return this.clusterDefaultRefreshInterval;
+    }
+
+    RemoteStoreStrategyProvider getRemoteStoreStrategyProvider() {
+        return this.remoteStoreStrategyProvider;
     }
 
     public RemoteStoreSettings getRemoteStoreSettings() {

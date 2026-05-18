@@ -82,6 +82,7 @@ import org.opensearch.index.fielddata.IndexFieldDataService;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.SearchIndexNameMatcher;
+import org.opensearch.index.remote.RemoteStoreStrategyProvider;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
 import org.opensearch.index.seqno.RetentionLeaseSyncer;
 import org.opensearch.index.shard.IndexEventListener;
@@ -194,6 +195,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private final Supplier<TimeValue> clusterDefaultRefreshIntervalSupplier;
     private final RecoverySettings recoverySettings;
     private final RemoteStoreSettings remoteStoreSettings;
+    private final RemoteStoreStrategyProvider remoteStoreStrategyProvider;
     private final FileCache fileCache;
     private final CompositeIndexSettings compositeIndexSettings;
     private final Consumer<IndexShard> replicator;
@@ -235,7 +237,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         RemoteStoreSettings remoteStoreSettings,
         FileCache fileCache,
         CompositeIndexSettings compositeIndexSettings,
-        Consumer<IndexShard> replicator
+        Consumer<IndexShard> replicator,
+        RemoteStoreStrategyProvider remoteStoreStrategyProvider
     ) {
         super(indexSettings);
         this.allowExpensiveQueries = allowExpensiveQueries;
@@ -316,6 +319,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         this.translogFactorySupplier = translogFactorySupplier;
         this.recoverySettings = recoverySettings;
         this.remoteStoreSettings = remoteStoreSettings;
+        this.remoteStoreStrategyProvider = remoteStoreStrategyProvider;
         this.compositeIndexSettings = compositeIndexSettings;
         this.fileCache = fileCache;
         this.replicator = replicator;
@@ -396,7 +400,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             remoteStoreSettings,
             fileCache,
             null,
-            (s) -> {}
+            (s) -> {},
+            RemoteStoreStrategyProvider.NOOP
         );
     }
 
@@ -473,7 +478,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             remoteStoreSettings,
             null,
             null,
-            s -> {}
+            s -> {},
+            RemoteStoreStrategyProvider.NOOP
         );
     }
 
@@ -768,6 +774,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                 nodeEnv.nodeId(),
                 recoverySettings,
                 remoteStoreSettings,
+                remoteStoreStrategyProvider,
                 seedRemote,
                 discoveryNodes
             );

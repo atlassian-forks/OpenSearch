@@ -153,6 +153,9 @@ import org.opensearch.index.recovery.RecoveryStats;
 import org.opensearch.index.refresh.RefreshStats;
 import org.opensearch.index.remote.RemoteSegmentStats;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
+import org.opensearch.index.remote.DefaultSegmentRemoteStoreStrategy;
+import org.opensearch.index.remote.RemoteStoreStrategyProvider;
+import org.opensearch.index.remote.SegmentRemoteStoreStrategy;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
 import org.opensearch.index.search.stats.SearchStats;
 import org.opensearch.index.search.stats.ShardSearchStats;
@@ -356,6 +359,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     private final RemoteStoreFileDownloader fileDownloader;
     private final RecoverySettings recoverySettings;
     private final RemoteStoreSettings remoteStoreSettings;
+    private final RemoteStoreStrategyProvider remoteStoreStrategyProvider;
     /*
      On source doc rep node,  It will be DOCREP_NON_MIGRATING.
      On source remote node , it will be REMOTE_MIGRATING_SEEDED when relocating from remote node
@@ -392,6 +396,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         final String nodeId,
         final RecoverySettings recoverySettings,
         final RemoteStoreSettings remoteStoreSettings,
+        final RemoteStoreStrategyProvider remoteStoreStrategyProvider,
         boolean seedRemote,
         final DiscoveryNodes discoveryNodes
     ) throws IOException {
@@ -492,6 +497,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.remoteStoreStatsTrackerFactory = remoteStoreStatsTrackerFactory;
         this.recoverySettings = recoverySettings;
         this.remoteStoreSettings = remoteStoreSettings;
+        this.remoteStoreStrategyProvider = remoteStoreStrategyProvider;
         this.fileDownloader = new RemoteStoreFileDownloader(shardRouting.shardId(), threadPool, recoverySettings);
         this.shardMigrationState = getShardMigrationState(indexSettings, seedRemote);
         this.discoveryNodes = discoveryNodes;
@@ -4023,7 +4029,8 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     this,
                     this.checkpointPublisher,
                     remoteStoreStatsTrackerFactory.getRemoteSegmentTransferTracker(shardId()),
-                    remoteStoreSettings
+                    remoteStoreSettings,
+                    resolveSegmentStrategy(remoteStoreStrategyProvider)
                 )
             );
         }
@@ -4069,6 +4076,17 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             translogFactorySupplier.apply(indexSettings, shardRouting),
             isTimeSeriesDescSortOptimizationEnabled() ? DataStream.TIMESERIES_LEAF_SORTER : null // DESC @timestamp default order for
             // timeseries
+        );
+    }
+
+    private SegmentRemoteStoreStrategy resolveSegmentStrategy(RemoteStoreStrategyProvider provider) {
+        SegmentRemoteStoreStrategy strategy = provider.getSegmentStrategy();
+        if (strategy != null) {
+            return strategy;
+        }
+        // Default: per-file upload with shard's own segment transfer tracker
+        return new DefaultSegmentRemoteStoreStrategy(
+            remoteStoreStatsTrackerFactory.getRemoteSegmentTransferTracker(shardId())
         );
     }
 

@@ -19,6 +19,8 @@ import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.TranslogTransferMetadata;
+import org.opensearch.common.Nullable;
+import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.node.remotestore.RemoteStorePinnedTimestampService;
 import org.opensearch.repositories.blobstore.BlobStoreRepository;
@@ -73,7 +75,8 @@ public class RemoteFsTimestampAwareTranslog extends RemoteFsTranslog {
         ThreadPool threadPool,
         BooleanSupplier startedPrimarySupplier,
         RemoteTranslogTransferTracker remoteTranslogTransferTracker,
-        RemoteStoreSettings remoteStoreSettings
+        RemoteStoreSettings remoteStoreSettings,
+        @Nullable TranslogRemoteStoreStrategy translogStrategy
     ) throws IOException {
         super(
             config,
@@ -86,7 +89,8 @@ public class RemoteFsTimestampAwareTranslog extends RemoteFsTranslog {
             threadPool,
             startedPrimarySupplier,
             remoteTranslogTransferTracker,
-            remoteStoreSettings
+            remoteStoreSettings,
+            translogStrategy
         );
         logger = Loggers.getLogger(getClass(), shardId);
         this.metadataFilePinnedTimestampMap = new HashMap<>();

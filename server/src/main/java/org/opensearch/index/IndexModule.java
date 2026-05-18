@@ -87,6 +87,7 @@ import org.opensearch.indices.fielddata.cache.IndicesFieldDataCache;
 import org.opensearch.indices.mapper.MapperRegistry;
 import org.opensearch.indices.recovery.RecoverySettings;
 import org.opensearch.indices.recovery.RecoveryState;
+import org.opensearch.index.remote.RemoteStoreStrategyProvider;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
@@ -322,6 +323,7 @@ public final class IndexModule {
     private final Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories;
     private final FileCache fileCache;
     private final CompositeIndexSettings compositeIndexSettings;
+    private RemoteStoreStrategyProvider remoteStoreStrategyProvider = RemoteStoreStrategyProvider.NOOP;
 
     /**
      * Construct the index module for the index with the specified index settings. The index module contains extension points for plugins
@@ -841,7 +843,8 @@ public final class IndexModule {
                 remoteStoreSettings,
                 fileCache,
                 compositeIndexSettings,
-                replicator
+                replicator,
+                this.remoteStoreStrategyProvider
             );
             success = true;
             return indexService;
@@ -935,6 +938,15 @@ public final class IndexModule {
     public void forceQueryCacheProvider(BiFunction<IndexSettings, IndicesQueryCache, QueryCache> queryCacheProvider) {
         ensureNotFrozen();
         this.forceQueryCacheProvider.set(queryCacheProvider);
+    }
+
+    /**
+     * Sets the remote store strategy provider to be passed to the index service on creation.
+     * Called from {@code IndicesService} after plugin discovery, before {@code newIndexService}.
+     * Package-private; not part of the public API.
+     */
+    public void setRemoteStoreStrategyProvider(RemoteStoreStrategyProvider provider) {
+        this.remoteStoreStrategyProvider = provider != null ? provider : RemoteStoreStrategyProvider.NOOP;
     }
 
     private void ensureNotFrozen() {

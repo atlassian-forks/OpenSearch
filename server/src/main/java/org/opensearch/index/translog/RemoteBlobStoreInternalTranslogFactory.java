@@ -8,7 +8,9 @@
 
 package org.opensearch.index.translog;
 
+import org.opensearch.index.remote.RemoteStoreStrategyProvider;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
+import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.repositories.Repository;
@@ -36,6 +38,8 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
     private final RemoteTranslogTransferTracker remoteTranslogTransferTracker;
 
     private final RemoteStoreSettings remoteStoreSettings;
+
+    private RemoteStoreStrategyProvider remoteStoreStrategyProvider = RemoteStoreStrategyProvider.NOOP;
 
     public RemoteBlobStoreInternalTranslogFactory(
         Supplier<RepositoriesService> repositoriesServiceSupplier,
@@ -69,6 +73,7 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
 
         assert repository instanceof BlobStoreRepository : "repository should be instance of BlobStoreRepository";
         BlobStoreRepository blobStoreRepository = ((BlobStoreRepository) repository);
+        TranslogRemoteStoreStrategy translogStrategy = remoteStoreStrategyProvider.getTranslogStrategy();
         if (RemoteStoreSettings.isPinnedTimestampsEnabled()) {
             return new RemoteFsTimestampAwareTranslog(
                 config,
@@ -81,7 +86,8 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
                 threadPool,
                 startedPrimarySupplier,
                 remoteTranslogTransferTracker,
-                remoteStoreSettings
+                remoteStoreSettings,
+                translogStrategy
             );
         } else {
             return new RemoteFsTranslog(
@@ -95,9 +101,17 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
                 threadPool,
                 startedPrimarySupplier,
                 remoteTranslogTransferTracker,
-                remoteStoreSettings
+                remoteStoreSettings,
+                translogStrategy
             );
         }
+    }
+
+    /**
+     * Sets the translog strategy provider. Called from {@code IndicesService} after plugin discovery.
+     */
+    public void setRemoteStoreStrategyProvider(RemoteStoreStrategyProvider provider) {
+        this.remoteStoreStrategyProvider = provider != null ? provider : RemoteStoreStrategyProvider.NOOP;
     }
 
     public Repository getRepository() {

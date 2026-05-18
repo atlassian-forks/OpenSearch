@@ -98,6 +98,7 @@ import org.opensearch.index.engine.InternalEngineFactory;
 import org.opensearch.index.engine.NRTReplicationEngineFactory;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.SourceToParse;
+import org.opensearch.index.remote.RemoteStoreStrategyProvider;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
 import org.opensearch.index.replication.TestReplicationSource;
@@ -716,6 +717,7 @@ public abstract class IndexShardTestCase extends OpenSearchTestCase {
                 "dummy-node",
                 DefaultRecoverySettings.INSTANCE,
                 DefaultRemoteStoreSettings.INSTANCE,
+                RemoteStoreStrategyProvider.NOOP,
                 false,
                 discoveryNodes
             );
