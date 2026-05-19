@@ -9,25 +9,26 @@
 package org.opensearch.index.translog.transfer;
 
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.index.remote.GcDecision;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 
 import java.io.IOException;
 import java.nio.file.Path;
 
 /**
- * Composite SPI for the full translog remote store lifecycle: upload, download, and GC.
- * <p>
- * All three operations must be provided together because they are tightly coupled:
+ * SPI for the translog remote store lifecycle: upload, download, and stale-blob GC.
+ *
+ * <p>Core calls these methods per shard. The implementation decides how to fulfil each
+ * request — it may upload immediately or defer to any internal coordination mechanism
+ * (e.g. node-level batching). Core has no knowledge of the implementation strategy.
+ *
+ * <p>All three operations should be provided together because they are tightly coupled:
  * <ul>
- *   <li>If upload batches generations into TAR archives, download must read from those archives.</li>
- *   <li>If upload creates archive blobs, GC must avoid issuing LIST calls for per-file blobs that don't exist.</li>
+ *   <li>Upload format determines what download must read.</li>
+ *   <li>Upload layout determines which GC LIST calls (if any) make sense.</li>
  * </ul>
- * <p>
- * <strong>GC note</strong>: The TAR archive plugin returns {@link GcDecision#SKIP} from
- * {@link #resolveStaleTranslogBlobs} to suppress the per-shard LIST call (expensive on S3).
- * Archive blob GC is instead performed by a node-level background task registered via
- * {@link org.opensearch.plugins.Plugin#createComponents}.
  *
  * @opensearch.internal
  */
@@ -37,32 +38,52 @@ public interface TranslogRemoteStoreStrategy {
     /**
      * Upload a translog snapshot to remote storage.
      *
-     * @param transferSnapshot the snapshot of translog files to upload
-     * @param listener         listener notified on success/failure
+     * <p>The implementation may upload files immediately, defer to a node-level coordinator,
+     * or apply any other batching/compression strategy. Core blocks on this call until the
+     * upload is acknowledged or fails.
+     *
+     * @param transferSnapshot   the snapshot of translog files to upload
+     * @param listener           notified on success or failure
+     * @param transferService    the shard's transfer service (may be used for blob I/O)
+     * @param shardId            identifies the shard (index UUID + shard number); passed so node-level
+     *                           batching strategies can correlate uploads without a separate init() call
+     * @param repositoryBasePath the translog repository base path; lets the strategy compute its target
+     *                           blob path without holding a reference to the repository object
      * @return {@code true} if the snapshot was uploaded successfully
      * @throws IOException if the upload fails
      */
-    boolean upload(TransferSnapshot transferSnapshot, TranslogTransferListener listener) throws IOException;
+    boolean upload(
+        TransferSnapshot transferSnapshot,
+        TranslogTransferListener listener,
+        TransferService transferService,
+        ShardId shardId,
+        BlobPath repositoryBasePath
+    ) throws IOException;
 
     /**
      * Download translog files for the given primary term and generation.
      *
-     * @param primaryTerm the primary term of the translog to recover
+     * @param primaryTerm the primary term of the translog generation to recover
      * @param generation  the generation to recover
-     * @param location    the local path to write the recovered files to
-     * @return {@code true} if the generation was found and downloaded
+     * @param location    the local directory to write the recovered files to
+     * @return {@code true} if the generation was found and downloaded; {@code false} if not found
+     *         (core may then fall back to the default per-file download)
      * @throws IOException if the download fails
      */
     boolean download(long primaryTerm, long generation, Path location) throws IOException;
 
     /**
      * Decide how to handle stale translog blob cleanup for this shard.
-     * <p>
-     * Called during per-shard translog trimming instead of the default LIST + delete logic.
+     *
+     * <p>Called during per-shard translog trimming. The default returns
+     * {@link GcDecision#USE_DEFAULT}, which runs the standard OpenSearch per-file
+     * LIST + delete logic. Implementations that use a different blob layout (e.g. archive
+     * blobs containing multiple shards) should return {@link GcDecision#SKIP} to suppress
+     * the per-shard LIST call; they are responsible for their own GC lifecycle.
      *
      * @param minPrimaryTerm  minimum primary term to retain
-     * @param minGeneration   minimum generation to retain; all older entries are candidates for deletion
-     * @return a {@link GcDecision} instructing core how to proceed with cleanup
+     * @param minGeneration   minimum generation to retain
+     * @return a {@link GcDecision} instructing core how to proceed
      * @throws IOException if the decision cannot be made
      */
     default GcDecision resolveStaleTranslogBlobs(long minPrimaryTerm, long minGeneration) throws IOException {

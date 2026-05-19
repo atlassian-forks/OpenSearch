@@ -52,7 +52,9 @@ public class TranslogUploadStrategyTests extends OpenSearchTestCase {
         // Verify manager is usable as a translog strategy by wrapping in adapter
         TranslogRemoteStoreStrategy strategy = new TranslogRemoteStoreStrategy() {
             @Override
-            public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener) throws java.io.IOException {
+            public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener,
+                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
+                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
                 return manager.transferSnapshot(snapshot, listener);
             }
 
@@ -72,7 +74,9 @@ public class TranslogUploadStrategyTests extends OpenSearchTestCase {
     public void testDefaultGcDecisionIsUseDefault() throws Exception {
         TranslogRemoteStoreStrategy strategy = new TranslogRemoteStoreStrategy() {
             @Override
-            public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener) throws java.io.IOException {
+            public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener,
+                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
+                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
                 return false;
             }
 
@@ -92,7 +96,9 @@ public class TranslogUploadStrategyTests extends OpenSearchTestCase {
     public void testCustomStrategyCanReturnSkipForTranslogGc() throws Exception {
         TranslogRemoteStoreStrategy strategy = new TranslogRemoteStoreStrategy() {
             @Override
-            public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener) throws java.io.IOException {
+            public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener,
+                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
+                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
                 return false;
             }
 

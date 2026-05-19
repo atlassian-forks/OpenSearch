@@ -109,6 +109,15 @@ public class TranslogTransferManager {
         return this.shardId;
     }
 
+    /**
+     * Returns the underlying {@link TransferService} for this shard.
+     * Used by {@link TranslogRemoteStoreStrategy} implementations that need to upload
+     * node-level batch archives (e.g. TAR translog batch uploader).
+     */
+    public TransferService getTransferService() {
+        return transferService;
+    }
+
     public boolean transferSnapshot(TransferSnapshot transferSnapshot, TranslogTransferListener translogTransferListener)
         throws IOException {
         List<Exception> exceptionList = new ArrayList<>(transferSnapshot.getTranslogTransferMetadata().getCount());

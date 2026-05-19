@@ -80,6 +80,8 @@ public class RemoteFsTranslog extends Translog {
      */
     @Nullable
     protected final TranslogRemoteStoreStrategy translogStrategy;
+    /** Translog repository base path — passed to strategy.upload() so plugins can compute blob paths. */
+    protected final BlobPath repositoryBasePath;
     private volatile long maxRemoteTranslogGenerationUploaded;
 
     private volatile long minSeqNoToKeep;
@@ -121,6 +123,7 @@ public class RemoteFsTranslog extends Translog {
         this.startedPrimarySupplier = startedPrimarySupplier;
         this.remoteTranslogTransferTracker = remoteTranslogTransferTracker;
         this.translogStrategy = translogStrategy;
+        this.repositoryBasePath = blobStoreRepository.basePath();
         fileTransferTracker = new FileTransferTracker(shardId, remoteTranslogTransferTracker);
         isTranslogMetadataEnabled = indexSettings().isTranslogMetadataEnabled();
         this.translogTransferManager = buildTranslogTransferManager(
@@ -448,6 +451,18 @@ public class RemoteFsTranslog extends Translog {
                 config.getNodeId()
             ).build()
         ) {
+            // If a plugin provides a translog strategy that supports node-level batching,
+            // delegate to it so translog files from multiple shards can be batched into
+            // a single archive blob (e.g. TAR). Otherwise fall back to the default per-file upload.
+            if (translogStrategy != null) {
+                return translogStrategy.upload(
+                    transferSnapshotProvider,
+                    new RemoteFsTranslogTransferListener(generation, primaryTerm, maxSeqNo),
+                    translogTransferManager.getTransferService(),
+                    translogTransferManager.getShardId(),
+                    repositoryBasePath
+                );
+            }
             return translogTransferManager.transferSnapshot(
                 transferSnapshotProvider,
                 new RemoteFsTranslogTransferListener(generation, primaryTerm, maxSeqNo)

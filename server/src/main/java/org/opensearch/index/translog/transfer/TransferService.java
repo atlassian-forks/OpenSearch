@@ -27,6 +27,7 @@ import java.util.Set;
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public interface TransferService {
 
     /**
