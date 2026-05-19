@@ -43,6 +43,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Locale;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -333,28 +334,48 @@ public class RemoteFsTranslog extends Translog {
             }
 
             Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
-            for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
-                String generation = Long.toString(i);
-                long primaryTerm = Long.parseLong(generationToPrimaryTermMapper.get(generation));
-                boolean downloaded = false;
-                if (translogStrategy != null && repositoryBasePath != null) {
-                    // Let the plugin strategy try first (e.g. extract from TAR archive blob).
-                    // Returns false to fall back to the default per-file download.
-                    downloaded = translogStrategy.download(
-                        primaryTerm, i, location,
-                        translogTransferManager.getTransferService(),
-                        translogTransferManager.getShardId(),
-                        repositoryBasePath
-                    );
+            long minGen = translogMetadata.getMinTranslogGeneration();
+            long maxGen = translogMetadata.getGeneration();
+
+            if (translogStrategy != null && repositoryBasePath != null) {
+                // Call downloadRange() once for the full generation range — allows TAR-based strategies
+                // to scan the archive hierarchy a single time for all generations rather than N times.
+                // The strategy returns false for any generation it could not find in archive storage;
+                // we fill in the gaps from per-file storage below.
+                Map<Long, Long> longGenToPrimaryTerm = new HashMap<>();
+                for (Map.Entry<String, String> e : generationToPrimaryTermMapper.entrySet()) {
+                    longGenToPrimaryTerm.put(Long.parseLong(e.getKey()), Long.parseLong(e.getValue()));
                 }
-                if (!downloaded) {
+                boolean allFound = translogStrategy.downloadRange(
+                    minGen, maxGen, longGenToPrimaryTerm, location,
+                    translogTransferManager.getTransferService(),
+                    translogTransferManager.getShardId(),
+                    repositoryBasePath
+                );
+                if (!allFound) {
+                    // Fill in any generations the strategy could not find from per-file storage.
+                    for (long i = maxGen; i >= minGen; i--) {
+                        String generation = Long.toString(i);
+                        String tlogFile = Translog.getFilename(i);
+                        if (Files.notExists(location.resolve(tlogFile))) {
+                            logger.debug("Gen {} missing from archive, falling back to per-file download", i);
+                            translogTransferManager.downloadTranslog(
+                                generationToPrimaryTermMapper.get(generation), generation, location
+                            );
+                        }
+                    }
+                }
+            } else {
+                // No strategy — use default per-file download for every generation.
+                for (long i = maxGen; i >= minGen; i--) {
+                    String generation = Long.toString(i);
                     translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
                 }
             }
             logger.info(
                 "Downloaded translog and checkpoint files from={} to={}",
-                translogMetadata.getMinTranslogGeneration(),
-                translogMetadata.getGeneration()
+                minGen,
+                maxGen
             );
 
             statsTracker.recordDownloadStats(prevDownloadBytesSucceeded, prevDownloadTimeInMillis);

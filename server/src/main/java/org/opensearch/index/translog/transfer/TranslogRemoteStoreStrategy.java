@@ -89,6 +89,50 @@ public interface TranslogRemoteStoreStrategy {
     ) throws IOException;
 
     /**
+     * Download all translog files in the given generation range in a single pass.
+     *
+     * <p>This is the preferred recovery entry point because it allows implementations to scan
+     * archive storage once for the entire range rather than once per generation. Core calls this
+     * instead of the per-generation {@link #download} loop when a strategy is present.
+     *
+     * <p>The default implementation delegates to {@link #download} per generation, preserving
+     * backward compatibility. Strategies that store multiple generations in a single archive
+     * blob (e.g. TAR batching) should override this method.
+     *
+     * @param minGeneration      first generation to recover (inclusive)
+     * @param maxGeneration      last generation to recover (inclusive)
+     * @param generationToPrimaryTerm map from generation (as long) → primaryTerm (as long)
+     * @param location           local directory to write recovered files to
+     * @param transferService    transfer service for blob I/O
+     * @param shardId            identifies the shard
+     * @param repositoryBasePath translog repository base path
+     * @return {@code true} if ALL generations in the range were found and downloaded;
+     *         {@code false} if at least one generation was not found (caller should fill gaps
+     *         from per-file storage)
+     * @throws IOException if a fatal download error occurs
+     */
+    default boolean downloadRange(
+        long minGeneration,
+        long maxGeneration,
+        java.util.Map<Long, Long> generationToPrimaryTerm,
+        Path location,
+        TransferService transferService,
+        ShardId shardId,
+        BlobPath repositoryBasePath
+    ) throws IOException {
+        boolean allFound = true;
+        for (long gen = maxGeneration; gen >= minGeneration; gen--) {
+            Long primaryTerm = generationToPrimaryTerm.get(gen);
+            if (primaryTerm == null) continue;
+            boolean found = download(primaryTerm, gen, location, transferService, shardId, repositoryBasePath);
+            if (!found) {
+                allFound = false;
+            }
+        }
+        return allFound;
+    }
+
+    /**
      * Decide how to handle stale translog blob cleanup for this shard.
      *
      * <p>Called during per-shard translog trimming. The default returns

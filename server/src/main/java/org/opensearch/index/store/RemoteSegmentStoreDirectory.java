@@ -381,6 +381,14 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             return originalFilename;
         }
 
+        /**
+         * Returns the remote blob name for this segment file.
+         * For per-file uploads this is the remote filename; for archive uploads this is the TAR blob name.
+         */
+        public String getUploadedFilename() {
+            return uploadedFilename;
+        }
+
         public void setWrittenByMajor(int writtenByMajor) {
             if (writtenByMajor <= Version.LATEST.major && writtenByMajor >= Version.MIN_SUPPORTED_MAJOR) {
                 this.writtenByMajor = writtenByMajor;

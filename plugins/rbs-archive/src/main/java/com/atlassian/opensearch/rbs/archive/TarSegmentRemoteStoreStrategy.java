@@ -14,6 +14,7 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.remote.GcDecision;
 import org.opensearch.index.remote.SegmentRemoteStoreStrategy;
@@ -57,6 +58,28 @@ public class TarSegmentRemoteStoreStrategy implements SegmentRemoteStoreStrategy
     private static final int MAX_UPLOAD_ATTEMPTS = 2;
     private static final String ARCHIVE_BLOB_PREFIX = "segment_archive_";
 
+    /**
+     * Node-level BlobContainer for the segment data path. Populated lazily on the first
+     * successful {@link #upload} call and reused for all subsequent {@link #openInput} calls.
+     * Volatile because upload and openInput may run on different threads.
+     */
+    private volatile BlobContainer dataContainer;
+
+    /** Public no-arg constructor used by {@link RbsArchivePlugin}. */
+    public TarSegmentRemoteStoreStrategy() {
+        this(null);
+    }
+
+    /**
+     * Package-private constructor for test injection of a pre-built {@link BlobContainer}.
+     *
+     * @param dataContainer the BlobContainer to use for range-reads in {@link #openInput};
+     *                      may be {@code null} (populated lazily from the first upload)
+     */
+    TarSegmentRemoteStoreStrategy(BlobContainer dataContainer) {
+        this.dataContainer = dataContainer;
+    }
+
     // -----------------------------------------------------------------------
     // Upload
     // -----------------------------------------------------------------------
@@ -92,6 +115,10 @@ public class TarSegmentRemoteStoreStrategy implements SegmentRemoteStoreStrategy
             logger.warn("Unable to extract BlobContainer from RemoteSegmentStoreDirectory — falling back to per-file uploads");
             fallbackUpload(files, sizeMap, storeDirectory, remoteDirectory, shard, listener);
             return;
+        }
+        // Cache the BlobContainer for openInput() calls (range-GETs during segment reads).
+        if (this.dataContainer == null) {
+            this.dataContainer = dataContainer;
         }
 
         String archiveBlobName = ARCHIVE_BLOB_PREFIX + UUID.randomUUID();
@@ -152,6 +179,17 @@ public class TarSegmentRemoteStoreStrategy implements SegmentRemoteStoreStrategy
 
         dataContainer.writeBlob(archiveBlobName, pis, layout.getTotalSize(), false);
         writerThread.join(30_000);
+
+        // Register each uploaded file in RemoteSegmentStoreDirectory's metadata cache with the
+        // TAR blob name + byte offset + length so openInput() can issue a direct range-GET
+        // without re-reading the TAR _index on cache miss.
+        List<TarArchiveBuilder.EntryLocation> locations = layout.getEntries();
+        // entries and locations are parallel lists (same order, same size)
+        for (int i = 0; i < entries.size(); i++) {
+            String file = entries.get(i).getPath();
+            TarArchiveBuilder.EntryLocation loc = locations.get(i);
+            remoteDirectory.postUploadForArchive(file, archiveBlobName, loc.getDataOffset(), loc.getDataLength(), storeDirectory);
+        }
     }
 
     private void fallbackUpload(
@@ -173,15 +211,57 @@ public class TarSegmentRemoteStoreStrategy implements SegmentRemoteStoreStrategy
     // Download
     // -----------------------------------------------------------------------
 
+    /**
+     * Opens an {@link IndexInput} for a segment file stored inside a TAR archive blob.
+     *
+     * <p>Requires that {@code metadata.tarOffset >= 0} and {@code metadata.tarDataLength > 0},
+     * which are set by {@link RemoteSegmentStoreDirectory#postUploadForArchive} during upload.
+     *
+     * <p>Implementation: issues a single range-GET ({@code BlobContainer.readBlob(blobName,
+     * tarOffset, tarDataLength)}) and wraps the result in a {@link ByteArrayIndexInput}.
+     * Reading the full file into memory is acceptable for Lucene segment files (typically &lt; 10 MB).
+     * For very large files the upload already falls back to per-file mode (see
+     * {@link #MAX_ARCHIVE_BYTES}).
+     *
+     * @throws IOException if the BlobContainer is not available (no upload has occurred yet)
+     *                     or if the metadata does not have archive offset information
+     */
     @Override
     public IndexInput openInput(String name, UploadedSegmentMetadata metadata) throws IOException {
-        // TODO: Implement range-GET download using TarSegmentParser + BlobContainer.readBlob(name, offset, length)
-        //       Requires access to the BlobContainer at download time. This is tracked in rbs-archive-plugin-plan.md.
-        throw new UnsupportedOperationException(
-            "TarSegmentRemoteStoreStrategy.openInput() not yet implemented — "
-                + "range-GET download requires BlobContainer injection at strategy construction time. "
-                + "Tracked: rbs-archive-plugin-plan.md"
-        );
+        if (dataContainer == null) {
+            throw new IOException(
+                "TarSegmentRemoteStoreStrategy.openInput(): BlobContainer not yet initialised "
+                    + "(no upload has occurred on this node). File: " + name
+            );
+        }
+
+        long tarOffset = metadata.getTarOffset();
+        long tarDataLength = metadata.getTarDataLength();
+
+        if (tarOffset < 0 || tarDataLength <= 0) {
+            // This file was uploaded per-file (not in a TAR), or metadata is from before archiving.
+            throw new IOException(
+                "No archive location for segment file '" + name + "' (tarOffset=" + tarOffset
+                    + ", tarDataLength=" + tarDataLength + "); cannot use TAR range-GET"
+            );
+        }
+
+        String archiveBlobName = metadata.getUploadedFilename();
+        logger.debug("openInput: range-GET {} offset={} length={} from {}", name, tarOffset, tarDataLength, archiveBlobName);
+
+        byte[] fileBytes;
+        try (java.io.InputStream in = dataContainer.readBlob(archiveBlobName, tarOffset, tarDataLength)) {
+            fileBytes = in.readAllBytes();
+        }
+
+        if (fileBytes.length != tarDataLength) {
+            throw new IOException(
+                "openInput: expected " + tarDataLength + " bytes for '" + name
+                    + "' but got " + fileBytes.length
+            );
+        }
+
+        return new ByteArrayIndexInput("tar:" + archiveBlobName + "!" + name, fileBytes);
     }
 
     // -----------------------------------------------------------------------

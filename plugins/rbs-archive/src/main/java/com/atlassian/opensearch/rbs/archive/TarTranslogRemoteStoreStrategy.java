@@ -221,23 +221,24 @@ public class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrate
     // ── Per-shard lifecycle methods (download + GC) ───────────────────────────
 
     /**
-     * Recovers a translog generation from archive TARs using the hierarchical path recovery
-     * ({@link TranslogArchiveRecovery#recoverFromHierarchicalPath}).
+     * Recovers a translog generation range from archive TARs in a single pass.
+     *
+     * <p>This is the preferred recovery entry point — it scans the hierarchical txlog path
+     * ({@link TranslogArchiveRecovery#recoverFromHierarchicalPath}) once for the entire range
+     * [minGeneration, maxGeneration] rather than once per generation. This eliminates N
+     * redundant {@code listFolders}/{@code listAllInSortedOrder} RPCs during recovery.
      *
      * <p>Uses the node-level {@link TranslogArchiveIndexCache} to avoid re-reading TAR index
      * blobs when multiple shards recover from the same TAR (common during rolling restarts).
      *
-     * <p>The {@code lastSegmentTimestamp} passed to recovery is {@code Instant.now()} because
-     * at download time we don't have segment upload timestamps — the 2-minute safety margin in
-     * {@link TranslogArchiveRecovery#RECOVERY_START_MARGIN_MINUTES} ensures we scan enough TARs.
-     *
-     * @return {@code true} if the generation was found and extracted from an archive TAR;
-     *         {@code false} to signal that core should use the per-file fallback
+     * @return {@code true} if ALL generations in the range were found and extracted;
+     *         {@code false} if any generation was not found (caller fills gaps from per-file storage)
      */
     @Override
-    public boolean download(
-        long primaryTerm,
-        long generation,
+    public boolean downloadRange(
+        long minGeneration,
+        long maxGeneration,
+        java.util.Map<Long, Long> generationToPrimaryTerm,
         Path location,
         TransferService transferService,
         ShardId shardId,
@@ -251,11 +252,35 @@ public class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrate
             repositoryBasePath,
             shardId.getIndex().getUUID(),
             shardId.id(),
-            generation,
-            generation,
+            minGeneration,
+            maxGeneration,
             location,
             java.time.Instant.now(),
             indexCache
+        );
+    }
+
+    /**
+     * Single-generation download — delegates to {@link #downloadRange} for the degenerate case.
+     *
+     * <p>Core no longer calls this when a strategy is present (it calls {@link #downloadRange}
+     * instead), but other callers (tests, future APIs) may use it.
+     *
+     * @return {@code true} if the generation was found and extracted; {@code false} to fall back
+     */
+    @Override
+    public boolean download(
+        long primaryTerm,
+        long generation,
+        Path location,
+        TransferService transferService,
+        ShardId shardId,
+        BlobPath repositoryBasePath
+    ) throws IOException {
+        return downloadRange(
+            generation, generation,
+            java.util.Map.of(generation, primaryTerm),
+            location, transferService, shardId, repositoryBasePath
         );
     }
 

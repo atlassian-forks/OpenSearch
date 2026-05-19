@@ -58,7 +58,7 @@ public class TranslogBatchCoordinator {
 
     private static final Logger logger = LogManager.getLogger(TranslogBatchCoordinator.class);
 
-    private static final int UPLOAD_RETRY_MAX_ATTEMPTS = 2;
+    private static final int UPLOAD_RETRY_MAX_ATTEMPTS = 3;
 
     /**
      * Maximum total uncompressed bytes across all shard entries in one batch.
