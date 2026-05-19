@@ -68,7 +68,8 @@ public class TranslogBatchCoordinator {
 
     private final String nodeId;
     /** Archive base path — repository base; the strategy will compute the full archive path from this. */
-    private volatile TarTranslogRemoteStoreStrategy strategy;
+    /** Package-private for test injection and verification. */
+    volatile TarTranslogRemoteStoreStrategy strategy;
     private final long archiveMaxWaitMillis;
     private final int archiveThreshold;
 

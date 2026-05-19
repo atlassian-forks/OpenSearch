@@ -117,6 +117,9 @@ public class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrate
             return true;
         }
 
+        // Capture basePath so GC (which may run on cluster-manager before any download occurs) can use it.
+        lastKnownBasePath = repositoryBasePath;
+
         var meta = snapshot.getTranslogTransferMetadata();
         TranslogShardBatch batch = new TranslogShardBatch(
             iUUID, sId,
