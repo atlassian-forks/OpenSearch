@@ -8,7 +8,7 @@
 
 opensearchplugin {
     description 'RBS Archive Plugin — provides TAR-based upload strategies for OpenSearch Remote Backed Storage'
-    classname 'com.atlassian.opensearch.rbs.archive.RbsArchivePlugin'
+    classname 'org.opensearch.plugin.rbs.archive.RbsArchivePlugin'
 }
 
 // No runtime external dependencies — uses OpenSearch server APIs only.
