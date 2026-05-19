@@ -156,6 +156,15 @@ public class TranslogBatchCoordinator {
         this.strategy = strategy;
     }
 
+    /**
+     * Returns the {@link TransferService} captured from the most recent batch dispatch,
+     * or {@code null} if no batch has been dispatched yet.
+     * Used by {@link TarTranslogRemoteStoreStrategy#runArchiveGc} to list/delete blobs.
+     */
+    public TransferService getLastKnownTransferService() {
+        return batchTransferService;
+    }
+
     public void submitAndWait(TranslogShardBatch shardBatch, TransferService transferService, BlobPath repositoryBasePath) throws IOException {
         if (closed) {
             throw new IOException("TranslogBatchCoordinator is closed");

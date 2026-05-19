@@ -63,14 +63,30 @@ public interface TranslogRemoteStoreStrategy {
     /**
      * Download translog files for the given primary term and generation.
      *
-     * @param primaryTerm the primary term of the translog generation to recover
-     * @param generation  the generation to recover
-     * @param location    the local directory to write the recovered files to
-     * @return {@code true} if the generation was found and downloaded; {@code false} if not found
-     *         (core may then fall back to the default per-file download)
+     * <p>Core calls this when recovering translog from remote storage. The strategy may return
+     * {@code false} to let core fall back to its default per-file download
+     * ({@link org.opensearch.index.translog.transfer.TranslogTransferManager#downloadTranslog}).
+     *
+     * <p>A TAR-based implementation would scan archive blobs for the requested generation and
+     * extract the matching {@code .tlog}/{@code .ckp} files to {@code location}.
+     *
+     * @param primaryTerm        the primary term of the generation to recover
+     * @param generation         the generation to recover
+     * @param location           local directory to write the recovered files to
+     * @param transferService    transfer service for blob I/O; same repository as used at upload time
+     * @param shardId            identifies the shard (used for path construction)
+     * @param repositoryBasePath translog repository base path
+     * @return {@code true} if the generation was found and downloaded; {@code false} to fall back
      * @throws IOException if the download fails
      */
-    boolean download(long primaryTerm, long generation, Path location) throws IOException;
+    boolean download(
+        long primaryTerm,
+        long generation,
+        Path location,
+        TransferService transferService,
+        ShardId shardId,
+        BlobPath repositoryBasePath
+    ) throws IOException;
 
     /**
      * Decide how to handle stale translog blob cleanup for this shard.

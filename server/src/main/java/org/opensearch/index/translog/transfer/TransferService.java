@@ -146,6 +146,18 @@ public interface TransferService {
     InputStream downloadBlob(Iterable<String> path, String fileName) throws IOException;
 
     /**
+     * Downloads a byte range from a blob — used by the TAR archive GC scanner to
+     * read only the GC prefix without fetching the full TAR blob.
+     *
+     * @param path     blob directory path components
+     * @param fileName blob name
+     * @param position byte offset to start reading from (inclusive)
+     * @param length   number of bytes to read
+     * @return input stream positioned at {@code position} and limited to {@code length} bytes
+     */
+    InputStream downloadBlob(Iterable<String> path, String fileName, long position, long length) throws IOException;
+
+    /**
      *
      * @param path  the remote path from where download should be made
      * @param fileName the name of the file

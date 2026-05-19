@@ -259,6 +259,11 @@ public class BlobStoreTransferService implements TransferService {
     }
 
     @Override
+    public InputStream downloadBlob(Iterable<String> path, String fileName, long position, long length) throws IOException {
+        return blobStore.blobContainer((BlobPath) path).readBlob(fileName, position, length);
+    }
+
+    @Override
     @ExperimentalApi
     public InputStreamWithMetadata downloadBlobWithMetadata(Iterable<String> path, String fileName) throws IOException {
         assert blobStore.isBlobMetadataEnabled();

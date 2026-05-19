@@ -177,6 +177,7 @@ import org.opensearch.index.store.StoreStats;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
 import org.opensearch.index.translog.RemoteFsTranslog;
+import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 import org.opensearch.index.translog.RemoteTranslogStats;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogConfig;
@@ -4090,6 +4091,14 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         );
     }
 
+    /**
+     * Returns the plugin-provided translog strategy from {@code provider}, or {@code null}
+     * when no plugin is registered (core falls back to the default per-file translog behaviour).
+     */
+    private TranslogRemoteStoreStrategy resolveTranslogStrategy(RemoteStoreStrategyProvider provider) {
+        return provider.getTranslogStrategy(); // null means "use core default"
+    }
+
     private boolean isRemoteStoreEnabled() {
         return (remoteStore != null && shardRouting.primary());
     }
@@ -5095,7 +5104,8 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             logger,
             shouldSeedRemoteStore(),
             isTranslogMetadataEnabled,
-            timestamp
+            timestamp,
+            resolveTranslogStrategy(remoteStoreStrategyProvider)
         );
     }
 

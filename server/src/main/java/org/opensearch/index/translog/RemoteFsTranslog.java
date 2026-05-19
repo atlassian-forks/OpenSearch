@@ -195,6 +195,23 @@ public class RemoteFsTranslog extends Translog {
         boolean isTranslogMetadataEnabled,
         long timestamp
     ) throws IOException {
+        download(repository, shardId, threadPool, location, pathStrategy, remoteStoreSettings,
+            logger, seedRemote, isTranslogMetadataEnabled, timestamp, null);
+    }
+
+    public static void download(
+        Repository repository,
+        ShardId shardId,
+        ThreadPool threadPool,
+        Path location,
+        RemoteStorePathStrategy pathStrategy,
+        RemoteStoreSettings remoteStoreSettings,
+        Logger logger,
+        boolean seedRemote,
+        boolean isTranslogMetadataEnabled,
+        long timestamp,
+        @Nullable TranslogRemoteStoreStrategy translogStrategy
+    ) throws IOException {
         assert repository instanceof BlobStoreRepository : String.format(
             Locale.ROOT,
             "%s repository should be instance of BlobStoreRepository",
@@ -215,8 +232,41 @@ public class RemoteFsTranslog extends Translog {
             remoteStoreSettings,
             isTranslogMetadataEnabled
         );
-        RemoteFsTranslog.download(translogTransferManager, location, logger, seedRemote, timestamp);
+        BlobPath basePath = blobStoreRepository.basePath();
+        if (translogStrategy != null) {
+            RemoteFsTranslog.downloadWithStrategy(translogTransferManager, location, logger, seedRemote, timestamp, translogStrategy, basePath);
+        } else {
+            RemoteFsTranslog.download(translogTransferManager, location, logger, seedRemote, timestamp);
+        }
         logger.trace(remoteTranslogTransferTracker.toString());
+    }
+
+    /** Delegates to the strategy-aware overload of {@link #downloadOnce}. */
+    static void downloadWithStrategy(
+        TranslogTransferManager translogTransferManager,
+        Path location,
+        Logger logger,
+        boolean seedRemote,
+        long timestamp,
+        @Nullable TranslogRemoteStoreStrategy translogStrategy,
+        @Nullable BlobPath repositoryBasePath
+    ) throws IOException {
+        IOException ex = null;
+        for (int i = 0; i <= DOWNLOAD_RETRIES; i++) {
+            boolean success = false;
+            long startTimeMs = System.currentTimeMillis();
+            try {
+                downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp, translogStrategy, repositoryBasePath);
+                success = true;
+                return;
+            } catch (FileNotFoundException | NoSuchFileException e) {
+                ex = e;
+            } finally {
+                logger.trace("downloadOnce success={} timeElapsed={}", success, (System.currentTimeMillis() - startTimeMs));
+            }
+        }
+        logger.info("Exhausted all download retries during translog/checkpoint file download");
+        throw ex;
     }
 
     // Visible for testing
@@ -255,6 +305,18 @@ public class RemoteFsTranslog extends Translog {
         boolean seedRemote,
         long timestamp
     ) throws IOException {
+        downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp, null, null);
+    }
+
+    private static void downloadOnce(
+        TranslogTransferManager translogTransferManager,
+        Path location,
+        Logger logger,
+        boolean seedRemote,
+        long timestamp,
+        @Nullable TranslogRemoteStoreStrategy translogStrategy,
+        @Nullable BlobPath repositoryBasePath
+    ) throws IOException {
         logger.debug("Downloading translog files from remote");
         RemoteTranslogTransferTracker statsTracker = translogTransferManager.getRemoteTranslogTransferTracker();
         long prevDownloadBytesSucceeded = statsTracker.getDownloadBytesSucceeded();
@@ -273,7 +335,21 @@ public class RemoteFsTranslog extends Translog {
             Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
             for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
                 String generation = Long.toString(i);
-                translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
+                long primaryTerm = Long.parseLong(generationToPrimaryTermMapper.get(generation));
+                boolean downloaded = false;
+                if (translogStrategy != null && repositoryBasePath != null) {
+                    // Let the plugin strategy try first (e.g. extract from TAR archive blob).
+                    // Returns false to fall back to the default per-file download.
+                    downloaded = translogStrategy.download(
+                        primaryTerm, i, location,
+                        translogTransferManager.getTransferService(),
+                        translogTransferManager.getShardId(),
+                        repositoryBasePath
+                    );
+                }
+                if (!downloaded) {
+                    translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
+                }
             }
             logger.info(
                 "Downloaded translog and checkpoint files from={} to={}",

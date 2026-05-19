@@ -63,4 +63,4 @@ testfixtures_shared/
 .ci/jobs/
 
 # build files generated
-doc-tools/missing-doclet/bin/
+doc-tools/missing-doclet/bin/.tmp/

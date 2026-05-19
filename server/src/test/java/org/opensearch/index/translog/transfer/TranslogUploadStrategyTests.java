@@ -59,7 +59,9 @@ public class TranslogUploadStrategyTests extends OpenSearchTestCase {
             }
 
             @Override
-            public boolean download(long primaryTerm, long generation, Path location) throws java.io.IOException {
+            public boolean download(long primaryTerm, long generation, Path location,
+                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
+                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
                 return manager.downloadTranslog(String.valueOf(primaryTerm), String.valueOf(generation), location);
             }
         };
@@ -81,7 +83,9 @@ public class TranslogUploadStrategyTests extends OpenSearchTestCase {
             }
 
             @Override
-            public boolean download(long primaryTerm, long generation, Path location) throws java.io.IOException {
+            public boolean download(long primaryTerm, long generation, Path location,
+                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
+                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
                 return false;
             }
         };
@@ -103,7 +107,9 @@ public class TranslogUploadStrategyTests extends OpenSearchTestCase {
             }
 
             @Override
-            public boolean download(long primaryTerm, long generation, Path location) throws java.io.IOException {
+            public boolean download(long primaryTerm, long generation, Path location,
+                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
+                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
                 return false;
             }
 
