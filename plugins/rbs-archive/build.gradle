@@ -11,4 +11,11 @@ opensearchplugin {
     classname 'com.atlassian.opensearch.rbs.archive.RbsArchivePlugin'
 }
 
-// No external dependencies — uses OpenSearch server APIs only
+// No runtime external dependencies — uses OpenSearch server APIs only.
+// commons-compress is used ONLY in tests as an independent TAR validator.
+dependencies {
+    // commons-compress + commons-io are used ONLY in tests as an independent TAR validator.
+    // commons-compress 1.26+ requires commons-io at runtime (NullInputStream etc.)
+    testImplementation "org.apache.commons:commons-compress:${versions.commonscompress}"
+    testImplementation "commons-io:commons-io:${versions.commonsio}"
+}

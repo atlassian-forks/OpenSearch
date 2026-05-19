@@ -223,8 +223,10 @@ public final class TarArchiveBuilder {
         List<Long> sizes = new ArrayList<>(entries.size());
         for (ArchiveBuildEntry e : entries) {
             String path = e.getPath();
-            if (path.getBytes(StandardCharsets.UTF_8).length > 100) {
-                throw new IOException("TAR path too long (max 100 bytes): " + path);
+            // TAR name field is 100 bytes but the last byte must be '\0' (null terminator),
+            // so the effective maximum usable path length is 99 bytes.
+            if (path.getBytes(StandardCharsets.UTF_8).length > 99) {
+                throw new IOException("TAR path too long (max 99 bytes): " + path);
             }
             paths.add(path);
             sizes.add(e.getSize());
