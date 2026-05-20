@@ -236,13 +236,73 @@ public class RemoteFsTranslog extends Translog {
             remoteStoreSettings,
             isTranslogMetadataEnabled
         );
+        download(blobStoreRepository, translogTransferManager, location, logger, seedRemote, timestamp, translogStrategy, null, null);
+        logger.trace(remoteTranslogTransferTracker.toString());
+    }
+
+    /**
+     * Strategy-aware download with full 3-step fallback chain.
+     * Accepts {@code strategyProvider} and {@code currentStrategyName} so that the fallback chain
+     * (current strategy → other registered strategies → per-file default) works correctly during
+     * recovery across strategy changes (TAR→off→TAR etc.).
+     */
+    public static void download(
+        Repository repository,
+        ShardId shardId,
+        ThreadPool threadPool,
+        Path location,
+        RemoteStorePathStrategy pathStrategy,
+        RemoteStoreSettings remoteStoreSettings,
+        Logger logger,
+        boolean seedRemote,
+        boolean isTranslogMetadataEnabled,
+        long timestamp,
+        @Nullable TranslogRemoteStoreStrategy translogStrategy,
+        @Nullable RemoteStoreStrategyProvider strategyProvider,
+        @Nullable String currentStrategyName
+    ) throws IOException {
+        assert repository instanceof BlobStoreRepository : String.format(
+            Locale.ROOT,
+            "%s repository should be instance of BlobStoreRepository",
+            shardId
+        );
+        BlobStoreRepository blobStoreRepository = (BlobStoreRepository) repository;
+        RemoteTranslogTransferTracker remoteTranslogTransferTracker = new RemoteTranslogTransferTracker(shardId, 1000);
+        FileTransferTracker fileTransferTracker = new FileTransferTracker(shardId, remoteTranslogTransferTracker);
+        TranslogTransferManager translogTransferManager = buildTranslogTransferManager(
+            blobStoreRepository,
+            threadPool,
+            shardId,
+            fileTransferTracker,
+            remoteTranslogTransferTracker,
+            pathStrategy,
+            remoteStoreSettings,
+            isTranslogMetadataEnabled
+        );
+        download(blobStoreRepository, translogTransferManager, location, logger, seedRemote, timestamp,
+            translogStrategy, strategyProvider, currentStrategyName);
+        logger.trace(remoteTranslogTransferTracker.toString());
+    }
+
+    /** Internal download helper shared by both public overloads. */
+    private static void download(
+        BlobStoreRepository blobStoreRepository,
+        TranslogTransferManager translogTransferManager,
+        Path location,
+        Logger logger,
+        boolean seedRemote,
+        long timestamp,
+        @Nullable TranslogRemoteStoreStrategy translogStrategy,
+        @Nullable RemoteStoreStrategyProvider strategyProvider,
+        @Nullable String currentStrategyName
+    ) throws IOException {
         BlobPath basePath = blobStoreRepository.basePath();
         if (translogStrategy != null) {
-            RemoteFsTranslog.downloadWithStrategy(translogTransferManager, location, logger, seedRemote, timestamp, translogStrategy, basePath);
+            RemoteFsTranslog.downloadWithStrategy(translogTransferManager, location, logger, seedRemote, timestamp,
+                translogStrategy, basePath, strategyProvider, currentStrategyName);
         } else {
             RemoteFsTranslog.download(translogTransferManager, location, logger, seedRemote, timestamp);
         }
-        logger.trace(remoteTranslogTransferTracker.toString());
     }
 
     /** Delegates to the strategy-aware overload of {@link #downloadOnce}. */
@@ -255,12 +315,29 @@ public class RemoteFsTranslog extends Translog {
         @Nullable TranslogRemoteStoreStrategy translogStrategy,
         @Nullable BlobPath repositoryBasePath
     ) throws IOException {
+        downloadWithStrategy(translogTransferManager, location, logger, seedRemote, timestamp,
+            translogStrategy, repositoryBasePath, null, null);
+    }
+
+    /** Delegates to the strategy-aware overload of {@link #downloadOnce}, with full fallback chain. */
+    static void downloadWithStrategy(
+        TranslogTransferManager translogTransferManager,
+        Path location,
+        Logger logger,
+        boolean seedRemote,
+        long timestamp,
+        @Nullable TranslogRemoteStoreStrategy translogStrategy,
+        @Nullable BlobPath repositoryBasePath,
+        @Nullable RemoteStoreStrategyProvider strategyProvider,
+        @Nullable String currentStrategyName
+    ) throws IOException {
         IOException ex = null;
         for (int i = 0; i <= DOWNLOAD_RETRIES; i++) {
             boolean success = false;
             long startTimeMs = System.currentTimeMillis();
             try {
-                downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp, translogStrategy, repositoryBasePath);
+                downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp,
+                    translogStrategy, repositoryBasePath, strategyProvider, currentStrategyName);
                 success = true;
                 return;
             } catch (FileNotFoundException | NoSuchFileException e) {

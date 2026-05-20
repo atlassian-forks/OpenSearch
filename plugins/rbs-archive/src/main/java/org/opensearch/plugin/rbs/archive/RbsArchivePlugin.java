@@ -123,22 +123,16 @@ public class RbsArchivePlugin extends Plugin implements RemoteStorePlugin {
     ) {
         String nodeId = clusterService.localNode().getId();
 
-        // Build coordinator and strategy together, breaking the circular reference:
-        // strategy → coordinator → strategy is solved by a two-step init:
-        //   1. Create coordinator with a null-strategy placeholder
-        //   2. Create strategy with the coordinator reference
-        //   3. Wire the strategy back into the coordinator via setStrategy()
-        TranslogBatchCoordinator coordinator = new TranslogBatchCoordinator(
-            nodeId,
-            null, // strategy wired below via setStrategy()
-            DEFAULT_ARCHIVE_MAX_WAIT,
-            DEFAULT_ARCHIVE_THRESHOLD
-        );
-        tarTranslogStrategy = new TarTranslogRemoteStoreStrategy(coordinator);
-        coordinator.setStrategy(tarTranslogStrategy);
+        // Create the strategy with a null coordinator initially.
+        // The coordinator is created and wired in TranslogBatchCollector.doStart(),
+        // which is called by OpenSearch before any shards are opened. This ensures
+        // the strategy always holds the coordinator that the collector manages (not a
+        // discarded temporary one).
+        tarTranslogStrategy = new TarTranslogRemoteStoreStrategy(null);
 
         // The collector manages the coordinator lifecycle (start/stop with the node) and
-        // schedules GC on the elected cluster-manager.
+        // schedules GC on the elected cluster-manager. On doStart() it creates the
+        // coordinator and calls strategy.setCoordinator() to wire it in.
         TranslogBatchCollector collector = new TranslogBatchCollector(
             nodeId,
             clusterService,

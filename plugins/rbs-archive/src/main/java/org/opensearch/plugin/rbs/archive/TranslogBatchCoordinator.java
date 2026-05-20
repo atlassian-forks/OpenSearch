@@ -327,6 +327,13 @@ class TranslogBatchCoordinator {
         } finally {
             lock.unlock();
         }
+        // Wait briefly for the timer thread to terminate so callers (e.g. TranslogBatchCollector.doStop)
+        // don't leave a dangling thread behind.
+        try {
+            timerExecutor.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** Returns this node's ID. */

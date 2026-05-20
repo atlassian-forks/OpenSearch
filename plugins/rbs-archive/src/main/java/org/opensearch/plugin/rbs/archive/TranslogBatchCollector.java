@@ -86,6 +86,8 @@ final class TranslogBatchCollector extends AbstractLifecycleComponent implements
             archiveMaxWait,
             archiveThreshold
         );
+        // Wire the fresh coordinator into the strategy so uploads go to the right coordinator instance.
+        strategy.setCoordinator(coordinator);
         // Register as cluster-manager listener to start/stop GC task on leadership changes
         clusterService.addLocalNodeClusterManagerListener(this);
         logger.info("TranslogBatchCollector started (maxWait={}, threshold={})", archiveMaxWait, archiveThreshold);
@@ -100,6 +102,9 @@ final class TranslogBatchCollector extends AbstractLifecycleComponent implements
             c.close();
             coordinator = null;
         }
+        // Clear the coordinator from the strategy so any upload attempt after stop gets a clear NPE/failure
+        // rather than silently submitting to a closed coordinator.
+        strategy.setCoordinator(null);
         logger.info("TranslogBatchCollector stopped");
     }
 

@@ -5100,6 +5100,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         boolean isTranslogMetadataEnabled,
         long timestamp
     ) throws IOException {
+        String strategyName = indexSettings().getValue(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_STRATEGY_SETTING);
         RemoteFsTranslog.download(
             repository,
             shardId,
@@ -5111,7 +5112,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             shouldSeedRemoteStore(),
             isTranslogMetadataEnabled,
             timestamp,
-            resolveTranslogStrategy(remoteStoreStrategyProvider)
+            resolveTranslogStrategy(remoteStoreStrategyProvider),
+            remoteStoreStrategyProvider,
+            strategyName
         );
     }
 

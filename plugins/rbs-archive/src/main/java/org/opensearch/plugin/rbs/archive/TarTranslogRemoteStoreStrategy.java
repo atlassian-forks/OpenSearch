@@ -55,7 +55,7 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
 
     private static final int PIPE_BUFFER_BYTES = 256 * 1024;
 
-    private final TranslogBatchCoordinator coordinator;
+    private volatile TranslogBatchCoordinator coordinator;
     /** Node-level LRU cache for parsed TAR {@code _index} entries, shared across all recovery calls. */
     private final TranslogArchiveIndexCache indexCache;
     /**
@@ -72,6 +72,20 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
     TarTranslogRemoteStoreStrategy(TranslogBatchCoordinator coordinator, TranslogArchiveIndexCache indexCache) {
         this.coordinator = coordinator;
         this.indexCache = indexCache;
+    }
+
+    /**
+     * Replaces the coordinator reference. Called by {@link TranslogBatchCollector} each time the
+     * node starts ({@code doStart}) or stops ({@code doStop}) to wire in the freshly-created
+     * coordinator (or clear it on stop). Must be called before any shard calls {@link #upload}.
+     */
+    void setCoordinator(TranslogBatchCoordinator newCoordinator) {
+        this.coordinator = newCoordinator;
+    }
+
+    /** Returns the current coordinator, or {@code null} if not yet started or stopped. Package-private for tests. */
+    TranslogBatchCoordinator getCoordinator() {
+        return coordinator;
     }
 
 
@@ -128,8 +142,16 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
             files
         );
 
+        TranslogBatchCoordinator c = coordinator;
+        if (c == null) {
+            // Coordinator is null when the collector has not started yet or has been stopped.
+            // Fall back to notifying failure so core falls back to per-file upload.
+            IOException ex = new IOException("TAR translog coordinator not available (collector not started or stopped)");
+            listener.onUploadFailed(snapshot, ex);
+            return false;
+        }
         try {
-            coordinator.submitAndWait(batch, transferService, repositoryBasePath);
+            c.submitAndWait(batch, transferService, repositoryBasePath);
             listener.onUploadComplete(snapshot);
             return true;
         } catch (IOException e) {

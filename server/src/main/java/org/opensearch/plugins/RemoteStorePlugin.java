@@ -23,8 +23,9 @@ import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
  * providing a compatible download and GC implementation.
  * <p>
  * If a method returns {@code null}, the built-in default behavior is used for that
- * data type. At most one {@link RemoteStorePlugin} may be loaded per node;
- * loading multiple implementations will result in a warning and only the first is used.
+ * data type. Multiple {@link RemoteStorePlugin} implementations may be loaded simultaneously,
+ * each identified by a unique {@link #getStrategyName()}. Plugins with conflicting names
+ * are skipped with a warning.
  *
  * @opensearch.spi
  */

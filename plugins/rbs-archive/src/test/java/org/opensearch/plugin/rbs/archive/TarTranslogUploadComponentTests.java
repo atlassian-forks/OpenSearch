@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
 /**
  * Component integration tests for the end-to-end TAR translog upload path.
@@ -172,16 +173,31 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
         TransferSnapshot snapshot = buildSnapshot(1L, generation, 5L);
         strategy.upload(snapshot, NOOP_LISTENER, transferService, SHARD_ID, basePath);
 
-        // Find the TAR blob
+        // Find the TAR blob — search all day-dirs and minute-dirs (upload may span midnight boundary)
         BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(basePath);
-        String[] dayDirs = blobStore.blobContainer(txlogRoot).children().keySet().toArray(new String[0]);
-        assertEquals(1, dayDirs.length);
-        String[] minuteDirs = blobStore.blobContainer(txlogRoot.add(dayDirs[0])).children().keySet().toArray(new String[0]);
-        assertEquals(1, minuteDirs.length);
-        BlobPath minutePath = txlogRoot.add(dayDirs[0]).add(minuteDirs[0]);
+        String[] dayDirs = blobStore.blobContainer(txlogRoot).children().keySet().stream().sorted().toArray(String[]::new);
+        assertThat("Should have at least one day directory", dayDirs.length, greaterThanOrEqualTo(1));
+
+        // Find the latest minute-dir that contains at least one TAR blob
+        BlobPath minutePath = null;
+        String tarBlobName = null;
+        outer:
+        for (int d = dayDirs.length - 1; d >= 0; d--) {
+            String[] minuteDirs = blobStore.blobContainer(txlogRoot.add(dayDirs[d])).children()
+                .keySet().stream().sorted().toArray(String[]::new);
+            for (int m = minuteDirs.length - 1; m >= 0; m--) {
+                BlobPath candidate = txlogRoot.add(dayDirs[d]).add(minuteDirs[m]);
+                Map<String, ?> blobs = blobStore.blobContainer(candidate).listBlobs();
+                String tar = blobs.keySet().stream().filter(n -> n.endsWith(".tar")).findFirst().orElse(null);
+                if (tar != null) {
+                    minutePath = candidate;
+                    tarBlobName = tar;
+                    break outer;
+                }
+            }
+        }
+        assertNotNull("TAR blob should exist in some minute-dir", tarBlobName);
         Map<String, ?> blobs = blobStore.blobContainer(minutePath).listBlobs();
-        String tarBlobName = blobs.keySet().stream().filter(n -> n.endsWith(".tar")).findFirst().orElse(null);
-        assertNotNull("TAR blob should exist in minute-dir", tarBlobName);
 
         // Download the full TAR and parse its index
         byte[] tarBytes;
