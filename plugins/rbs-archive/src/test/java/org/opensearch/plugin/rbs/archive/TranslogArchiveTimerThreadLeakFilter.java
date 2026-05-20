@@ -6,17 +6,16 @@
  * compatible open source license.
  */
 
-package org.opensearch.index.translog;
+package org.opensearch.plugin.rbs.archive;
 
 import com.carrotsearch.randomizedtesting.ThreadFilter;
 
 /**
  * Thread leak filter for the translog archive batch timer threads.
  * <p>
- * {@code TranslogBatchCoordinator} (in the rbs-archive plugin) spawns one daemon timer thread
- * per node named {@code "translog-archive-batch-timer-{nodeId}"}. These threads are stopped
- * via {@code TranslogBatchCoordinator.close()} which is called from
- * {@code TranslogBatchCollector.doStop()} → {@code IndicesService.removeIndex()}.
+ * {@code TranslogBatchCoordinator} spawns one daemon timer thread per node named
+ * {@code "translog-archive-batch-timer-{nodeName}"}. These are stopped via
+ * {@code TranslogBatchCoordinator.close()} → {@code TranslogBatchCollector.doStop()}.
  * <p>
  * Test cluster teardown may not call {@code removeIndex()} before the randomized-testing
  * framework checks for thread leaks, so we filter out these known daemon threads to prevent

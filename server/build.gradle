@@ -135,10 +135,6 @@ dependencies {
   internalClusterTestImplementation(project(":test:framework")) {
     exclude group: 'org.opensearch', module: 'server'
   }
-  // rbs-archive plugin: needed by TranslogArchiveUploadIT to load RbsArchivePlugin into the test cluster.
-  internalClusterTestImplementation(project(":plugins:rbs-archive")) {
-    exclude group: 'org.opensearch', module: 'server'
-  }
 }
 
 tasks.withType(JavaCompile).configureEach {

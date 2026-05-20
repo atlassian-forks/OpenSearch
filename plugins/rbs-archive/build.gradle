@@ -6,6 +6,8 @@
  * compatible open source license.
  */
 
+apply plugin: 'opensearch.internal-cluster-test'
+
 opensearchplugin {
     description 'RBS Archive Plugin — provides TAR-based upload strategies for OpenSearch Remote Backed Storage'
     classname 'org.opensearch.plugin.rbs.archive.RbsArchivePlugin'
@@ -18,4 +20,10 @@ dependencies {
     // commons-compress 1.26+ requires commons-io at runtime (NullInputStream etc.)
     testImplementation "org.apache.commons:commons-compress:${versions.commonscompress}"
     testImplementation "commons-io:commons-io:${versions.commonsio}"
+
+    // internalClusterTest: needs RemoteStoreBaseIntegTestCase from the server's internalClusterTest
+    // source set. This is the standard OpenSearch pattern for plugin ITs that test remote-store
+    // behaviour (see repository-s3, repository-azure, etc.).
+    internalClusterTestImplementation(project(":server").sourceSets.internalClusterTest.output)
+    internalClusterTestImplementation(project(":test:framework"))
 }
