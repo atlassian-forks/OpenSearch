@@ -56,8 +56,13 @@ public class RbsArchivePlugin extends Plugin implements RemoteStorePlugin {
     static final TimeValue DEFAULT_GC_INTERVAL = TimeValue.timeValueMinutes(10);
     static final Duration DEFAULT_RETENTION_AGE = Duration.ofHours(2);
 
-    /** Shared node-level TAR translog strategy — created once, shared across all shards. */
-    private TarTranslogRemoteStoreStrategy tarTranslogStrategy;
+    /**
+     * Shared node-level TAR translog strategy — created at plugin construction time so that
+     * {@link #getTranslogStrategy()} can return it when {@code IndicesService} calls it during
+     * {@code RemoteStoreStrategyProvider.fromPlugins()} (before {@link #createComponents} is called).
+     * The coordinator is wired lazily by {@code TranslogBatchCollector.doStart()}.
+     */
+    private final TarTranslogRemoteStoreStrategy tarTranslogStrategy = new TarTranslogRemoteStoreStrategy(null);
 
     /**
      * The strategy name used to identify this plugin in per-index settings.
@@ -118,14 +123,13 @@ public class RbsArchivePlugin extends Plugin implements RemoteStorePlugin {
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
-        String nodeId = clusterService.localNode().getId();
+        // Use getNodeName() — safe to call during createComponents() before cluster state is set.
+        // localNode().getId() would throw "initial cluster state not set yet" at this point.
+        String nodeId = clusterService.getNodeName();
 
-        // Create the strategy with a null coordinator initially.
-        // The coordinator is created and wired in TranslogBatchCollector.doStart(),
-        // which is called by OpenSearch before any shards are opened. This ensures
-        // the strategy always holds the coordinator that the collector manages (not a
-        // discarded temporary one).
-        tarTranslogStrategy = new TarTranslogRemoteStoreStrategy(null);
+        // tarTranslogStrategy is created eagerly at plugin construction so that IndicesService
+        // can register it via getTranslogStrategy() → RemoteStoreStrategyProvider.fromPlugins()
+        // before createComponents() is called. No need to re-create it here.
 
         // The collector manages the coordinator lifecycle (start/stop with the node) and
         // schedules GC on the elected cluster-manager. On doStart() it creates the

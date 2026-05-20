@@ -41,10 +41,14 @@ public class RbsArchivePluginTests extends OpenSearchTestCase {
      * Verifies that the translog strategy returns null before {@code createComponents()} is called.
      * The strategy is wired lazily by the collector's {@code doStart()}.
      */
-    public void testGetTranslogStrategyReturnsNullBeforeCreateComponents() {
-        // Before createComponents(), tarTranslogStrategy is not yet initialized
+    public void testGetTranslogStrategyReturnsNonNullFromConstruction() {
+        // tarTranslogStrategy is created eagerly at field init — non-null from the start
         TranslogRemoteStoreStrategy strategy = plugin.getTranslogStrategy();
-        assertNull("Plugin translog strategy must be null before createComponents() is called", strategy);
+        assertNotNull(
+            "Plugin translog strategy must be non-null from plugin construction (required for IndicesService registration)",
+            strategy
+        );
+        assertTrue("Plugin translog strategy must be a TarTranslogRemoteStoreStrategy", strategy instanceof TarTranslogRemoteStoreStrategy);
     }
 
     /**

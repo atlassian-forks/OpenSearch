@@ -692,6 +692,7 @@ public class IndexShardIT extends OpenSearchSingleNodeTestCase {
             nodeId,
             null,
             DefaultRemoteStoreSettings.INSTANCE,
+            null, // remoteStoreStrategyProvider — use NOOP for test-only shard construction
             false,
             IndexShardTestUtils.getFakeDiscoveryNodes(initializingShardRouting)
         );
