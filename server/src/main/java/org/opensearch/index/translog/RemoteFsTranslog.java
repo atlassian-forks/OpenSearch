@@ -10,6 +10,7 @@ package org.opensearch.index.translog;
 
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.lease.Releasable;
@@ -26,7 +27,6 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.index.translog.transfer.FileTransferTracker;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
-import org.opensearch.common.Nullable;
 import org.opensearch.index.translog.transfer.TranslogCheckpointTransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
@@ -43,10 +43,10 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -199,8 +199,19 @@ public class RemoteFsTranslog extends Translog {
         boolean isTranslogMetadataEnabled,
         long timestamp
     ) throws IOException {
-        download(repository, shardId, threadPool, location, pathStrategy, remoteStoreSettings,
-            logger, seedRemote, isTranslogMetadataEnabled, timestamp, null);
+        download(
+            repository,
+            shardId,
+            threadPool,
+            location,
+            pathStrategy,
+            remoteStoreSettings,
+            logger,
+            seedRemote,
+            isTranslogMetadataEnabled,
+            timestamp,
+            null
+        );
     }
 
     public static void download(
@@ -279,8 +290,17 @@ public class RemoteFsTranslog extends Translog {
             remoteStoreSettings,
             isTranslogMetadataEnabled
         );
-        download(blobStoreRepository, translogTransferManager, location, logger, seedRemote, timestamp,
-            translogStrategy, strategyProvider, currentStrategyName);
+        download(
+            blobStoreRepository,
+            translogTransferManager,
+            location,
+            logger,
+            seedRemote,
+            timestamp,
+            translogStrategy,
+            strategyProvider,
+            currentStrategyName
+        );
         logger.trace(remoteTranslogTransferTracker.toString());
     }
 
@@ -298,8 +318,17 @@ public class RemoteFsTranslog extends Translog {
     ) throws IOException {
         BlobPath basePath = blobStoreRepository.basePath();
         if (translogStrategy != null) {
-            RemoteFsTranslog.downloadWithStrategy(translogTransferManager, location, logger, seedRemote, timestamp,
-                translogStrategy, basePath, strategyProvider, currentStrategyName);
+            RemoteFsTranslog.downloadWithStrategy(
+                translogTransferManager,
+                location,
+                logger,
+                seedRemote,
+                timestamp,
+                translogStrategy,
+                basePath,
+                strategyProvider,
+                currentStrategyName
+            );
         } else {
             RemoteFsTranslog.download(translogTransferManager, location, logger, seedRemote, timestamp);
         }
@@ -315,8 +344,17 @@ public class RemoteFsTranslog extends Translog {
         @Nullable TranslogRemoteStoreStrategy translogStrategy,
         @Nullable BlobPath repositoryBasePath
     ) throws IOException {
-        downloadWithStrategy(translogTransferManager, location, logger, seedRemote, timestamp,
-            translogStrategy, repositoryBasePath, null, null);
+        downloadWithStrategy(
+            translogTransferManager,
+            location,
+            logger,
+            seedRemote,
+            timestamp,
+            translogStrategy,
+            repositoryBasePath,
+            null,
+            null
+        );
     }
 
     /** Delegates to the strategy-aware overload of {@link #downloadOnce}, with full fallback chain. */
@@ -336,8 +374,17 @@ public class RemoteFsTranslog extends Translog {
             boolean success = false;
             long startTimeMs = System.currentTimeMillis();
             try {
-                downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp,
-                    translogStrategy, repositoryBasePath, strategyProvider, currentStrategyName);
+                downloadOnce(
+                    translogTransferManager,
+                    location,
+                    logger,
+                    seedRemote,
+                    timestamp,
+                    translogStrategy,
+                    repositoryBasePath,
+                    strategyProvider,
+                    currentStrategyName
+                );
                 success = true;
                 return;
             } catch (FileNotFoundException | NoSuchFileException e) {
@@ -409,8 +456,7 @@ public class RemoteFsTranslog extends Translog {
         @Nullable TranslogRemoteStoreStrategy translogStrategy,
         @Nullable BlobPath repositoryBasePath
     ) throws IOException {
-        downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp,
-            translogStrategy, repositoryBasePath, null, null);
+        downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp, translogStrategy, repositoryBasePath, null, null);
     }
 
     private static void downloadOnce(
@@ -450,19 +496,22 @@ public class RemoteFsTranslog extends Translog {
             }
 
             // 3-step recovery fallback chain:
-            //   Step 1 — current strategy (null = per-file is step 1 if no strategy configured)
-            //   Step 2 — other registered strategies (handles TAR→off→TAR, multi-plugin)
-            //   Step 3 — default per-file for anything still missing
+            // Step 1 — current strategy (null = per-file is step 1 if no strategy configured)
+            // Step 2 — other registered strategies (handles TAR→off→TAR, multi-plugin)
+            // Step 3 — default per-file for anything still missing
             //
             // This makes recovery safe across strategy changes:
-            //   TAR→off: current=null → step 1 tries per-file, step 2 tries TAR for missing gens
-            //   off→TAR: current=TAR → step 1 tries TAR, step 3 fills old per-file gens
-            //   TAR→off→TAR: current=TAR → step 1 finds both TAR phases, step 3 fills per-file phase
+            // TAR→off: current=null → step 1 tries per-file, step 2 tries TAR for missing gens
+            // off→TAR: current=TAR → step 1 tries TAR, step 3 fills old per-file gens
+            // TAR→off→TAR: current=TAR → step 1 finds both TAR phases, step 3 fills per-file phase
 
             if (translogStrategy != null && repositoryBasePath != null) {
                 // Step 1: current strategy (e.g. TAR) — scans archive hierarchy once for all gens.
                 boolean allFound = translogStrategy.downloadRange(
-                    minGen, maxGen, longGenToPrimaryTerm, location,
+                    minGen,
+                    maxGen,
+                    longGenToPrimaryTerm,
+                    location,
                     translogTransferManager.getTransferService(),
                     translogTransferManager.getShardId(),
                     repositoryBasePath
@@ -474,7 +523,10 @@ public class RemoteFsTranslog extends Translog {
                         if (allMissing(minGen, maxGen, location).isEmpty()) break;
                         logger.debug("Trying fallback strategy [{}] for missing translog gens", other.getClass().getSimpleName());
                         other.downloadRange(
-                            minGen, maxGen, longGenToPrimaryTerm, location,
+                            minGen,
+                            maxGen,
+                            longGenToPrimaryTerm,
+                            location,
                             translogTransferManager.getTransferService(),
                             translogTransferManager.getShardId(),
                             repositoryBasePath
@@ -487,9 +539,7 @@ public class RemoteFsTranslog extends Translog {
                     if (Files.notExists(location.resolve(tlogFile))) {
                         String generation = Long.toString(i);
                         logger.debug("Gen {} missing from all archive strategies, falling back to per-file", i);
-                        translogTransferManager.downloadTranslog(
-                            generationToPrimaryTermMapper.get(generation), generation, location
-                        );
+                        translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
                     }
                 }
             } else {
@@ -499,9 +549,7 @@ public class RemoteFsTranslog extends Translog {
                     String generation = Long.toString(i);
                     String tlogFile = Translog.getFilename(i);
                     try {
-                        translogTransferManager.downloadTranslog(
-                            generationToPrimaryTermMapper.get(generation), generation, location
-                        );
+                        translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
                     } catch (FileNotFoundException | NoSuchFileException missing) {
                         // Step 2: gen not found per-file — try registered archive strategies.
                         // Handles the case: index was previously on TAR, strategy disabled.
@@ -510,7 +558,10 @@ public class RemoteFsTranslog extends Translog {
                             for (TranslogRemoteStoreStrategy other : strategyProvider.allTranslogStrategies()) {
                                 logger.debug("Gen {} not found per-file, trying strategy [{}]", i, other.getClass().getSimpleName());
                                 other.downloadRange(
-                                    i, i, longGenToPrimaryTerm, location,
+                                    i,
+                                    i,
+                                    longGenToPrimaryTerm,
+                                    location,
                                     translogTransferManager.getTransferService(),
                                     translogTransferManager.getShardId(),
                                     repositoryBasePath
@@ -527,11 +578,7 @@ public class RemoteFsTranslog extends Translog {
                     }
                 }
             }
-            logger.info(
-                "Downloaded translog and checkpoint files from={} to={}",
-                minGen,
-                maxGen
-            );
+            logger.info("Downloaded translog and checkpoint files from={} to={}", minGen, maxGen);
 
             statsTracker.recordDownloadStats(prevDownloadBytesSucceeded, prevDownloadTimeInMillis);
 

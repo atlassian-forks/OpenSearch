@@ -151,12 +151,12 @@ import org.opensearch.index.mapper.Uid;
 import org.opensearch.index.merge.MergeStats;
 import org.opensearch.index.recovery.RecoveryStats;
 import org.opensearch.index.refresh.RefreshStats;
+import org.opensearch.index.remote.DefaultSegmentRemoteStoreStrategy;
 import org.opensearch.index.remote.RemoteSegmentStats;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
-import org.opensearch.index.remote.DefaultSegmentRemoteStoreStrategy;
+import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
 import org.opensearch.index.remote.RemoteStoreStrategyProvider;
 import org.opensearch.index.remote.SegmentRemoteStoreStrategy;
-import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
 import org.opensearch.index.search.stats.SearchStats;
 import org.opensearch.index.search.stats.ShardSearchStats;
 import org.opensearch.index.seqno.ReplicationTracker;
@@ -177,12 +177,12 @@ import org.opensearch.index.store.StoreStats;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
 import org.opensearch.index.translog.RemoteFsTranslog;
-import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 import org.opensearch.index.translog.RemoteTranslogStats;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogConfig;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogStats;
+import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 import org.opensearch.index.warmer.ShardIndexWarmerService;
 import org.opensearch.index.warmer.WarmerStats;
 import org.opensearch.indices.IndexingMemoryController;
@@ -4089,9 +4089,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             return strategy;
         }
         // Default: per-file upload with shard's own segment transfer tracker
-        return new DefaultSegmentRemoteStoreStrategy(
-            remoteStoreStatsTrackerFactory.getRemoteSegmentTransferTracker(shardId())
-        );
+        return new DefaultSegmentRemoteStoreStrategy(remoteStoreStatsTrackerFactory.getRemoteSegmentTransferTracker(shardId()));
     }
 
     /**

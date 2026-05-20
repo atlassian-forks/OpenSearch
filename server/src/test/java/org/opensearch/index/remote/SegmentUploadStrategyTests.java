@@ -61,17 +61,22 @@ public class SegmentUploadStrategyTests extends OpenSearchTestCase {
     public void testCustomStrategyCanReturnSkipForGc() throws Exception {
         SegmentRemoteStoreStrategy customStrategy = new SegmentRemoteStoreStrategy() {
             @Override
-            public void upload(java.util.Collection<String> files, Map<String, Long> sizeMap,
-                               org.apache.lucene.store.Directory store,
-                               org.opensearch.index.store.RemoteSegmentStoreDirectory remote,
-                               org.opensearch.index.shard.IndexShard shard,
-                               ActionListener<Void> listener) {
+            public void upload(
+                java.util.Collection<String> files,
+                Map<String, Long> sizeMap,
+                org.apache.lucene.store.Directory store,
+                org.opensearch.index.store.RemoteSegmentStoreDirectory remote,
+                org.opensearch.index.shard.IndexShard shard,
+                ActionListener<Void> listener
+            ) {
                 listener.onResponse(null);
             }
 
             @Override
-            public org.apache.lucene.store.IndexInput openInput(String name,
-                    org.opensearch.index.store.RemoteSegmentStoreDirectory.UploadedSegmentMetadata metadata) {
+            public org.apache.lucene.store.IndexInput openInput(
+                String name,
+                org.opensearch.index.store.RemoteSegmentStoreDirectory.UploadedSegmentMetadata metadata
+            ) {
                 throw new UnsupportedOperationException();
             }
 

@@ -9,17 +9,14 @@
 package org.opensearch.plugin.rbs.archive;
 
 import org.opensearch.client.Client;
-import org.opensearch.cluster.service.ClusterService;
-import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.common.unit.TimeValue;
-import org.opensearch.env.Environment;
-import org.opensearch.env.NodeEnvironment;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.env.Environment;
+import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.remote.SegmentRemoteStoreStrategy;
-// TranslogBatchCoordinator is in same plugin package
-// TranslogBatchCollector is in same plugin package
 import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.RemoteStorePlugin;

@@ -20,7 +20,6 @@ import org.opensearch.common.util.UploadListener;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
-// IndexShard is kept for the interface contract (upload signature)
 import org.opensearch.index.store.RemoteSegmentStoreDirectory.UploadedSegmentMetadata;
 
 import java.io.IOException;

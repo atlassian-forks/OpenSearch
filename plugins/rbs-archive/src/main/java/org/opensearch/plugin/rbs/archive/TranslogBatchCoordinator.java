@@ -11,11 +11,9 @@ package org.opensearch.plugin.rbs.archive;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
-import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.translog.transfer.TransferService;
-// TranslogShardBatch is in same plugin package
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -164,7 +162,8 @@ class TranslogBatchCoordinator {
         return batchTransferService;
     }
 
-    public void submitAndWait(TranslogShardBatch shardBatch, TransferService transferService, BlobPath repositoryBasePath) throws IOException {
+    public void submitAndWait(TranslogShardBatch shardBatch, TransferService transferService, BlobPath repositoryBasePath)
+        throws IOException {
         if (closed) {
             throw new IOException("TranslogBatchCoordinator is closed");
         }
@@ -202,8 +201,12 @@ class TranslogBatchCoordinator {
             if (!firstArrivalTimerScheduled && !dispatching) {
                 firstArrivalTimerScheduled = true;
                 timerExecutor.schedule(this::onTimerExpiry, archiveMaxWaitMillis, TimeUnit.MILLISECONDS);
-                logger.debug("Archive batch timer started ({} ms), first shard: {}:{}", archiveMaxWaitMillis,
-                    shardBatch.getIndexUUID(), shardBatch.getShardId());
+                logger.debug(
+                    "Archive batch timer started ({} ms), first shard: {}:{}",
+                    archiveMaxWaitMillis,
+                    shardBatch.getIndexUUID(),
+                    shardBatch.getShardId()
+                );
             }
 
             // Early dispatch conditions: threshold reached OR byte cap exceeded
@@ -211,8 +214,12 @@ class TranslogBatchCoordinator {
             boolean bytesCapReached = pendingBatchBytes >= MAX_BATCH_BYTES;
 
             if ((thresholdReached || bytesCapReached) && !dispatching) {
-                logger.debug("Archive batch dispatch triggered: threshold={} byteCap={} shards={}",
-                    thresholdReached, bytesCapReached, pendingShards.size());
+                logger.debug(
+                    "Archive batch dispatch triggered: threshold={} byteCap={} shards={}",
+                    thresholdReached,
+                    bytesCapReached,
+                    pendingShards.size()
+                );
                 dispatchBatch();
             }
 
@@ -290,7 +297,8 @@ class TranslogBatchCoordinator {
      * Delegates the actual archive building and upload to {@code TarTranslogRemoteStoreStrategy#uploadBatch}.
      * Retries up to {@link #UPLOAD_RETRY_MAX_ATTEMPTS} times on failure.
      */
-    private void uploadBatchWithRetry(List<TranslogShardBatch> batch, BlobPath basePath, TransferService transferService) throws IOException {
+    private void uploadBatchWithRetry(List<TranslogShardBatch> batch, BlobPath basePath, TransferService transferService)
+        throws IOException {
         IOException lastFailure = null;
         for (int attempt = 0; attempt < UPLOAD_RETRY_MAX_ATTEMPTS; attempt++) {
             try {
@@ -301,8 +309,12 @@ class TranslogBatchCoordinator {
                 lastFailure = e;
                 final int attemptNum = attempt + 1;
                 logger.warn(
-                    () -> new ParameterizedMessage("Archive upload attempt {} of {} failed (shards={})",
-                        attemptNum, UPLOAD_RETRY_MAX_ATTEMPTS, batch.size()),
+                    () -> new ParameterizedMessage(
+                        "Archive upload attempt {} of {} failed (shards={})",
+                        attemptNum,
+                        UPLOAD_RETRY_MAX_ATTEMPTS,
+                        batch.size()
+                    ),
                     e
                 );
             }

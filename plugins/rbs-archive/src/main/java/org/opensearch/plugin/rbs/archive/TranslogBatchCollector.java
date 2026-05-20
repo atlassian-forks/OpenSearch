@@ -15,11 +15,10 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.threadpool.Scheduler;
 import org.opensearch.index.translog.transfer.TransferService;
+import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
-import java.io.IOException;
 import java.time.Duration;
 
 /**
@@ -80,12 +79,7 @@ final class TranslogBatchCollector extends AbstractLifecycleComponent implements
 
     @Override
     protected void doStart() {
-        coordinator = new TranslogBatchCoordinator(
-            nodeId,
-            strategy,
-            archiveMaxWait,
-            archiveThreshold
-        );
+        coordinator = new TranslogBatchCoordinator(nodeId, strategy, archiveMaxWait, archiveThreshold);
         // Wire the fresh coordinator into the strategy so uploads go to the right coordinator instance.
         strategy.setCoordinator(coordinator);
         // Register as cluster-manager listener to start/stop GC task on leadership changes

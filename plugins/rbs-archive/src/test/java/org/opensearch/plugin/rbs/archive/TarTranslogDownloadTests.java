@@ -64,7 +64,10 @@ public class TarTranslogDownloadTests extends OpenSearchTestCase {
         Path dir = createTempDir();
 
         boolean found = TarTranslogRemoteStoreStrategy.extractGenerationFromTarStream(
-            new ByteArrayInputStream(tar), tlogName, ckpName, dir
+            new ByteArrayInputStream(tar),
+            tlogName,
+            ckpName,
+            dir
         );
 
         assertTrue("Should report found=true when both files present", found);
@@ -82,7 +85,10 @@ public class TarTranslogDownloadTests extends OpenSearchTestCase {
         Path dir = createTempDir();
 
         boolean found = TarTranslogRemoteStoreStrategy.extractGenerationFromTarStream(
-            new ByteArrayInputStream(tar), tlogName, ckpName, dir
+            new ByteArrayInputStream(tar),
+            tlogName,
+            ckpName,
+            dir
         );
 
         assertFalse("Should return false when only .tlog is present", found);
@@ -101,7 +107,10 @@ public class TarTranslogDownloadTests extends OpenSearchTestCase {
         Path dir = createTempDir();
 
         boolean found = TarTranslogRemoteStoreStrategy.extractGenerationFromTarStream(
-            new ByteArrayInputStream(tar), tlogName, ckpName, dir
+            new ByteArrayInputStream(tar),
+            tlogName,
+            ckpName,
+            dir
         );
 
         assertFalse("Should return false when generation not in TAR", found);
@@ -114,14 +123,14 @@ public class TarTranslogDownloadTests extends OpenSearchTestCase {
         String ckpName = org.opensearch.index.translog.Translog.getCommitCheckpointFileName(gen);
 
         // Entries have a directory prefix (as the TAR builder uses)
-        byte[] tar = buildTar(
-            "abc-uuid/0/" + tlogName, "tlog-content",
-            "abc-uuid/0/" + ckpName, "ckp-content"
-        );
+        byte[] tar = buildTar("abc-uuid/0/" + tlogName, "tlog-content", "abc-uuid/0/" + ckpName, "ckp-content");
         Path dir = createTempDir();
 
         boolean found = TarTranslogRemoteStoreStrategy.extractGenerationFromTarStream(
-            new ByteArrayInputStream(tar), tlogName, ckpName, dir
+            new ByteArrayInputStream(tar),
+            tlogName,
+            ckpName,
+            dir
         );
 
         assertTrue("Should strip dir prefix and match entry", found);
@@ -138,16 +147,14 @@ public class TarTranslogDownloadTests extends OpenSearchTestCase {
         String otherTlog = org.opensearch.index.translog.Translog.getFilename(otherGen);
         String otherCkp = org.opensearch.index.translog.Translog.getCommitCheckpointFileName(otherGen);
 
-        byte[] tar = buildTar(
-            otherTlog, "other-tlog",
-            otherCkp, "other-ckp",
-            tlogName, "target-tlog",
-            ckpName, "target-ckp"
-        );
+        byte[] tar = buildTar(otherTlog, "other-tlog", otherCkp, "other-ckp", tlogName, "target-tlog", ckpName, "target-ckp");
         Path dir = createTempDir();
 
         boolean found = TarTranslogRemoteStoreStrategy.extractGenerationFromTarStream(
-            new ByteArrayInputStream(tar), tlogName, ckpName, dir
+            new ByteArrayInputStream(tar),
+            tlogName,
+            ckpName,
+            dir
         );
 
         assertTrue("Should find requested generation", found);
@@ -167,7 +174,10 @@ public class TarTranslogDownloadTests extends OpenSearchTestCase {
         Path dir = createTempDir();
 
         boolean found = TarTranslogRemoteStoreStrategy.extractGenerationFromTarStream(
-            new ByteArrayInputStream(tar), tlogName, ckpName, dir
+            new ByteArrayInputStream(tar),
+            tlogName,
+            ckpName,
+            dir
         );
 
         assertFalse("Empty TAR should return false", found);

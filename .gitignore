@@ -56,6 +56,9 @@ html_docs
 /tmp/
 eclipse-build
 
+# local git worktrees / feature reference checkouts
+.tmp/
+
 # projects using testfixtures
 testfixtures_shared/
 

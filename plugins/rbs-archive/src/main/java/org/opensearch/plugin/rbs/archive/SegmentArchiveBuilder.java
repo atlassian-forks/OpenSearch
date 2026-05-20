@@ -11,7 +11,6 @@ package org.opensearch.plugin.rbs.archive;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
-// SegmentArchiveEntry and TarArchiveBuilder are in the same package — no import needed
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -183,16 +182,24 @@ final class SegmentArchiveBuilder {
         for (SegmentArchiveBuildEntry e : entries) {
             out.add(new TarArchiveBuilder.ArchiveBuildEntry() {
                 @Override
-                public String getPath() { return e.getPath(); }
+                public String getPath() {
+                    return e.getPath();
+                }
 
                 @Override
-                public InputStream getContent() throws IOException { return e.getContent(); }
+                public InputStream getContent() throws IOException {
+                    return e.getContent();
+                }
 
                 @Override
-                public long getSize() { return e.getSize(); }
+                public long getSize() {
+                    return e.getSize();
+                }
 
                 @Override
-                public byte[] getBackingBytes() { return e.getBackingBytes(); }
+                public byte[] getBackingBytes() {
+                    return e.getBackingBytes();
+                }
             });
         }
         return out;
@@ -204,7 +211,7 @@ final class SegmentArchiveBuilder {
      * Interface for entries to be added to the segment archive.
      *
      */
-        public interface SegmentArchiveBuildEntry {
+    public interface SegmentArchiveBuildEntry {
         /**
          * Path within the archive (e.g., {@code "_0.si"}, {@code "_0.cfs"}).
          */

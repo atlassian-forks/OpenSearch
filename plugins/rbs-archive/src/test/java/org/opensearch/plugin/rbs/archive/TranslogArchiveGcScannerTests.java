@@ -30,7 +30,6 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -65,21 +64,15 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         long readLength = TarArchiveBuilder.TAR_BLOCK + TranslogArchiveGcScanner.MAX_GC_PREFIX_BYTES;
         byte[] combined = new byte[(int) readLength];
         System.arraycopy(tarBytes, 0, combined, 0, Math.min(tarBytes.length, combined.length));
-        when(ts.downloadBlob(eq(minutePath), eq(blobName), eq(0L), eq(readLength)))
-            .thenReturn(new ByteArrayInputStream(combined));
+        when(ts.downloadBlob(eq(minutePath), eq(blobName), eq(0L), eq(readLength))).thenReturn(new ByteArrayInputStream(combined));
     }
 
     /**
      * Mocks {@code loadFromPersisted()} inputs: listFolders(gcIdxRoot) → [dayDir],
      * listAllInSortedOrder(gcDayPath, ...) → [minuteDir.idx], downloadBlob(gcDayPath, minuteDir.idx) → idxBytes.
      */
-    private static void mockLoadPersisted(
-        TransferService ts,
-        BlobPath base,
-        String dayDir,
-        String minuteDir,
-        byte[] idxBytes
-    ) throws IOException {
+    private static void mockLoadPersisted(TransferService ts, BlobPath base, String dayDir, String minuteDir, byte[] idxBytes)
+        throws IOException {
         BlobPath gcIdxRoot = TranslogArchiveGcScanner.gcIdxRootPath(base);
         BlobPath gcDayPath = gcIdxRoot.add(dayDir);
         String idxBlobName = minuteDir + ".idx";
@@ -91,8 +84,7 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
             listener.onResponse(List.of(new PlainBlobMetadata(idxBlobName, idxBytes.length)));
             return null;
         }).when(ts).listAllInSortedOrder(eq(gcDayPath), eq(""), anyInt(), any());
-        when(ts.downloadBlob(eq(gcDayPath), eq(idxBlobName)))
-            .thenReturn(new ByteArrayInputStream(idxBytes));
+        when(ts.downloadBlob(eq(gcDayPath), eq(idxBlobName))).thenReturn(new ByteArrayInputStream(idxBytes));
     }
 
     // ── readGcPrefix ──────────────────────────────────────────────────────────
@@ -131,8 +123,7 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
     public void testReadGcPrefixHandlesDownloadError() throws IOException {
         TransferService ts = mock(TransferService.class);
         BlobPath minutePath = BASE.add("txlog").add("20260502").add("1000");
-        when(ts.downloadBlob(any(BlobPath.class), anyString(), anyLong(), anyLong()))
-            .thenThrow(new IOException("S3 error"));
+        when(ts.downloadBlob(any(BlobPath.class), anyString(), anyLong(), anyLong())).thenThrow(new IOException("S3 error"));
 
         TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(ts, BASE);
         List<TarArchiveBuilder.GcShardEntry> result = scanner.readGcPrefix(minutePath, "broken.tar");
@@ -169,10 +160,12 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
 
         MinuteGcIndex.Builder builder = new MinuteGcIndex.Builder();
         // maxCheckpoint (globalCheckpoint) ≥ maxSeqNo for both shards → phase 1 passes
-        builder.merge(Arrays.asList(
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L),   // ckp=5 ≥ maxSeq=5
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 1, 10L, 15L, 20L)  // ckp=20 ≥ maxSeq=15
-        ));
+        builder.merge(
+            Arrays.asList(
+                new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L),   // ckp=5 ≥ maxSeq=5
+                new TarArchiveBuilder.GcShardEntry(UUID_A, 1, 10L, 15L, 20L)  // ckp=20 ≥ maxSeq=15
+            )
+        );
         byte[] idxBytes = builder.build().serialize();
         mockLoadPersisted(ts, BASE, "20260502", "1000", idxBytes);
 
@@ -191,9 +184,11 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         MinuteGcIndex.Builder builder = new MinuteGcIndex.Builder();
         // shard 0: checkpoint=3, maxSeqNo=10 → phase 1 fails (3 < 10)
         // No rolling checkpoint from a later TAR → phase 2 fails → not safe
-        builder.merge(List.of(
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 10L, 3L)  // ckp=3 < maxSeq=10
-        ));
+        builder.merge(
+            List.of(
+                new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 10L, 3L)  // ckp=3 < maxSeq=10
+            )
+        );
         byte[] idxBytes = builder.build().serialize();
         mockLoadPersisted(ts, BASE, "20260502", "1000", idxBytes);
 
@@ -226,10 +221,9 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         doAnswer(inv -> {
             @SuppressWarnings("unchecked")
             org.opensearch.core.action.ActionListener<List<BlobMetadata>> listener = inv.getArgument(3);
-            listener.onResponse(Arrays.asList(
-                new PlainBlobMetadata("1000.idx", idxBytes1.length),
-                new PlainBlobMetadata("1001.idx", idxBytes2.length)
-            ));
+            listener.onResponse(
+                Arrays.asList(new PlainBlobMetadata("1000.idx", idxBytes1.length), new PlainBlobMetadata("1001.idx", idxBytes2.length))
+            );
             return null;
         }).when(ts).listAllInSortedOrder(eq(gcDayPath), eq(""), anyInt(), any());
         when(ts.downloadBlob(eq(gcDayPath), eq("1000.idx"))).thenReturn(new ByteArrayInputStream(idxBytes1));
@@ -245,8 +239,7 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         // Verify the rolling checkpoint was populated correctly (the key part of Phase 2 logic).
         Map<String, Map<Integer, Long>> checkpoints = scanner.getRollingCheckpoints();
         assertNotNull("UUID_A must have rolling checkpoints", checkpoints.get(UUID_A));
-        assertEquals("Rolling checkpoint for shard 0 should be 15 (from minute 1001)",
-            15L, (long) checkpoints.get(UUID_A).get(0));
+        assertEquals("Rolling checkpoint for shard 0 should be 15 (from minute 1001)", 15L, (long) checkpoints.get(UUID_A).get(0));
     }
 
     // ── evict ─────────────────────────────────────────────────────────────────
@@ -322,9 +315,7 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         scanner.loadFromPersisted();
 
         // GC entries from the TAR we want to delete: checkpoint=15 ≥ maxSeqNo=10
-        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 10L, 15L)
-        );
+        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 10L, 15L));
         assertTrue("Phase 1: checkpoint covers maxSeqNo → safe", scanner.isTarSafeToDelete(gcEntries));
     }
 
@@ -334,9 +325,7 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(ts, BASE);
 
         // shard has checkpoint=3, maxSeqNo=10 → phase 1 fails; no rolling checkpoint → phase 2 fails
-        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 10L, 3L)
-        );
+        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 10L, 3L));
         assertFalse("Stuck shard → TAR not safe to delete", scanner.isTarSafeToDelete(gcEntries));
     }
 
@@ -365,8 +354,7 @@ public class TranslogArchiveGcScannerTests extends OpenSearchTestCase {
         assertEquals("Before load, index should be empty", 0, scanner.getInMemoryIndex().size());
         scanner.loadFromPersisted();
         assertEquals("After load, index should have 1 entry", 1, scanner.getInMemoryIndex().size());
-        assertTrue("Index should contain key '20260502/1000'",
-            scanner.getInMemoryIndex().containsKey("20260502/1000"));
+        assertTrue("Index should contain key '20260502/1000'", scanner.getInMemoryIndex().containsKey("20260502/1000"));
     }
 
     /** After loadFromPersisted(), rollingCheckpoints are populated for covered shards. */

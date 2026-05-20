@@ -8,9 +8,9 @@
 
 package org.opensearch.index.translog.transfer;
 
+import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.index.remote.GcDecision;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
@@ -18,7 +18,6 @@ import org.opensearch.indices.DefaultRemoteStoreSettings;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Path;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.mockito.Mockito.mock;
 
@@ -52,16 +51,25 @@ public class TranslogUploadStrategyTests extends OpenSearchTestCase {
         // Verify manager is usable as a translog strategy by wrapping in adapter
         TranslogRemoteStoreStrategy strategy = new TranslogRemoteStoreStrategy() {
             @Override
-            public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener,
-                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
-                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
+            public boolean upload(
+                TransferSnapshot snapshot,
+                TranslogTransferListener listener,
+                TransferService ts,
+                org.opensearch.core.index.shard.ShardId sid,
+                org.opensearch.common.blobstore.BlobPath bp
+            ) throws java.io.IOException {
                 return manager.transferSnapshot(snapshot, listener);
             }
 
             @Override
-            public boolean download(long primaryTerm, long generation, Path location,
-                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
-                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
+            public boolean download(
+                long primaryTerm,
+                long generation,
+                Path location,
+                TransferService ts,
+                org.opensearch.core.index.shard.ShardId sid,
+                org.opensearch.common.blobstore.BlobPath bp
+            ) throws java.io.IOException {
                 return manager.downloadTranslog(String.valueOf(primaryTerm), String.valueOf(generation), location);
             }
         };
@@ -76,16 +84,25 @@ public class TranslogUploadStrategyTests extends OpenSearchTestCase {
     public void testDefaultGcDecisionIsUseDefault() throws Exception {
         TranslogRemoteStoreStrategy strategy = new TranslogRemoteStoreStrategy() {
             @Override
-            public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener,
-                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
-                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
+            public boolean upload(
+                TransferSnapshot snapshot,
+                TranslogTransferListener listener,
+                TransferService ts,
+                org.opensearch.core.index.shard.ShardId sid,
+                org.opensearch.common.blobstore.BlobPath bp
+            ) throws java.io.IOException {
                 return false;
             }
 
             @Override
-            public boolean download(long primaryTerm, long generation, Path location,
-                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
-                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
+            public boolean download(
+                long primaryTerm,
+                long generation,
+                Path location,
+                TransferService ts,
+                org.opensearch.core.index.shard.ShardId sid,
+                org.opensearch.common.blobstore.BlobPath bp
+            ) throws java.io.IOException {
                 return false;
             }
         };
@@ -100,16 +117,25 @@ public class TranslogUploadStrategyTests extends OpenSearchTestCase {
     public void testCustomStrategyCanReturnSkipForTranslogGc() throws Exception {
         TranslogRemoteStoreStrategy strategy = new TranslogRemoteStoreStrategy() {
             @Override
-            public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener,
-                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
-                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
+            public boolean upload(
+                TransferSnapshot snapshot,
+                TranslogTransferListener listener,
+                TransferService ts,
+                org.opensearch.core.index.shard.ShardId sid,
+                org.opensearch.common.blobstore.BlobPath bp
+            ) throws java.io.IOException {
                 return false;
             }
 
             @Override
-            public boolean download(long primaryTerm, long generation, Path location,
-                    TransferService ts, org.opensearch.core.index.shard.ShardId sid,
-                    org.opensearch.common.blobstore.BlobPath bp) throws java.io.IOException {
+            public boolean download(
+                long primaryTerm,
+                long generation,
+                Path location,
+                TransferService ts,
+                org.opensearch.core.index.shard.ShardId sid,
+                org.opensearch.common.blobstore.BlobPath bp
+            ) throws java.io.IOException {
                 return false;
             }
 

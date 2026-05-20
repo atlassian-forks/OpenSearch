@@ -12,7 +12,6 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.test.OpenSearchTestCase;
-
 import org.junit.After;
 
 import java.io.IOException;
@@ -163,8 +162,10 @@ public class TranslogBatchCoordinatorTests extends OpenSearchTestCase {
         TransferService transferService = mock(TransferService.class);
 
         AtomicInteger uploadCount = new AtomicInteger(0);
-        doAnswer(inv -> { uploadCount.incrementAndGet(); return null; })
-            .when(coordinator.strategy).uploadBatch(any(), any(), any());
+        doAnswer(inv -> {
+            uploadCount.incrementAndGet();
+            return null;
+        }).when(coordinator.strategy).uploadBatch(any(), any(), any());
 
         // Submit exactly 'threshold' shards concurrently
         List<Thread> threads = new ArrayList<>();
@@ -214,11 +215,12 @@ public class TranslogBatchCoordinatorTests extends OpenSearchTestCase {
         TranslogBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(1));
         TransferService transferService = mock(TransferService.class);
 
-        doThrow(new IOException("Persistent failure"))
-            .when(coordinator.strategy).uploadBatch(any(), any(), any());
+        doThrow(new IOException("Persistent failure")).when(coordinator.strategy).uploadBatch(any(), any(), any());
 
-        IOException ex = expectThrows(IOException.class,
-            () -> coordinator.submitAndWait(shardBatch(0, "data"), transferService, BASE_PATH));
+        IOException ex = expectThrows(
+            IOException.class,
+            () -> coordinator.submitAndWait(shardBatch(0, "data"), transferService, BASE_PATH)
+        );
         assertNotNull(ex);
     }
 
@@ -229,8 +231,7 @@ public class TranslogBatchCoordinatorTests extends OpenSearchTestCase {
         TranslogBatchCoordinator coordinator = createCoordinator(TimeValue.timeValueMillis(50));
         TransferService transferService = mock(TransferService.class);
 
-        doThrow(new IOException("Batch failed"))
-            .when(coordinator.strategy).uploadBatch(any(), any(), any());
+        doThrow(new IOException("Batch failed")).when(coordinator.strategy).uploadBatch(any(), any(), any());
 
         int numWaiters = 4;
         AtomicInteger failureCount = new AtomicInteger(0);
@@ -259,8 +260,7 @@ public class TranslogBatchCoordinatorTests extends OpenSearchTestCase {
         TransferService transferService = mock(TransferService.class);
         coordinator.close();
 
-        expectThrows(IOException.class,
-            () -> coordinator.submitAndWait(shardBatch(0, "data"), transferService, BASE_PATH));
+        expectThrows(IOException.class, () -> coordinator.submitAndWait(shardBatch(0, "data"), transferService, BASE_PATH));
     }
 
     /**
@@ -301,9 +301,7 @@ public class TranslogBatchCoordinatorTests extends OpenSearchTestCase {
 
         // The batch should contain exactly 1 entry for shard 0 (duplicate was overwritten)
         assertNotNull(capturedBatch.get());
-        long shard0Count = capturedBatch.get().stream()
-            .filter(b -> b.getShardId() == 0 && INDEX_UUID.equals(b.getIndexUUID()))
-            .count();
+        long shard0Count = capturedBatch.get().stream().filter(b -> b.getShardId() == 0 && INDEX_UUID.equals(b.getIndexUUID())).count();
         assertEquals("Duplicate shard submission must be deduplicated", 1, shard0Count);
     }
 

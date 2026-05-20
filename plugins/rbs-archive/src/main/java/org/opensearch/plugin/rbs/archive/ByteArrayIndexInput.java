@@ -61,14 +61,7 @@ final class ByteArrayIndexInput extends IndexInput {
     @Override
     public IndexInput slice(String sliceDescription, long sliceOffset, long sliceLength) throws IOException {
         if (sliceOffset < 0 || sliceLength < 0 || sliceOffset + sliceLength > length) {
-            throw new IOException(
-                "slice ["
-                    + sliceOffset
-                    + ", "
-                    + (sliceOffset + sliceLength)
-                    + ") out of bounds for length="
-                    + length
-            );
+            throw new IOException("slice [" + sliceOffset + ", " + (sliceOffset + sliceLength) + ") out of bounds for length=" + length);
         }
         return new ByteArrayIndexInput(sliceDescription, bytes, (int) (offset + sliceOffset), (int) sliceLength);
     }
@@ -84,9 +77,7 @@ final class ByteArrayIndexInput extends IndexInput {
     @Override
     public void readBytes(byte[] b, int off, int len) throws IOException {
         if (position + len > length) {
-            throw new IOException(
-                "read past EOF: position=" + position + " len=" + len + " file_length=" + length
-            );
+            throw new IOException("read past EOF: position=" + position + " len=" + len + " file_length=" + length);
         }
         System.arraycopy(bytes, offset + position, b, off, len);
         position += len;

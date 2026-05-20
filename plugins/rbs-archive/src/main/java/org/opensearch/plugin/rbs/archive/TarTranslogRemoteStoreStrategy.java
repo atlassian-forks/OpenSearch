@@ -14,8 +14,6 @@ import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.index.remote.GcDecision;
-import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
@@ -27,7 +25,6 @@ import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -88,11 +85,9 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
         return coordinator;
     }
 
-
-
     // ── TranslogRemoteStoreStrategy: batch model ─────────────────────────────
 
-        public boolean supportsNodeBatching() {
+    public boolean supportsNodeBatching() {
         return true;
     }
 
@@ -108,8 +103,13 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
     }
 
     @Override
-    public boolean upload(TransferSnapshot snapshot, TranslogTransferListener listener, TransferService transferService,
-            ShardId shardId, BlobPath repositoryBasePath) throws IOException {
+    public boolean upload(
+        TransferSnapshot snapshot,
+        TranslogTransferListener listener,
+        TransferService transferService,
+        ShardId shardId,
+        BlobPath repositoryBasePath
+    ) throws IOException {
         List<TranslogShardBatch.BatchFile> files = new ArrayList<>();
         String iUUID = shardId.getIndex().getUUID();
         int sId = shardId.id();
@@ -137,8 +137,11 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
 
         var meta = snapshot.getTranslogTransferMetadata();
         TranslogShardBatch batch = new TranslogShardBatch(
-            iUUID, sId,
-            meta.getPrimaryTerm(), meta.getGeneration(), meta.getMinTranslogGeneration(),
+            iUUID,
+            sId,
+            meta.getPrimaryTerm(),
+            meta.getGeneration(),
+            meta.getMinTranslogGeneration(),
             files
         );
 
@@ -171,7 +174,7 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
      * @param basePath        the repository base path for constructing the archive blob path
      * @param transferService the shard's transfer service (passed by coordinator; all shards share a repo)
      */
-        public void uploadBatch(List<TranslogShardBatch> batch, BlobPath basePath, TransferService transferService) throws IOException {
+    public void uploadBatch(List<TranslogShardBatch> batch, BlobPath basePath, TransferService transferService) throws IOException {
         // Build all ArchiveBuildEntry objects from the batch
         List<TarArchiveBuilder.ArchiveBuildEntry> allEntries = new ArrayList<>();
         List<TarArchiveBuilder.GcShardEntry> gcEntries = new ArrayList<>();
@@ -183,13 +186,15 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
                 String remoteName = file.getRemoteName();
                 allEntries.add(TarArchiveBuilder.fromPath(remoteName, localPath, sizeBytes));
             }
-            gcEntries.add(new TarArchiveBuilder.GcShardEntry(
-                shardBatch.getIndexUUID(),
-                shardBatch.getShardId(),
-                shardBatch.getMinSeqNo(),
-                shardBatch.getMaxSeqNo(),
-                shardBatch.getGlobalCheckpoint()
-            ));
+            gcEntries.add(
+                new TarArchiveBuilder.GcShardEntry(
+                    shardBatch.getIndexUUID(),
+                    shardBatch.getShardId(),
+                    shardBatch.getMinSeqNo(),
+                    shardBatch.getMaxSeqNo(),
+                    shardBatch.getGlobalCheckpoint()
+                )
+            );
         }
 
         if (allEntries.isEmpty()) {
@@ -207,10 +212,7 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
         // Stream the TAR bytes via pipe into the upload thread — no full-batch buffering.
         final IOException[] uploadError = { null };
 
-        try (
-            PipedOutputStream pos = new PipedOutputStream();
-            PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)
-        ) {
+        try (PipedOutputStream pos = new PipedOutputStream(); PipedInputStream pis = new PipedInputStream(pos, PIPE_BUFFER_BYTES)) {
             PlainActionFuture<Void> uploadFuture = PlainActionFuture.newFuture();
 
             Thread uploadThread = new Thread(() -> {
@@ -240,8 +242,14 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
             throw uploadError[0];
         }
 
-        logger.debug("TAR translog batch uploaded: path={} blob={} shards={} entries={} size={}",
-            archivePath.buildAsString(), blobName, batch.size(), allEntries.size(), contentLength);
+        logger.debug(
+            "TAR translog batch uploaded: path={} blob={} shards={} entries={} size={}",
+            archivePath.buildAsString(),
+            blobName,
+            batch.size(),
+            allEntries.size(),
+            contentLength
+        );
     }
 
     // ── Per-shard lifecycle methods (download + GC) ───────────────────────────
@@ -304,28 +312,38 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
         BlobPath repositoryBasePath
     ) throws IOException {
         return downloadRange(
-            generation, generation,
+            generation,
+            generation,
             Map.of(generation, primaryTerm),
-            location, transferService, shardId, repositoryBasePath
+            location,
+            transferService,
+            shardId,
+            repositoryBasePath
         );
     }
 
-    static boolean extractGenerationFromTarStream(InputStream is, String tlogName, String ckpName, Path targetDir)
-        throws IOException {
+    static boolean extractGenerationFromTarStream(InputStream is, String tlogName, String ckpName, Path targetDir) throws IOException {
         final int BLOCK = TarArchiveBuilder.TAR_BLOCK;
         byte[] header = new byte[BLOCK];
         boolean tlogFound = false, ckpFound = false;
         while (true) {
             if (readFully(is, header) < BLOCK) break;
             boolean allZero = true;
-            for (byte b : header) { if (b != 0) { allZero = false; break; } }
+            for (byte b : header) {
+                if (b != 0) {
+                    allZero = false;
+                    break;
+                }
+            }
             if (allZero) break;
             int nameEnd = 0;
-            while (nameEnd < 100 && header[nameEnd] != 0) nameEnd++;
+            while (nameEnd < 100 && header[nameEnd] != 0)
+                nameEnd++;
             String entryName = new String(header, 0, nameEnd, java.nio.charset.StandardCharsets.US_ASCII);
             String baseName = entryName.contains("/") ? entryName.substring(entryName.lastIndexOf('/') + 1) : entryName;
             int sizeEnd = 136;
-            while (sizeEnd > 124 && header[sizeEnd - 1] == 0) sizeEnd--;
+            while (sizeEnd > 124 && header[sizeEnd - 1] == 0)
+                sizeEnd--;
             String sizeStr = new String(header, 124, sizeEnd - 124, java.nio.charset.StandardCharsets.US_ASCII).trim();
             long dataSize = sizeStr.isEmpty() ? 0 : Long.parseLong(sizeStr, 8);
             long paddedSize = ((dataSize + BLOCK - 1) / BLOCK) * BLOCK;
@@ -342,7 +360,8 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
                     }
                 }
                 is.skip(paddedSize - dataSize);
-                if (baseName.equals(tlogName)) tlogFound = true; else ckpFound = true;
+                if (baseName.equals(tlogName)) tlogFound = true;
+                else ckpFound = true;
                 if (tlogFound && ckpFound) return true;
             } else {
                 is.skip(paddedSize);
@@ -361,7 +380,7 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
         return total;
     }
 
-        public void runArchiveGc(BlobPath basePath, Duration retentionAge) throws IOException {
+    public void runArchiveGc(BlobPath basePath, Duration retentionAge) throws IOException {
         // Prefer the explicitly passed basePath; fall back to the one captured from the last upload.
         BlobPath effectiveBase = (basePath != null) ? basePath : lastKnownBasePath;
         if (effectiveBase == null) {
@@ -436,8 +455,14 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
                         .filter(ts -> ts.isBefore(cutoff))
                         .ifPresent(ts -> {
                             toDelete.add(blob);
-                            log.debug("TAR translog archive GC: deleting expired blob {}/{}/{} (ts={}, cutoff={})",
-                                dayDir, minuteDir, blob, ts, cutoff);
+                            log.debug(
+                                "TAR translog archive GC: deleting expired blob {}/{}/{} (ts={}, cutoff={})",
+                                dayDir,
+                                minuteDir,
+                                blob,
+                                ts,
+                                cutoff
+                            );
                         });
                 }
                 if (!toDelete.isEmpty()) {

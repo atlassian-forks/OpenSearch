@@ -97,7 +97,11 @@ final class TranslogArchiveRecovery {
 
         logger.info(
             "Hierarchical recovery: index={} shard={} gen=[{}-{}] startFrom={}",
-            indexUUID, shardId, minGeneration, maxGeneration, startFrom
+            indexUUID,
+            shardId,
+            minGeneration,
+            maxGeneration,
+            startFrom
         );
 
         // Collect all relevant TARs from minute-dirs at or after startFrom
@@ -174,7 +178,12 @@ final class TranslogArchiveRecovery {
 
         logger.info(
             "Hierarchical recovery complete: index={} shard={} gen=[{}-{}] allFound={} tarsScanned={}",
-            indexUUID, shardId, minGeneration, maxGeneration, allFound, tars.size()
+            indexUUID,
+            shardId,
+            minGeneration,
+            maxGeneration,
+            allFound,
+            tars.size()
         );
         return allFound;
     }
@@ -183,11 +192,8 @@ final class TranslogArchiveRecovery {
      * Collects all TAR blob references from the hierarchical txlog path that are at or after
      * {@code startFrom}, sorted lexicographically (= chronologically).
      */
-    static List<TarRef> collectTarsFromHierarchicalPath(
-        TransferService transferService,
-        BlobPath txlogRoot,
-        Instant startFrom
-    ) throws IOException {
+    static List<TarRef> collectTarsFromHierarchicalPath(TransferService transferService, BlobPath txlogRoot, Instant startFrom)
+        throws IOException {
         List<TarRef> result = new ArrayList<>();
 
         Set<String> dayDirs;
@@ -317,8 +323,7 @@ final class TranslogArchiveRecovery {
 
         // Step 2: range-GET the index bytes (immediately after the 512-byte header)
         byte[] indexBytes;
-        try (InputStream iStream = transferService.downloadBlob(
-                tar.path, tar.blobName, TarArchiveBuilder.TAR_BLOCK, indexDataSize)) {
+        try (InputStream iStream = transferService.downloadBlob(tar.path, tar.blobName, TarArchiveBuilder.TAR_BLOCK, indexDataSize)) {
             indexBytes = iStream.readAllBytes();
         }
 
@@ -340,15 +345,21 @@ final class TranslogArchiveRecovery {
         String ckpFilename = Translog.getCommitCheckpointFileName(generation);
 
         rangeReadToFile(
-            transferService, loc.tar.path, loc.tar.blobName,
-            loc.tlogLoc.getDataOffset(), loc.tlogLoc.getDataLength(),
+            transferService,
+            loc.tar.path,
+            loc.tar.blobName,
+            loc.tlogLoc.getDataOffset(),
+            loc.tlogLoc.getDataLength(),
             location.resolve(tlogFilename)
         );
 
         if (loc.ckpLoc != null) {
             rangeReadToFile(
-                transferService, loc.tar.path, loc.tar.blobName,
-                loc.ckpLoc.getDataOffset(), loc.ckpLoc.getDataLength(),
+                transferService,
+                loc.tar.path,
+                loc.tar.blobName,
+                loc.ckpLoc.getDataOffset(),
+                loc.ckpLoc.getDataLength(),
                 location.resolve(ckpFilename)
             );
         }

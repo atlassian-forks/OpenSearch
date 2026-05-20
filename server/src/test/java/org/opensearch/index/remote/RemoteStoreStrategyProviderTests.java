@@ -27,9 +27,20 @@ public class RemoteStoreStrategyProviderTests extends OpenSearchTestCase {
     /** A minimal RemoteStorePlugin stub with configurable name and strategies. */
     private static RemoteStorePlugin plugin(String name, SegmentRemoteStoreStrategy seg, TranslogRemoteStoreStrategy tlog) {
         return new RemoteStorePlugin() {
-            @Override public String getStrategyName() { return name; }
-            @Override public SegmentRemoteStoreStrategy getSegmentStrategy() { return seg; }
-            @Override public TranslogRemoteStoreStrategy getTranslogStrategy() { return tlog; }
+            @Override
+            public String getStrategyName() {
+                return name;
+            }
+
+            @Override
+            public SegmentRemoteStoreStrategy getSegmentStrategy() {
+                return seg;
+            }
+
+            @Override
+            public TranslogRemoteStoreStrategy getTranslogStrategy() {
+                return tlog;
+            }
         };
     }
 
@@ -77,17 +88,13 @@ public class RemoteStoreStrategyProviderTests extends OpenSearchTestCase {
     }
 
     public void testUnknownNameReturnsNull() {
-        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(
-            List.of(plugin("tar", mockSeg(), mockTlog()))
-        );
+        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(List.of(plugin("tar", mockSeg(), mockTlog())));
         assertNull("Unknown strategy name must return null", provider.segmentStrategyFor("zip"));
         assertNull("Unknown strategy name must return null", provider.translogStrategyFor("zip"));
     }
 
     public void testEmptyNameReturnsNull() {
-        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(
-            List.of(plugin("tar", mockSeg(), mockTlog()))
-        );
+        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(List.of(plugin("tar", mockSeg(), mockTlog())));
         assertNull("Empty strategy name must return null (use default)", provider.segmentStrategyFor(""));
         assertNull("Empty strategy name must return null (use default)", provider.translogStrategyFor(""));
         assertNull("Null strategy name must return null", provider.segmentStrategyFor(null));
@@ -165,10 +172,9 @@ public class RemoteStoreStrategyProviderTests extends OpenSearchTestCase {
         TranslogRemoteStoreStrategy tarTlog = mockTlog();
         TranslogRemoteStoreStrategy zipTlog = mockTlog();
 
-        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(List.of(
-            plugin("tar", null, tarTlog),
-            plugin("zip", null, zipTlog)
-        ));
+        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(
+            List.of(plugin("tar", null, tarTlog), plugin("zip", null, zipTlog))
+        );
 
         List<TranslogRemoteStoreStrategy> others = provider.otherTranslogStrategies("tar");
         assertEquals("Others must exclude current ('tar')", 1, others.size());
@@ -179,10 +185,9 @@ public class RemoteStoreStrategyProviderTests extends OpenSearchTestCase {
         TranslogRemoteStoreStrategy tarTlog = mockTlog();
         TranslogRemoteStoreStrategy zipTlog = mockTlog();
 
-        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(List.of(
-            plugin("tar", null, tarTlog),
-            plugin("zip", null, zipTlog)
-        ));
+        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(
+            List.of(plugin("tar", null, tarTlog), plugin("zip", null, zipTlog))
+        );
 
         List<TranslogRemoteStoreStrategy> others = provider.otherTranslogStrategies(null);
         assertEquals("Others with null current should return all", 2, others.size());
@@ -190,18 +195,14 @@ public class RemoteStoreStrategyProviderTests extends OpenSearchTestCase {
 
     public void testOtherTranslogStrategiesReturnsAllWhenCurrentIsUnknown() {
         TranslogRemoteStoreStrategy tarTlog = mockTlog();
-        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(
-            List.of(plugin("tar", null, tarTlog))
-        );
+        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(List.of(plugin("tar", null, tarTlog)));
 
         List<TranslogRemoteStoreStrategy> others = provider.otherTranslogStrategies("nonexistent");
         assertEquals("Others with unknown current should return all", 1, others.size());
     }
 
     public void testOtherTranslogStrategiesIsEmptyWhenOnlyOnePlugin() {
-        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(
-            List.of(plugin("tar", null, mockTlog()))
-        );
+        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(List.of(plugin("tar", null, mockTlog())));
 
         List<TranslogRemoteStoreStrategy> others = provider.otherTranslogStrategies("tar");
         assertTrue("With only one plugin, others should be empty", others.isEmpty());
@@ -212,11 +213,9 @@ public class RemoteStoreStrategyProviderTests extends OpenSearchTestCase {
         TranslogRemoteStoreStrategy t2 = mockTlog();
         TranslogRemoteStoreStrategy t3 = mockTlog();
 
-        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(List.of(
-            plugin("a", null, t1),
-            plugin("b", null, t2),
-            plugin("c", null, t3)
-        ));
+        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(
+            List.of(plugin("a", null, t1), plugin("b", null, t2), plugin("c", null, t3))
+        );
 
         List<TranslogRemoteStoreStrategy> all = provider.allTranslogStrategies();
         assertEquals(3, all.size());
@@ -230,10 +229,9 @@ public class RemoteStoreStrategyProviderTests extends OpenSearchTestCase {
     @SuppressWarnings("deprecation")
     public void testDeprecatedGetSegmentStrategyReturnsFirstRegistered() {
         SegmentRemoteStoreStrategy first = mockSeg();
-        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(List.of(
-            plugin("tar", first, null),
-            plugin("zip", mockSeg(), null)
-        ));
+        RemoteStoreStrategyProvider provider = RemoteStoreStrategyProvider.fromPlugins(
+            List.of(plugin("tar", first, null), plugin("zip", mockSeg(), null))
+        );
         assertSame("Deprecated getSegmentStrategy() must return first registered", first, provider.getSegmentStrategy());
     }
 

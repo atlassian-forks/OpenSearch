@@ -10,7 +10,6 @@ package org.opensearch.plugin.rbs.archive;
 
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
-// SegmentArchiveEntry is in the same package — no import needed
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;
@@ -119,10 +118,8 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
     }
 
     public void testSingleByteEntryIsValidTar() throws IOException {
-        byte[] content = {0x42};
-        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
-            TarArchiveBuilder.fromBytes("tiny.bin", content)
-        );
+        byte[] content = { 0x42 };
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(TarArchiveBuilder.fromBytes("tiny.bin", content));
         byte[] tar = buildToBytes(entries);
 
         Map<String, byte[]> parsed = parseTarWithCommonsCompress(tar);
@@ -133,9 +130,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
     public void testExactly512ByteEntryIsValidTar() throws IOException {
         byte[] content = new byte[512];
         Arrays.fill(content, (byte) 'Z');
-        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
-            TarArchiveBuilder.fromBytes("exact512.bin", content)
-        );
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(TarArchiveBuilder.fromBytes("exact512.bin", content));
         byte[] tar = buildToBytes(entries);
 
         Map<String, byte[]> parsed = parseTarWithCommonsCompress(tar);
@@ -146,9 +141,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
     public void testLargeEntryIsValidTar() throws IOException {
         byte[] content = new byte[128 * 1024]; // 128 KB
         new Random(7).nextBytes(content);
-        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(
-            TarArchiveBuilder.fromBytes("large.bin", content)
-        );
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(TarArchiveBuilder.fromBytes("large.bin", content));
         byte[] tar = buildToBytes(entries);
 
         Map<String, byte[]> parsed = parseTarWithCommonsCompress(tar);
@@ -347,7 +340,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
             new TarArchiveBuilder.GcShardEntry(idx2, 1, 100L, 200L, 190L)
         );
         TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(
-            List.of(TarArchiveBuilder.fromBytes("f.tlog", new byte[]{1, 2, 3})),
+            List.of(TarArchiveBuilder.fromBytes("f.tlog", new byte[] { 1, 2, 3 })),
             gcEntries
         );
         List<TarArchiveBuilder.GcShardEntry> parsed = TarArchiveBuilder.parseGcSummary(layout.getIndexBytes());
@@ -367,7 +360,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
     // ─────────────────────────────────────────────────────────────────────────
 
     public void testEntryOf1ByteIsPaddedTo512() throws IOException {
-        byte[] content = new byte[]{42};
+        byte[] content = new byte[] { 42 };
         List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(TarArchiveBuilder.fromBytes("tiny.bin", content));
         TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(entries);
         byte[] tar = buildToBytes(entries);
@@ -393,8 +386,7 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
     public void testTotalSizeMatchesActualByteCount() throws IOException {
         List<TarArchiveBuilder.ArchiveBuildEntry> entries = new ArrayList<>();
         for (int i = 0; i < 10; i++) {
-            entries.add(TarArchiveBuilder.fromBytes("file-" + i + ".bin",
-                ("data " + i).getBytes(StandardCharsets.UTF_8)));
+            entries.add(TarArchiveBuilder.fromBytes("file-" + i + ".bin", ("data " + i).getBytes(StandardCharsets.UTF_8)));
         }
         TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(entries);
         byte[] tar = buildToBytes(entries);
@@ -410,18 +402,22 @@ public class TarArchiveBuilderTests extends OpenSearchTestCase {
         // TAR name field is 100 bytes with the last byte reserved for '\0', so effective max is 99 bytes.
         // Both 100-char and 101-char paths must be rejected.
         String path100 = "a".repeat(100);
-        expectThrows(IOException.class, () -> TarArchiveBuilder.computeLayout(
-            List.of(TarArchiveBuilder.fromBytes(path100, new byte[]{1}))));
+        expectThrows(
+            IOException.class,
+            () -> TarArchiveBuilder.computeLayout(List.of(TarArchiveBuilder.fromBytes(path100, new byte[] { 1 })))
+        );
 
         String path101 = "a".repeat(101);
-        expectThrows(IOException.class, () -> TarArchiveBuilder.computeLayout(
-            List.of(TarArchiveBuilder.fromBytes(path101, new byte[]{1}))));
+        expectThrows(
+            IOException.class,
+            () -> TarArchiveBuilder.computeLayout(List.of(TarArchiveBuilder.fromBytes(path101, new byte[] { 1 })))
+        );
     }
 
     public void testPathAtMaxLengthIsAccepted() throws IOException {
         // 99-char path is the maximum that fits with a null terminator in the 100-byte TAR name field.
         String path99 = "a".repeat(99);
-        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(TarArchiveBuilder.fromBytes(path99, new byte[]{2}));
+        List<TarArchiveBuilder.ArchiveBuildEntry> entries = List.of(TarArchiveBuilder.fromBytes(path99, new byte[] { 2 }));
         TarArchiveBuilder.TarLayout layout = TarArchiveBuilder.computeLayout(entries);
         assertNotNull(layout);
         List<TarArchiveBuilder.EntryLocation> locs = TarArchiveBuilder.parseIndex(layout.getIndexBytes());

@@ -12,14 +12,12 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.remote.GcDecision;
-import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.index.translog.transfer.FileSnapshot.CheckpointFileSnapshot;
-import org.opensearch.index.translog.transfer.FileSnapshot.TranslogFileSnapshot;
 import org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot;
+import org.opensearch.index.translog.transfer.FileSnapshot.TranslogFileSnapshot;
 import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogTransferMetadata;
@@ -27,7 +25,6 @@ import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
-
 import org.junit.After;
 
 import java.io.IOException;
@@ -42,7 +39,6 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
@@ -92,7 +88,9 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
         super.tearDown();
         coordinator.close();
         for (TransferFileSnapshot snap : snapshotsToClose) {
-            try { snap.close(); } catch (Exception ignored) {}
+            try {
+                snap.close();
+            } catch (Exception ignored) {}
         }
         snapshotsToClose.clear();
         ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
@@ -121,10 +119,25 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
         snapshotsToClose.add(ckpSnap);
 
         return new TransferSnapshot() {
-            @Override public Set<TransferFileSnapshot> getCheckpointFileSnapshots() { return Set.of(ckpSnap); }
-            @Override public Set<TransferFileSnapshot> getTranslogFileSnapshots() { return Set.of(tlogSnap); }
-            @Override public TranslogTransferMetadata getTranslogTransferMetadata() { return metadata; }
-            @Override public Set<TransferFileSnapshot> getTranslogFileSnapshotWithMetadata() { return Set.of(tlogSnap, ckpSnap); }
+            @Override
+            public Set<TransferFileSnapshot> getCheckpointFileSnapshots() {
+                return Set.of(ckpSnap);
+            }
+
+            @Override
+            public Set<TransferFileSnapshot> getTranslogFileSnapshots() {
+                return Set.of(tlogSnap);
+            }
+
+            @Override
+            public TranslogTransferMetadata getTranslogTransferMetadata() {
+                return metadata;
+            }
+
+            @Override
+            public Set<TransferFileSnapshot> getTranslogFileSnapshotWithMetadata() {
+                return Set.of(tlogSnap, ckpSnap);
+            }
         };
     }
 
@@ -132,8 +145,11 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
     private final List<TransferFileSnapshot> snapshotsToClose = new ArrayList<>();
 
     private static final TranslogTransferListener NOOP_LISTENER = new TranslogTransferListener() {
-        @Override public void onUploadComplete(TransferSnapshot snapshot) {}
-        @Override public void onUploadFailed(TransferSnapshot snapshot, Exception e) {}
+        @Override
+        public void onUploadComplete(TransferSnapshot snapshot) {}
+
+        @Override
+        public void onUploadFailed(TransferSnapshot snapshot, Exception e) {}
     };
 
     /** Returns the count of TAR blobs under the txlog root. */
@@ -144,8 +160,7 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
             var dayContainer = blobStore.blobContainer(txlogRoot.add(day));
             for (String minute : dayContainer.children().keySet()) {
                 var minuteContainer = blobStore.blobContainer(txlogRoot.add(day).add(minute));
-                count += minuteContainer.listBlobs().keySet().stream()
-                    .filter(n -> n.endsWith(".tar")).count();
+                count += minuteContainer.listBlobs().keySet().stream().filter(n -> n.endsWith(".tar")).count();
             }
         }
         return count;
@@ -181,10 +196,13 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
         // Find the latest minute-dir that contains at least one TAR blob
         BlobPath minutePath = null;
         String tarBlobName = null;
-        outer:
-        for (int d = dayDirs.length - 1; d >= 0; d--) {
-            String[] minuteDirs = blobStore.blobContainer(txlogRoot.add(dayDirs[d])).children()
-                .keySet().stream().sorted().toArray(String[]::new);
+        outer: for (int d = dayDirs.length - 1; d >= 0; d--) {
+            String[] minuteDirs = blobStore.blobContainer(txlogRoot.add(dayDirs[d]))
+                .children()
+                .keySet()
+                .stream()
+                .sorted()
+                .toArray(String[]::new);
             for (int m = minuteDirs.length - 1; m >= 0; m--) {
                 BlobPath candidate = txlogRoot.add(dayDirs[d]).add(minuteDirs[m]);
                 Map<String, ?> blobs = blobStore.blobContainer(candidate).listBlobs();
@@ -218,14 +236,18 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
         // Verify that the tlog and ckp entry paths are correctly named
         String expectedTlogPath = INDEX_UUID + "/" + SHARD_ID_INT + "/1/translog-" + generation + ".tlog";
         String expectedCkpPath = INDEX_UUID + "/" + SHARD_ID_INT + "/1/translog-" + generation + ".ckp";
-        boolean hasTlog = locations.stream().anyMatch(loc -> loc.getPath().endsWith(expectedTlogPath) || loc.getPath().endsWith("translog-" + generation + ".tlog"));
-        boolean hasCkp = locations.stream().anyMatch(loc -> loc.getPath().endsWith(expectedCkpPath) || loc.getPath().endsWith("translog-" + generation + ".ckp"));
+        boolean hasTlog = locations.stream()
+            .anyMatch(loc -> loc.getPath().endsWith(expectedTlogPath) || loc.getPath().endsWith("translog-" + generation + ".tlog"));
+        boolean hasCkp = locations.stream()
+            .anyMatch(loc -> loc.getPath().endsWith(expectedCkpPath) || loc.getPath().endsWith("translog-" + generation + ".ckp"));
         assertTrue("TAR must contain tlog entry for generation " + generation, hasTlog);
         assertTrue("TAR must contain ckp entry for generation " + generation, hasCkp);
 
         // Range-read the tlog entry and verify content
         TarArchiveBuilder.EntryLocation tlogLoc = locations.stream()
-            .filter(loc -> loc.getPath().endsWith(".tlog")).findFirst().orElse(null);
+            .filter(loc -> loc.getPath().endsWith(".tlog"))
+            .findFirst()
+            .orElse(null);
         assertNotNull("tlog entry must be found in TAR index", tlogLoc);
         byte[] tlogContent;
         try (InputStream in = blobStore.blobContainer(minutePath).readBlob(tarBlobName, tlogLoc.getDataOffset(), tlogLoc.getDataLength())) {
@@ -242,8 +264,15 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
         AtomicBoolean failed = new AtomicBoolean(false);
 
         TranslogTransferListener listener = new TranslogTransferListener() {
-            @Override public void onUploadComplete(TransferSnapshot snapshot) { completed.set(true); }
-            @Override public void onUploadFailed(TransferSnapshot snapshot, Exception e) { failed.set(true); }
+            @Override
+            public void onUploadComplete(TransferSnapshot snapshot) {
+                completed.set(true);
+            }
+
+            @Override
+            public void onUploadFailed(TransferSnapshot snapshot, Exception e) {
+                failed.set(true);
+            }
         };
 
         TransferSnapshot snapshot = buildSnapshot(1L, 3L, 1L);
@@ -260,7 +289,10 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
     public void testTwoShardsBatchedIntoSingleTar() throws Exception {
         // Use a short timer to allow batching
         TranslogBatchCoordinator batchCoordinator = new TranslogBatchCoordinator(
-            "node-batch", null, TimeValue.timeValueMillis(100), Integer.MAX_VALUE
+            "node-batch",
+            null,
+            TimeValue.timeValueMillis(100),
+            Integer.MAX_VALUE
         );
         TarTranslogRemoteStoreStrategy batchStrategy = new TarTranslogRemoteStoreStrategy(batchCoordinator);
         batchCoordinator.setStrategy(batchStrategy);
@@ -332,9 +364,7 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
         String tarBlobName = blobs.keySet().stream().filter(n -> n.endsWith(".tar")).findFirst().orElse(null);
         assertNotNull(tarBlobName);
 
-        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(
-            new BlobStoreTransferService(blobStore, threadPool), basePath
-        );
+        TranslogArchiveGcScanner scanner = new TranslogArchiveGcScanner(new BlobStoreTransferService(blobStore, threadPool), basePath);
         java.util.List<TarArchiveBuilder.GcShardEntry> gcEntries = scanner.readGcPrefix(minutePath, tarBlobName);
 
         // GC entries should be present if the upload embeds seqNo info
@@ -354,7 +384,6 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
             1L, // minPrimaryTerm
             3L  // minGeneration
         );
-        assertEquals("Archive strategy returns USE_DEFAULT for translog blob GC",
-            GcDecision.USE_DEFAULT, decision);
+        assertEquals("Archive strategy returns USE_DEFAULT for translog blob GC", GcDecision.USE_DEFAULT, decision);
     }
 }

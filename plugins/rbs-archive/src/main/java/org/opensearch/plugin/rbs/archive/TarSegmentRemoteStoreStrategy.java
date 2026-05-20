@@ -231,7 +231,8 @@ class TarSegmentRemoteStoreStrategy implements SegmentRemoteStoreStrategy {
         if (dataContainer == null) {
             throw new IOException(
                 "TarSegmentRemoteStoreStrategy.openInput(): BlobContainer not yet initialised "
-                    + "(no upload has occurred on this node). File: " + name
+                    + "(no upload has occurred on this node). File: "
+                    + name
             );
         }
 
@@ -241,8 +242,13 @@ class TarSegmentRemoteStoreStrategy implements SegmentRemoteStoreStrategy {
         if (tarOffset < 0 || tarDataLength <= 0) {
             // This file was uploaded per-file (not in a TAR), or metadata is from before archiving.
             throw new IOException(
-                "No archive location for segment file '" + name + "' (tarOffset=" + tarOffset
-                    + ", tarDataLength=" + tarDataLength + "); cannot use TAR range-GET"
+                "No archive location for segment file '"
+                    + name
+                    + "' (tarOffset="
+                    + tarOffset
+                    + ", tarDataLength="
+                    + tarDataLength
+                    + "); cannot use TAR range-GET"
             );
         }
 
@@ -255,10 +261,7 @@ class TarSegmentRemoteStoreStrategy implements SegmentRemoteStoreStrategy {
         }
 
         if (fileBytes.length != tarDataLength) {
-            throw new IOException(
-                "openInput: expected " + tarDataLength + " bytes for '" + name
-                    + "' but got " + fileBytes.length
-            );
+            throw new IOException("openInput: expected " + tarDataLength + " bytes for '" + name + "' but got " + fileBytes.length);
         }
 
         return new ByteArrayIndexInput("tar:" + archiveBlobName + "!" + name, fileBytes);

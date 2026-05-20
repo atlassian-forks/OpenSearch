@@ -130,7 +130,6 @@ import org.opensearch.index.recovery.RecoveryStats;
 import org.opensearch.index.refresh.RefreshStats;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
 import org.opensearch.index.remote.RemoteStoreStrategyProvider;
-import org.opensearch.plugins.RemoteStorePlugin;
 import org.opensearch.index.search.stats.SearchStats;
 import org.opensearch.index.seqno.RetentionLeaseStats;
 import org.opensearch.index.seqno.RetentionLeaseSyncer;
@@ -160,6 +159,7 @@ import org.opensearch.node.Node;
 import org.opensearch.node.remotestore.RemoteStoreNodeAttribute;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.PluginsService;
+import org.opensearch.plugins.RemoteStorePlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.support.ValuesSourceRegistry;
@@ -498,9 +498,7 @@ public class IndicesService extends AbstractLifecycleComponent
         this.remoteDirectoryFactory = remoteDirectoryFactory;
         this.recoverySettings = recoverySettings;
         this.remoteStoreSettings = remoteStoreSettings;
-        this.remoteStoreStrategyProvider = RemoteStoreStrategyProvider.fromPlugins(
-            pluginsService.filterPlugins(RemoteStorePlugin.class)
-        );
+        this.remoteStoreStrategyProvider = RemoteStoreStrategyProvider.fromPlugins(pluginsService.filterPlugins(RemoteStorePlugin.class));
         this.translogFactorySupplier = getTranslogFactorySupplier(
             repositoriesServiceSupplier,
             threadPool,

@@ -8,12 +8,12 @@
 
 package org.opensearch.plugin.rbs.archive;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.index.translog.transfer.FileSnapshot;
@@ -21,7 +21,6 @@ import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
-
 import org.junit.After;
 
 import java.io.ByteArrayOutputStream;
@@ -31,11 +30,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.TimeUnit;
-
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.greaterThan;
 
 /**
  * Integration-style tests for {@link TranslogBatchCollector} and the
@@ -77,10 +72,8 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /** Builds a minimal TAR blob (1 entry) with the given GC entries. */
-    private static byte[] buildTar(
-        String indexUUID, int shardId, long gen,
-        List<TarArchiveBuilder.GcShardEntry> gcEntries
-    ) throws IOException {
+    private static byte[] buildTar(String indexUUID, int shardId, long gen, List<TarArchiveBuilder.GcShardEntry> gcEntries)
+        throws IOException {
         String tarPath = indexUUID + "/" + shardId + "/1/translog-" + gen + ".tlog";
         List<TarArchiveBuilder.ArchiveBuildEntry> entries = Arrays.asList(
             TarArchiveBuilder.fromBytes(tarPath, ("gen-" + gen).getBytes(StandardCharsets.UTF_8))
@@ -95,10 +88,7 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
     private void uploadTar(Instant uploadTime, String nodeId, byte[] tarBytes) throws IOException {
         BlobPath minutePath = TranslogArchivePathHelper.tarBlobDir(basePath, uploadTime);
         String blobName = TranslogArchivePathHelper.tarBlobName(uploadTime, nodeId);
-        transferService.uploadBlob(
-            new FileSnapshot.TransferFileSnapshot(blobName, tarBytes, 0L),
-            minutePath, WritePriority.HIGH
-        );
+        transferService.uploadBlob(new FileSnapshot.TransferFileSnapshot(blobName, tarBytes, 0L), minutePath, WritePriority.HIGH);
     }
 
     /** Returns the count of TAR blobs under the txlog root. */
@@ -109,8 +99,7 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
             var dayContainer = blobStore.blobContainer(txlogRoot.add(dayDir));
             for (String minuteDir : dayContainer.children().keySet()) {
                 var minuteContainer = blobStore.blobContainer(txlogRoot.add(dayDir).add(minuteDir));
-                count += minuteContainer.listBlobs().keySet().stream()
-                    .filter(n -> n.endsWith(".tar")).count();
+                count += minuteContainer.listBlobs().keySet().stream().filter(n -> n.endsWith(".tar")).count();
             }
         }
         return count;
@@ -128,9 +117,7 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
 
         // GC entry: maxSeqNo=10, globalCheckpoint=8 → checkpoint NOT covered (unsafe per scanner)
         // But runTranslogGc does timestamp-based only → should still delete it
-        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
-            new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 5L, 10L, 8L)
-        );
+        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 5L, 10L, 8L));
 
         // Upload an old TAR (2 hours ago → past any retention window)
         Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
@@ -138,8 +125,7 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
 
         runGc(Duration.ofMinutes(1));
 
-        assertEquals("Timestamp-based GC deletes old TARs regardless of checkpoint status",
-            0L, countTarBlobs());
+        assertEquals("Timestamp-based GC deletes old TARs regardless of checkpoint status", 0L, countTarBlobs());
     }
 
     /**
@@ -151,9 +137,7 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
         int shardId = 0;
 
         // GC entry: globalCheckpoint=10 >= maxSeqNo=10 → safe to delete
-        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
-            new TarArchiveBuilder.GcShardEntry(indexUUID, shardId, 5L, 10L, 10L)
-        );
+        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(new TarArchiveBuilder.GcShardEntry(indexUUID, shardId, 5L, 10L, 10L));
 
         // Old TAR (2 hours ago)
         Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
@@ -171,9 +155,7 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
         String indexUUID = "idx-" + randomAlphaOfLength(8);
 
         // Safe entry
-        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(
-            new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 1L, 5L, 5L)
-        );
+        List<TarArchiveBuilder.GcShardEntry> gcEntries = List.of(new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 1L, 5L, 5L));
 
         // Recent TAR (10 seconds ago)
         Instant recent = Instant.now().minus(Duration.ofSeconds(10));
@@ -192,18 +174,12 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
         String indexUUID = "idx-" + randomAlphaOfLength(8);
 
         // Old TAR: 2 hours ago, safe (ckp >= maxSeq)
-        List<TarArchiveBuilder.GcShardEntry> oldGc = List.of(
-            new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 1L, 5L, 5L)
-        );
-        uploadTar(Instant.now().minus(Duration.ofHours(2)), "node1",
-            buildTar(indexUUID, 0, 1L, oldGc));
+        List<TarArchiveBuilder.GcShardEntry> oldGc = List.of(new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 1L, 5L, 5L));
+        uploadTar(Instant.now().minus(Duration.ofHours(2)), "node1", buildTar(indexUUID, 0, 1L, oldGc));
 
         // Recent TAR: 30 seconds ago, safe
-        List<TarArchiveBuilder.GcShardEntry> recentGc = List.of(
-            new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 6L, 10L, 10L)
-        );
-        uploadTar(Instant.now().minus(Duration.ofSeconds(30)), "node1",
-            buildTar(indexUUID, 0, 6L, recentGc));
+        List<TarArchiveBuilder.GcShardEntry> recentGc = List.of(new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 6L, 10L, 10L));
+        uploadTar(Instant.now().minus(Duration.ofSeconds(30)), "node1", buildTar(indexUUID, 0, 6L, recentGc));
 
         runGc(Duration.ofMinutes(1));
 
@@ -235,8 +211,7 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
             new TarArchiveBuilder.GcShardEntry(indexUUID, 1, 1L, 10L, 3L)    // not covered
         );
 
-        uploadTar(Instant.now().minus(Duration.ofHours(2)), "node1",
-            buildTar(indexUUID, 0, 1L, gcEntries));
+        uploadTar(Instant.now().minus(Duration.ofHours(2)), "node1", buildTar(indexUUID, 0, 1L, gcEntries));
 
         runGc(Duration.ofMinutes(1));
 
@@ -251,12 +226,9 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
         Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
 
         for (int gen = 1; gen <= 3; gen++) {
-            List<TarArchiveBuilder.GcShardEntry> gc = List.of(
-                new TarArchiveBuilder.GcShardEntry(indexUUID, 0, gen, gen + 2L, gen + 2L)
-            );
+            List<TarArchiveBuilder.GcShardEntry> gc = List.of(new TarArchiveBuilder.GcShardEntry(indexUUID, 0, gen, gen + 2L, gen + 2L));
             // Use slightly different node IDs to get different blob names
-            uploadTar(twoHoursAgo.plusSeconds(gen), "node" + gen,
-                buildTar(indexUUID, 0, gen, gc));
+            uploadTar(twoHoursAgo.plusSeconds(gen), "node" + gen, buildTar(indexUUID, 0, gen, gc));
         }
 
         runGc(Duration.ofMinutes(1));
@@ -275,9 +247,7 @@ public class TranslogBatchCollectorTests extends OpenSearchTestCase {
 
         // Old, safe TAR
         Instant twoHoursAgo = Instant.now().minus(Duration.ofHours(2));
-        List<TarArchiveBuilder.GcShardEntry> gc = List.of(
-            new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 1L, 5L, 5L)
-        );
+        List<TarArchiveBuilder.GcShardEntry> gc = List.of(new TarArchiveBuilder.GcShardEntry(indexUUID, 0, 1L, 5L, 5L));
         uploadTar(twoHoursAgo, "node1", buildTar(indexUUID, 0, 1L, gc));
 
         runGc(Duration.ofMinutes(1));

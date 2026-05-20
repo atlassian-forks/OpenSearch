@@ -58,9 +58,7 @@ final class TarSegmentParser {
         int indexEnd = (int) (indexStart + indexDataLength);
 
         if (head.length < indexEnd) {
-            throw new IOException(
-                "TAR head buffer does not contain full _index payload: need " + indexEnd + " bytes, got " + head.length
-            );
+            throw new IOException("TAR head buffer does not contain full _index payload: need " + indexEnd + " bytes, got " + head.length);
         }
 
         byte[] indexBytes = new byte[(int) indexDataLength];

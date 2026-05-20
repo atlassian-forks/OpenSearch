@@ -26,9 +26,7 @@ public class MinuteGcIndexTests extends OpenSearchTestCase {
 
     public void testBuilderSingleShard() {
         MinuteGcIndex.Builder builder = new MinuteGcIndex.Builder();
-        List<TarArchiveBuilder.GcShardEntry> entries = List.of(
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 5L, 10L, 100L)
-        );
+        List<TarArchiveBuilder.GcShardEntry> entries = List.of(new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 5L, 10L, 100L));
         builder.merge(entries);
 
         MinuteGcIndex idx = builder.build();
@@ -60,10 +58,12 @@ public class MinuteGcIndexTests extends OpenSearchTestCase {
 
     public void testBuilderMultipleShardsSameIndex() {
         MinuteGcIndex.Builder builder = new MinuteGcIndex.Builder();
-        builder.merge(Arrays.asList(
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 3L, 3L),
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 1, 10L, 20L, 20L)
-        ));
+        builder.merge(
+            Arrays.asList(
+                new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 3L, 3L),
+                new TarArchiveBuilder.GcShardEntry(UUID_A, 1, 10L, 20L, 20L)
+            )
+        );
         MinuteGcIndex idx = builder.build();
         assertEquals(2, idx.size());
         assertEquals(3L, idx.get(UUID_A, 0).getMaxSeqNo());
@@ -72,10 +72,12 @@ public class MinuteGcIndexTests extends OpenSearchTestCase {
 
     public void testBuilderMultipleIndices() {
         MinuteGcIndex.Builder builder = new MinuteGcIndex.Builder();
-        builder.merge(Arrays.asList(
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L),
-            new TarArchiveBuilder.GcShardEntry(UUID_B, 0, 10L, 20L, 20L)
-        ));
+        builder.merge(
+            Arrays.asList(
+                new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 5L, 5L),
+                new TarArchiveBuilder.GcShardEntry(UUID_B, 0, 10L, 20L, 20L)
+            )
+        );
         MinuteGcIndex idx = builder.build();
         assertEquals(2, idx.size());
         assertEquals(2, idx.indexUUIDs().size());
@@ -88,10 +90,12 @@ public class MinuteGcIndexTests extends OpenSearchTestCase {
     public void testBuilderSameShardIdDifferentIndices() {
         // shard 0 of UUID_A and shard 0 of UUID_B must not collide
         MinuteGcIndex.Builder builder = new MinuteGcIndex.Builder();
-        builder.merge(Arrays.asList(
-            new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 50L, 30L),
-            new TarArchiveBuilder.GcShardEntry(UUID_B, 0, 100L, 200L, 150L)
-        ));
+        builder.merge(
+            Arrays.asList(
+                new TarArchiveBuilder.GcShardEntry(UUID_A, 0, 1L, 50L, 30L),
+                new TarArchiveBuilder.GcShardEntry(UUID_B, 0, 100L, 200L, 150L)
+            )
+        );
         MinuteGcIndex idx = builder.build();
         MinuteGcIndex.ShardRange a = idx.get(UUID_A, 0);
         MinuteGcIndex.ShardRange b = idx.get(UUID_B, 0);

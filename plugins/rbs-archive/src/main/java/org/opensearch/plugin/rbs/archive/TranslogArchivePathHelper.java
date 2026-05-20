@@ -8,7 +8,6 @@
 
 package org.opensearch.plugin.rbs.archive;
 
-import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobPath;
 
 import java.time.Instant;
@@ -48,12 +47,10 @@ final class TranslogArchivePathHelper {
     public static final String TXLOG_PREFIX = "txlog";
 
     /** Formatter for the day-level directory: {@code yyyyMMdd}. */
-    private static final DateTimeFormatter DAY_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd", Locale.ROOT)
-        .withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter DAY_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd", Locale.ROOT).withZone(ZoneOffset.UTC);
 
     /** Formatter for the minute-level directory: {@code HHmm}. */
-    private static final DateTimeFormatter MINUTE_FORMAT = DateTimeFormatter.ofPattern("HHmm", Locale.ROOT)
-        .withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter MINUTE_FORMAT = DateTimeFormatter.ofPattern("HHmm", Locale.ROOT).withZone(ZoneOffset.UTC);
 
     /** Formatter for the blob name time prefix: {@code ss.SSS} (seconds + ms within the minute). */
     private static final DateTimeFormatter BLOB_NAME_TIME_FORMAT = DateTimeFormatter.ofPattern("ss.SSS", Locale.ROOT)
@@ -143,7 +140,7 @@ final class TranslogArchivePathHelper {
         if (!blobName.endsWith(".tar")) {
             return Optional.empty();
         }
-        // blob name format: ss.SSS.nodeIdShort.tar  → split on '.'
+        // blob name format: ss.SSS.nodeIdShort.tar → split on '.'
         String[] parts = blobName.split("\\.", -1);
         // Expected: ["ss", "SSS", "nodeIdShort", "tar"] = 4 parts
         if (parts.length < 4) {

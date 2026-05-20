@@ -10,8 +10,8 @@ package org.opensearch.index.translog.transfer;
 
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.index.remote.GcDecision;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.remote.GcDecision;
 import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 
 import java.io.IOException;

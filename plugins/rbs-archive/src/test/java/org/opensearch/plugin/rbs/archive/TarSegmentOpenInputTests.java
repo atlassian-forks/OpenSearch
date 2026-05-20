@@ -65,15 +65,17 @@ public class TarSegmentOpenInputTests extends OpenSearchTestCase {
      */
     static BlobContainer mockContainerWith(byte[] tarBytes) throws IOException {
         BlobContainer container = mock(BlobContainer.class);
-        when(container.readBlob(
+        when(
+            container.readBlob(
                 org.mockito.ArgumentMatchers.anyString(),
                 org.mockito.ArgumentMatchers.anyLong(),
-                org.mockito.ArgumentMatchers.anyLong()))
-            .thenAnswer(inv -> {
-                long offset = inv.getArgument(1);
-                long length = inv.getArgument(2);
-                return new ByteArrayInputStream(tarBytes, (int) offset, (int) Math.min(length, tarBytes.length - offset));
-            });
+                org.mockito.ArgumentMatchers.anyLong()
+            )
+        ).thenAnswer(inv -> {
+            long offset = inv.getArgument(1);
+            long length = inv.getArgument(2);
+            return new ByteArrayInputStream(tarBytes, (int) offset, (int) Math.min(length, tarBytes.length - offset));
+        });
         return container;
     }
 
@@ -86,10 +88,15 @@ public class TarSegmentOpenInputTests extends OpenSearchTestCase {
      */
     static UploadedSegmentMetadata metadataFor(String originalName, String archiveBlobName, long tarOffset, long tarDataLength) {
         // Lucene major version 9 is max supported in OpenSearch 2.17; see UploadedSegmentMetadata.writtenByMajor.
-        String s5Format = String.join("::",
-            originalName, archiveBlobName, "dummy-checksum",
-            String.valueOf(tarDataLength), "9",
-            String.valueOf(tarOffset), String.valueOf(tarDataLength)
+        String s5Format = String.join(
+            "::",
+            originalName,
+            archiveBlobName,
+            "dummy-checksum",
+            String.valueOf(tarDataLength),
+            "9",
+            String.valueOf(tarOffset),
+            String.valueOf(tarDataLength)
         );
         return UploadedSegmentMetadata.fromString(s5Format);
     }
@@ -120,9 +127,11 @@ public class TarSegmentOpenInputTests extends OpenSearchTestCase {
 
         byte[] readBack = new byte[fileBytes.length];
         input.readBytes(readBack, 0, readBack.length);
-        assertEquals("Should read back the original file content",
+        assertEquals(
+            "Should read back the original file content",
             new String(fileBytes, StandardCharsets.UTF_8),
-            new String(readBack, StandardCharsets.UTF_8));
+            new String(readBack, StandardCharsets.UTF_8)
+        );
         input.close();
     }
 

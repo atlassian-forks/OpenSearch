@@ -17,7 +17,6 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -56,8 +55,7 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
      * Builds a TAR blob (using TarArchiveBuilder) containing the given generations for one shard.
      * Returns the raw bytes of the archive.
      */
-    private static byte[] buildTarWithGenerations(String indexUUID, int shardId, long primaryTerm, long... generations)
-        throws IOException {
+    private static byte[] buildTarWithGenerations(String indexUUID, int shardId, long primaryTerm, long... generations) throws IOException {
         List<TarArchiveBuilder.ArchiveBuildEntry> entries = new java.util.ArrayList<>();
 
         for (long gen : generations) {
@@ -147,17 +145,15 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
                 for (Map.Entry<String, byte[]> blobEntry : blobs.entrySet()) {
                     String blobName = blobEntry.getKey();
                     byte[] data = blobEntry.getValue();
-                    when(ts.downloadBlob(eq(minutePath), eq(blobName), anyLong(), anyLong()))
-                        .thenAnswer(inv -> {
-                            long offset = inv.getArgument(2);
-                            long length = inv.getArgument(3);
-                            int start = (int) offset;
-                            int len = (int) Math.min(length, data.length - start);
-                            return new ByteArrayInputStream(data, start, len);
-                        });
+                    when(ts.downloadBlob(eq(minutePath), eq(blobName), anyLong(), anyLong())).thenAnswer(inv -> {
+                        long offset = inv.getArgument(2);
+                        long length = inv.getArgument(3);
+                        int start = (int) offset;
+                        int len = (int) Math.min(length, data.length - start);
+                        return new ByteArrayInputStream(data, start, len);
+                    });
                     // full blob download
-                    when(ts.downloadBlob(eq(minutePath), eq(blobName)))
-                        .thenReturn(new ByteArrayInputStream(data));
+                    when(ts.downloadBlob(eq(minutePath), eq(blobName))).thenReturn(new ByteArrayInputStream(data));
                 }
             }
         }
@@ -189,7 +185,15 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
         Instant startFrom = uploadTime.minusSeconds(60); // scan from 1 min before upload
 
         boolean found = TranslogArchiveRecovery.recoverFromHierarchicalPath(
-            ts, base, INDEX_UUID, SHARD_ID, gen, gen, location, startFrom, null
+            ts,
+            base,
+            INDEX_UUID,
+            SHARD_ID,
+            gen,
+            gen,
+            location,
+            startFrom,
+            null
         );
 
         assertTrue("Should find generation " + gen, found);
@@ -218,7 +222,15 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
         Instant startFrom = uploadTime.minusSeconds(60);
 
         boolean found = TranslogArchiveRecovery.recoverFromHierarchicalPath(
-            ts, base, INDEX_UUID, SHARD_ID, 10L, 12L, location, startFrom, null
+            ts,
+            base,
+            INDEX_UUID,
+            SHARD_ID,
+            10L,
+            12L,
+            location,
+            startFrom,
+            null
         );
 
         assertTrue("Should find all generations in range", found);
@@ -239,7 +251,15 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
         Instant startFrom = Instant.now().minusSeconds(120);
 
         boolean found = TranslogArchiveRecovery.recoverFromHierarchicalPath(
-            ts, base, INDEX_UUID, SHARD_ID, 1L, 1L, location, startFrom, null
+            ts,
+            base,
+            INDEX_UUID,
+            SHARD_ID,
+            1L,
+            1L,
+            location,
+            startFrom,
+            null
         );
 
         assertFalse("Should return false when no TAR archive exists", found);
@@ -264,7 +284,15 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
         Instant startFrom = uploadTime.minusSeconds(60);
 
         boolean found = TranslogArchiveRecovery.recoverFromHierarchicalPath(
-            ts, base, INDEX_UUID, SHARD_ID, missingGen, missingGen, location, startFrom, null
+            ts,
+            base,
+            INDEX_UUID,
+            SHARD_ID,
+            missingGen,
+            missingGen,
+            location,
+            startFrom,
+            null
         );
 
         assertFalse("Should return false when generation is not in any TAR", found);
@@ -292,14 +320,30 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
 
         // First call: populates cache
         boolean found1 = TranslogArchiveRecovery.recoverFromHierarchicalPath(
-            ts, base, INDEX_UUID, SHARD_ID, gen, gen, location1, startFrom, cache
+            ts,
+            base,
+            INDEX_UUID,
+            SHARD_ID,
+            gen,
+            gen,
+            location1,
+            startFrom,
+            cache
         );
         assertTrue("First call should find generation", found1);
         assertEquals("Cache should have 1 entry after first call", 1, cache.size());
 
         // Second call: should hit cache (no extra downloads of the _index)
         boolean found2 = TranslogArchiveRecovery.recoverFromHierarchicalPath(
-            ts, base, INDEX_UUID, SHARD_ID, gen, gen, location2, startFrom, cache
+            ts,
+            base,
+            INDEX_UUID,
+            SHARD_ID,
+            gen,
+            gen,
+            location2,
+            startFrom,
+            cache
         );
         assertTrue("Second call should also find generation", found2);
         assertEquals("Cache size should still be 1", 1, cache.size());
@@ -332,7 +376,15 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
         Instant startFrom = uploadTime.plusSeconds(600); // 10 minutes later
 
         boolean found = TranslogArchiveRecovery.recoverFromHierarchicalPath(
-            ts, base, INDEX_UUID, SHARD_ID, gen, gen, location, startFrom, null
+            ts,
+            base,
+            INDEX_UUID,
+            SHARD_ID,
+            gen,
+            gen,
+            location,
+            startFrom,
+            null
         );
 
         assertFalse("Should not find TAR that is before startFrom", found);
@@ -365,7 +417,15 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
         Instant startFrom = time1.minusSeconds(60);
 
         boolean found = TranslogArchiveRecovery.recoverFromHierarchicalPath(
-            ts, base, INDEX_UUID, SHARD_ID, gen1, gen2, location, startFrom, null
+            ts,
+            base,
+            INDEX_UUID,
+            SHARD_ID,
+            gen1,
+            gen2,
+            location,
+            startFrom,
+            null
         );
 
         assertTrue("Should find both generations across two minute-dirs", found);
@@ -382,7 +442,15 @@ public class TranslogArchiveRecoveryTests extends OpenSearchTestCase {
 
         Path location = createTempDir();
         boolean found = TranslogArchiveRecovery.recoverFromHierarchicalPath(
-            ts, base, INDEX_UUID, SHARD_ID, 1L, 1L, location, Instant.now(), null
+            ts,
+            base,
+            INDEX_UUID,
+            SHARD_ID,
+            1L,
+            1L,
+            location,
+            Instant.now(),
+            null
         );
 
         assertFalse("Should return false when txlog root does not exist", found);

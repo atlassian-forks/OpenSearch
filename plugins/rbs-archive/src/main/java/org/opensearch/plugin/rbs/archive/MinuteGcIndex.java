@@ -8,8 +8,6 @@
 
 package org.opensearch.plugin.rbs.archive;
 
-import org.opensearch.common.annotation.ExperimentalApi;
-
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -120,12 +118,26 @@ final class MinuteGcIndex {
             this.maxCheckpoint = maxCheckpoint;
         }
 
-        public String getIndexUUID() { return indexUUID; }
-        public int getShardId() { return shardId; }
-        public long getMinSeqNo() { return minSeqNo; }
-        public long getMaxSeqNo() { return maxSeqNo; }
+        public String getIndexUUID() {
+            return indexUUID;
+        }
+
+        public int getShardId() {
+            return shardId;
+        }
+
+        public long getMinSeqNo() {
+            return minSeqNo;
+        }
+
+        public long getMaxSeqNo() {
+            return maxSeqNo;
+        }
+
         /** Max globalCheckpoint seen across all TARs in this minute for this (index, shard). */
-        public long getMaxCheckpoint() { return maxCheckpoint; }
+        public long getMaxCheckpoint() {
+            return maxCheckpoint;
+        }
 
         /** Merge with another range for the same (indexUUID, shardId): expand seqNo range, take max checkpoint. */
         public ShardRange merge(ShardRange other) {
@@ -162,8 +174,7 @@ final class MinuteGcIndex {
                     entry.getMaxSeqNo(),
                     entry.getGlobalCheckpoint()
                 );
-                shards.computeIfAbsent(indexUUID, k -> new HashMap<>())
-                    .merge(shardId, incoming, ShardRange::merge);
+                shards.computeIfAbsent(indexUUID, k -> new HashMap<>()).merge(shardId, incoming, ShardRange::merge);
             }
         }
 

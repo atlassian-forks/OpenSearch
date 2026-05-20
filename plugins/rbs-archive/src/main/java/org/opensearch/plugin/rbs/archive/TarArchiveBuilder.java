@@ -8,9 +8,7 @@
 
 package org.opensearch.plugin.rbs.archive;
 
-import org.opensearch.common.annotation.ExperimentalApi;
 import java.io.ByteArrayInputStream;
-
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -118,14 +116,28 @@ final class TarArchiveBuilder {
             this.globalCheckpoint = globalCheckpoint;
         }
 
-        public String getIndexUUID() { return indexUUID; }
-        public int getShardId() { return shardId; }
+        public String getIndexUUID() {
+            return indexUUID;
+        }
+
+        public int getShardId() {
+            return shardId;
+        }
+
         /** Minimum sequence number of ops in this TAR's translog files for this shard (seqNo space). */
-        public long getMinSeqNo() { return minSeqNo; }
+        public long getMinSeqNo() {
+            return minSeqNo;
+        }
+
         /** Maximum sequence number of ops in this TAR's translog files for this shard (seqNo space). */
-        public long getMaxSeqNo() { return maxSeqNo; }
+        public long getMaxSeqNo() {
+            return maxSeqNo;
+        }
+
         /** Global checkpoint (seqNo) on the data node at the time this TAR was uploaded. */
-        public long getGlobalCheckpoint() { return globalCheckpoint; }
+        public long getGlobalCheckpoint() {
+            return globalCheckpoint;
+        }
     }
 
     private TarArchiveBuilder() {}
@@ -175,9 +187,17 @@ final class TarArchiveBuilder {
             this.dataLength = dataLength;
         }
 
-        public String getPath() { return path; }
-        public long getDataOffset() { return dataOffset; }
-        public long getDataLength() { return dataLength; }
+        public String getPath() {
+            return path;
+        }
+
+        public long getDataOffset() {
+            return dataOffset;
+        }
+
+        public long getDataLength() {
+            return dataLength;
+        }
     }
 
     /**
@@ -228,7 +248,7 @@ final class TarArchiveBuilder {
         }
 
         // Step 2: compute GC prefix size (index-grouped format)
-        //   2 (numIndices) + per-index: 18 (header) + numShards * 24
+        // 2 (numIndices) + per-index: 18 (header) + numShards * 24
         // Group gcEntries by indexUUID
         java.util.LinkedHashMap<String, List<GcShardEntry>> byIndex = new java.util.LinkedHashMap<>();
         for (GcShardEntry gc : gcEntries) {
@@ -393,8 +413,8 @@ final class TarArchiveBuilder {
         }
         ByteBuffer buf = ByteBuffer.wrap(indexBytes);
         // Skip GC summary prefix (index-grouped format):
-        //   [2 bytes: numIndices]
-        //   Per index: [16 bytes UUID][2 bytes numShards][numShards * 24 bytes]
+        // [2 bytes: numIndices]
+        // Per index: [16 bytes UUID][2 bytes numShards][numShards * 24 bytes]
         int numIndices = buf.getShort() & 0xFFFF;
         for (int i = 0; i < numIndices; i++) {
             buf.getLong(); // UUID msb

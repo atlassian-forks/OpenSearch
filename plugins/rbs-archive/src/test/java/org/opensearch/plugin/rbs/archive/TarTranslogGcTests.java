@@ -21,7 +21,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -62,13 +64,17 @@ public class TarTranslogGcTests extends OpenSearchTestCase {
             // strip leading "txlog" if present
             boolean seenTxlog = false;
             for (String p : path) {
-                if (!seenTxlog && "txlog".equals(p)) { seenTxlog = true; continue; }
+                if (!seenTxlog && "txlog".equals(p)) {
+                    seenTxlog = true;
+                    continue;
+                }
                 parts.add(p);
             }
             return String.join("/", parts);
         }
 
-        @Override public Set<String> listFolders(Iterable<String> path) {
+        @Override
+        public Set<String> listFolders(Iterable<String> path) {
             String prefix = pathKey(path);
             Set<String> result = new LinkedHashSet<>();
             for (String key : blobs.keySet()) {
@@ -83,12 +89,14 @@ public class TarTranslogGcTests extends OpenSearchTestCase {
             return result;
         }
 
-        @Override public Set<String> listAll(Iterable<String> path) {
+        @Override
+        public Set<String> listAll(Iterable<String> path) {
             String key = pathKey(path);
             return blobs.getOrDefault(key, Set.of());
         }
 
-        @Override public void deleteBlobs(Iterable<String> path, List<String> fileNames) {
+        @Override
+        public void deleteBlobs(Iterable<String> path, List<String> fileNames) {
             String key = pathKey(path);
             Set<String> set = blobs.get(key);
             if (set != null) {
@@ -98,25 +106,96 @@ public class TarTranslogGcTests extends OpenSearchTestCase {
         }
 
         // ── Unimplemented (not needed for GC tests) ───────────────────────────
-        @Override public void uploadBlob(String tp, org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot snap,
-                                         Iterable<String> path, ActionListener<org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot> l,
-                                         WritePriority prio) { fail("not expected"); }
-        @Override public void uploadBlobs(Set<org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot> snaps,
-                                          Map<Long, BlobPath> paths, ActionListener<org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot> l,
-                                          WritePriority prio) { fail("not expected"); }
-        @Override public void uploadBlob(org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot snap,
-                                         Iterable<String> path, WritePriority prio) throws IOException { fail("not expected"); }
-        @Override public void uploadBlob(InputStream is, Iterable<String> path, String fileName,
-                                         WritePriority prio, ActionListener<Void> l) throws IOException { fail("not expected"); }
-        @Override public void delete(Iterable<String> path) throws IOException { fail("not expected"); }
-        @Override public void deleteAsync(String tp, Iterable<String> path, ActionListener<Void> l) { fail("not expected"); }
-        @Override public InputStream downloadBlob(Iterable<String> path, String fileName) throws IOException { fail("not expected"); return null; }
-        @Override public InputStream downloadBlob(Iterable<String> path, String fileName, long position, long length) throws IOException { fail("not expected"); return null; }
-        @Override public org.opensearch.common.blobstore.InputStreamWithMetadata downloadBlobWithMetadata(Iterable<String> path, String fileName) throws IOException { fail("not expected"); return null; }
-        @Override public void listFoldersAsync(String tp, Iterable<String> path, ActionListener<Set<String>> l) { fail("not expected"); }
-        @Override public void listAllInSortedOrder(Iterable<String> path, String prefix, int limit, ActionListener<List<BlobMetadata>> l) { fail("not expected"); }
-        @Override public void listAllInSortedOrderAsync(String tp, Iterable<String> path, String prefix, int limit, ActionListener<List<BlobMetadata>> l) { fail("not expected"); }
-        @Override public void deleteBlobsAsync(String tp, Iterable<String> path, List<String> fileNames, ActionListener<Void> l) { fail("not expected"); }
+        @Override
+        public void uploadBlob(
+            String tp,
+            org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot snap,
+            Iterable<String> path,
+            ActionListener<org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot> l,
+            WritePriority prio
+        ) {
+            fail("not expected");
+        }
+
+        @Override
+        public void uploadBlobs(
+            Set<org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot> snaps,
+            Map<Long, BlobPath> paths,
+            ActionListener<org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot> l,
+            WritePriority prio
+        ) {
+            fail("not expected");
+        }
+
+        @Override
+        public void uploadBlob(
+            org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot snap,
+            Iterable<String> path,
+            WritePriority prio
+        ) throws IOException {
+            fail("not expected");
+        }
+
+        @Override
+        public void uploadBlob(InputStream is, Iterable<String> path, String fileName, WritePriority prio, ActionListener<Void> l)
+            throws IOException {
+            fail("not expected");
+        }
+
+        @Override
+        public void delete(Iterable<String> path) throws IOException {
+            fail("not expected");
+        }
+
+        @Override
+        public void deleteAsync(String tp, Iterable<String> path, ActionListener<Void> l) {
+            fail("not expected");
+        }
+
+        @Override
+        public InputStream downloadBlob(Iterable<String> path, String fileName) throws IOException {
+            fail("not expected");
+            return null;
+        }
+
+        @Override
+        public InputStream downloadBlob(Iterable<String> path, String fileName, long position, long length) throws IOException {
+            fail("not expected");
+            return null;
+        }
+
+        @Override
+        public org.opensearch.common.blobstore.InputStreamWithMetadata downloadBlobWithMetadata(Iterable<String> path, String fileName)
+            throws IOException {
+            fail("not expected");
+            return null;
+        }
+
+        @Override
+        public void listFoldersAsync(String tp, Iterable<String> path, ActionListener<Set<String>> l) {
+            fail("not expected");
+        }
+
+        @Override
+        public void listAllInSortedOrder(Iterable<String> path, String prefix, int limit, ActionListener<List<BlobMetadata>> l) {
+            fail("not expected");
+        }
+
+        @Override
+        public void listAllInSortedOrderAsync(
+            String tp,
+            Iterable<String> path,
+            String prefix,
+            int limit,
+            ActionListener<List<BlobMetadata>> l
+        ) {
+            fail("not expected");
+        }
+
+        @Override
+        public void deleteBlobsAsync(String tp, Iterable<String> path, List<String> fileNames, ActionListener<Void> l) {
+            fail("not expected");
+        }
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

@@ -43,7 +43,10 @@ public final class RemoteStoreStrategyProvider {
 
     /** A no-op provider — all callers use built-in defaults. */
     public static final RemoteStoreStrategyProvider NOOP = new RemoteStoreStrategyProvider(
-        Collections.emptyMap(), Collections.emptyMap(), Collections.emptyList(), Collections.emptyList()
+        Collections.emptyMap(),
+        Collections.emptyMap(),
+        Collections.emptyList(),
+        Collections.emptyList()
     );
 
     /** Map of strategy name → segment strategy, in plugin registration order. */
@@ -96,13 +99,11 @@ public final class RemoteStoreStrategyProvider {
         for (RemoteStorePlugin plugin : plugins) {
             String name = plugin.getStrategyName();
             if (name == null || name.isEmpty()) {
-                logger.warn("RemoteStorePlugin [{}] returned empty getStrategyName() — skipping",
-                    plugin.getClass().getName());
+                logger.warn("RemoteStorePlugin [{}] returned empty getStrategyName() — skipping", plugin.getClass().getName());
                 continue;
             }
             if (segMap.containsKey(name) || tlogMap.containsKey(name)) {
-                logger.warn("RemoteStorePlugin [{}] duplicate strategy name '{}' — skipping",
-                    plugin.getClass().getName(), name);
+                logger.warn("RemoteStorePlugin [{}] duplicate strategy name '{}' — skipping", plugin.getClass().getName(), name);
                 continue;
             }
             SegmentRemoteStoreStrategy seg = plugin.getSegmentStrategy();
@@ -115,7 +116,8 @@ public final class RemoteStoreStrategyProvider {
             names.add(name);
             logger.info(
                 "RemoteStorePlugin [{}] registered as '{}' — segmentStrategy={}, translogStrategy={}",
-                plugin.getClass().getName(), name,
+                plugin.getClass().getName(),
+                name,
                 seg != null ? seg.getClass().getSimpleName() : "none",
                 tlog != null ? tlog.getClass().getSimpleName() : "none"
             );

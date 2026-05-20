@@ -34,10 +34,7 @@ public class RbsArchivePluginTests extends OpenSearchTestCase {
     public void testGetSegmentStrategyReturnsTarStrategy() {
         SegmentRemoteStoreStrategy strategy = plugin.getSegmentStrategy();
         assertNotNull("Plugin must provide a SegmentRemoteStoreStrategy", strategy);
-        assertTrue(
-            "Plugin segment strategy must be TarSegmentRemoteStoreStrategy",
-            strategy instanceof TarSegmentRemoteStoreStrategy
-        );
+        assertTrue("Plugin segment strategy must be TarSegmentRemoteStoreStrategy", strategy instanceof TarSegmentRemoteStoreStrategy);
     }
 
     /**
@@ -47,10 +44,7 @@ public class RbsArchivePluginTests extends OpenSearchTestCase {
     public void testGetTranslogStrategyReturnsNullBeforeCreateComponents() {
         // Before createComponents(), tarTranslogStrategy is not yet initialized
         TranslogRemoteStoreStrategy strategy = plugin.getTranslogStrategy();
-        assertNull(
-            "Plugin translog strategy must be null before createComponents() is called",
-            strategy
-        );
+        assertNull("Plugin translog strategy must be null before createComponents() is called", strategy);
     }
 
     /**
@@ -69,6 +63,7 @@ public class RbsArchivePluginTests extends OpenSearchTestCase {
                 public void onUploadComplete(org.opensearch.index.translog.transfer.TransferSnapshot snapshot) {
                     completed.set(true);
                 }
+
                 public void onUploadFailed(org.opensearch.index.translog.transfer.TransferSnapshot snapshot, Exception ex) {
                     failed.set(true);
                 }

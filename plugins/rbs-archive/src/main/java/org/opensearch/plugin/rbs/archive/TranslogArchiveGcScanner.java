@@ -11,16 +11,9 @@ package org.opensearch.plugin.rbs.archive;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.PlainActionFuture;
-import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.index.translog.transfer.TransferService;
-
-
-
-
-
-
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -72,7 +65,8 @@ final class TranslogArchiveGcScanner {
      * Conservative upper bound: use 2 + 4096 * (18 + 28) to handle worst case (1 shard/index).
      * S3 charges per request, not per byte — this is effectively free.
      */
-    static final int MAX_GC_PREFIX_BYTES = 2 + 4096 * (TarArchiveBuilder.GC_INDEX_HEADER_BYTES + TarArchiveBuilder.GC_SUMMARY_BYTES_PER_SHARD);
+    static final int MAX_GC_PREFIX_BYTES = 2 + 4096 * (TarArchiveBuilder.GC_INDEX_HEADER_BYTES
+        + TarArchiveBuilder.GC_SUMMARY_BYTES_PER_SHARD);
 
     private final TransferService transferService;
     private final BlobPath archiveBasePath;
@@ -137,7 +131,7 @@ final class TranslogArchiveGcScanner {
         String today = TranslogArchivePathHelper.dayDir(now);
         String yesterday = TranslogArchivePathHelper.dayDir(now.minus(java.time.Duration.ofDays(1)));
 
-        for (String dayDir : new String[]{ yesterday, today }) {
+        for (String dayDir : new String[] { yesterday, today }) {
             try {
                 scanDay(txlogRoot, gcIdxRoot, dayDir);
             } catch (Exception e) {
@@ -181,8 +175,10 @@ final class TranslogArchiveGcScanner {
                         inMemoryIndex.put(minuteKey, idx);
                         // Restore rolling checkpoints from persisted state (2-level: indexUUID → shardId)
                         for (String indexUUID : idx.indexUUIDs()) {
-                            Map<Integer, Long> indexCheckpoints = rollingCheckpoints
-                                .computeIfAbsent(indexUUID, k -> new ConcurrentHashMap<>());
+                            Map<Integer, Long> indexCheckpoints = rollingCheckpoints.computeIfAbsent(
+                                indexUUID,
+                                k -> new ConcurrentHashMap<>()
+                            );
                             for (MinuteGcIndex.ShardRange shard : idx.shards(indexUUID).values()) {
                                 indexCheckpoints.merge(shard.getShardId(), shard.getMaxCheckpoint(), Math::max);
                             }
@@ -475,8 +471,7 @@ final class TranslogArchiveGcScanner {
             // to always return false and blocking all GC deletions on the second and subsequent
             // scan cycles (when all minutes already have .idx files).
             for (String indexUUID : idx.indexUUIDs()) {
-                Map<Integer, Long> indexCheckpoints = rollingCheckpoints
-                    .computeIfAbsent(indexUUID, k -> new ConcurrentHashMap<>());
+                Map<Integer, Long> indexCheckpoints = rollingCheckpoints.computeIfAbsent(indexUUID, k -> new ConcurrentHashMap<>());
                 for (MinuteGcIndex.ShardRange shard : idx.shards(indexUUID).values()) {
                     indexCheckpoints.merge(shard.getShardId(), shard.getMaxCheckpoint(), Math::max);
                 }
@@ -556,8 +551,7 @@ final class TranslogArchiveGcScanner {
         // Update rolling checkpoints with this minute's per-(indexUUID, shardId) maxCheckpoint.
         // Called after persistence to ensure durability-memory consistency.
         for (String indexUUID : idx.indexUUIDs()) {
-            Map<Integer, Long> indexCheckpoints = rollingCheckpoints
-                .computeIfAbsent(indexUUID, k -> new ConcurrentHashMap<>());
+            Map<Integer, Long> indexCheckpoints = rollingCheckpoints.computeIfAbsent(indexUUID, k -> new ConcurrentHashMap<>());
             for (MinuteGcIndex.ShardRange shard : idx.shards(indexUUID).values()) {
                 indexCheckpoints.merge(shard.getShardId(), shard.getMaxCheckpoint(), Math::max);
             }
