@@ -32,6 +32,20 @@ import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 public interface RemoteStorePlugin {
 
     /**
+     * A unique name identifying this plugin's strategy (e.g. {@code "tar"}).
+     * Used to match against the per-index {@code index.remote_store.segment.strategy}
+     * and {@code index.remote_store.translog.strategy} settings so that installing the
+     * plugin does NOT automatically activate the strategy — an operator must explicitly
+     * opt in per index.
+     *
+     * <p>Must be non-empty, lower-case, and stable across plugin versions (it is persisted
+     * in segment metadata and referenced by index settings).
+     */
+    default String getStrategyName() {
+        return "";
+    }
+
+    /**
      * Returns the composite segment remote store strategy (upload + download + GC),
      * or {@code null} to use the built-in per-file behavior.
      */

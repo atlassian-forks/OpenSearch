@@ -20,6 +20,7 @@ import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.util.FileSystemUtils;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
+import org.opensearch.index.remote.RemoteStoreStrategyProvider;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
@@ -41,7 +42,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.HashMap;
 import java.util.Map;
@@ -299,6 +302,17 @@ public class RemoteFsTranslog extends Translog {
         throw ex;
     }
 
+    /** Returns generation numbers in [minGen, maxGen] whose .tlog file does not yet exist at location. */
+    private static List<Long> allMissing(long minGen, long maxGen, Path location) {
+        List<Long> missing = new ArrayList<>();
+        for (long g = minGen; g <= maxGen; g++) {
+            if (Files.notExists(location.resolve(Translog.getFilename(g)))) {
+                missing.add(g);
+            }
+        }
+        return missing;
+    }
+
     private static void downloadOnce(
         TranslogTransferManager translogTransferManager,
         Path location,
@@ -306,7 +320,7 @@ public class RemoteFsTranslog extends Translog {
         boolean seedRemote,
         long timestamp
     ) throws IOException {
-        downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp, null, null);
+        downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp, null, null, null, null);
     }
 
     private static void downloadOnce(
@@ -317,6 +331,21 @@ public class RemoteFsTranslog extends Translog {
         long timestamp,
         @Nullable TranslogRemoteStoreStrategy translogStrategy,
         @Nullable BlobPath repositoryBasePath
+    ) throws IOException {
+        downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp,
+            translogStrategy, repositoryBasePath, null, null);
+    }
+
+    private static void downloadOnce(
+        TranslogTransferManager translogTransferManager,
+        Path location,
+        Logger logger,
+        boolean seedRemote,
+        long timestamp,
+        @Nullable TranslogRemoteStoreStrategy translogStrategy,
+        @Nullable BlobPath repositoryBasePath,
+        @Nullable RemoteStoreStrategyProvider strategyProvider,
+        @Nullable String currentStrategyName
     ) throws IOException {
         logger.debug("Downloading translog files from remote");
         RemoteTranslogTransferTracker statsTracker = translogTransferManager.getRemoteTranslogTransferTracker();
@@ -337,39 +366,88 @@ public class RemoteFsTranslog extends Translog {
             long minGen = translogMetadata.getMinTranslogGeneration();
             long maxGen = translogMetadata.getGeneration();
 
+            // Build gen→primaryTerm map once (used across all recovery steps).
+            Map<Long, Long> longGenToPrimaryTerm = new HashMap<>();
+            for (Map.Entry<String, String> e : generationToPrimaryTermMapper.entrySet()) {
+                longGenToPrimaryTerm.put(Long.parseLong(e.getKey()), Long.parseLong(e.getValue()));
+            }
+
+            // 3-step recovery fallback chain:
+            //   Step 1 — current strategy (null = per-file is step 1 if no strategy configured)
+            //   Step 2 — other registered strategies (handles TAR→off→TAR, multi-plugin)
+            //   Step 3 — default per-file for anything still missing
+            //
+            // This makes recovery safe across strategy changes:
+            //   TAR→off: current=null → step 1 tries per-file, step 2 tries TAR for missing gens
+            //   off→TAR: current=TAR → step 1 tries TAR, step 3 fills old per-file gens
+            //   TAR→off→TAR: current=TAR → step 1 finds both TAR phases, step 3 fills per-file phase
+
             if (translogStrategy != null && repositoryBasePath != null) {
-                // Call downloadRange() once for the full generation range — allows TAR-based strategies
-                // to scan the archive hierarchy a single time for all generations rather than N times.
-                // The strategy returns false for any generation it could not find in archive storage;
-                // we fill in the gaps from per-file storage below.
-                Map<Long, Long> longGenToPrimaryTerm = new HashMap<>();
-                for (Map.Entry<String, String> e : generationToPrimaryTermMapper.entrySet()) {
-                    longGenToPrimaryTerm.put(Long.parseLong(e.getKey()), Long.parseLong(e.getValue()));
-                }
+                // Step 1: current strategy (e.g. TAR) — scans archive hierarchy once for all gens.
                 boolean allFound = translogStrategy.downloadRange(
                     minGen, maxGen, longGenToPrimaryTerm, location,
                     translogTransferManager.getTransferService(),
                     translogTransferManager.getShardId(),
                     repositoryBasePath
                 );
-                if (!allFound) {
-                    // Fill in any generations the strategy could not find from per-file storage.
-                    for (long i = maxGen; i >= minGen; i--) {
+                if (!allFound && strategyProvider != null) {
+                    // Step 2: other registered strategies (not the current one) — handles
+                    // gens written by a different strategy (e.g. strategy was disabled/changed).
+                    for (TranslogRemoteStoreStrategy other : strategyProvider.otherTranslogStrategies(currentStrategyName)) {
+                        if (allMissing(minGen, maxGen, location).isEmpty()) break;
+                        logger.debug("Trying fallback strategy [{}] for missing translog gens", other.getClass().getSimpleName());
+                        other.downloadRange(
+                            minGen, maxGen, longGenToPrimaryTerm, location,
+                            translogTransferManager.getTransferService(),
+                            translogTransferManager.getShardId(),
+                            repositoryBasePath
+                        );
+                    }
+                }
+                // Step 3: default per-file for anything still not found.
+                for (long i = maxGen; i >= minGen; i--) {
+                    String tlogFile = Translog.getFilename(i);
+                    if (Files.notExists(location.resolve(tlogFile))) {
                         String generation = Long.toString(i);
-                        String tlogFile = Translog.getFilename(i);
-                        if (Files.notExists(location.resolve(tlogFile))) {
-                            logger.debug("Gen {} missing from archive, falling back to per-file download", i);
-                            translogTransferManager.downloadTranslog(
-                                generationToPrimaryTermMapper.get(generation), generation, location
-                            );
-                        }
+                        logger.debug("Gen {} missing from all archive strategies, falling back to per-file", i);
+                        translogTransferManager.downloadTranslog(
+                            generationToPrimaryTermMapper.get(generation), generation, location
+                        );
                     }
                 }
             } else {
-                // No strategy — use default per-file download for every generation.
+                // No current strategy configured for this index.
+                // Step 1: default per-file download.
                 for (long i = maxGen; i >= minGen; i--) {
                     String generation = Long.toString(i);
-                    translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
+                    String tlogFile = Translog.getFilename(i);
+                    try {
+                        translogTransferManager.downloadTranslog(
+                            generationToPrimaryTermMapper.get(generation), generation, location
+                        );
+                    } catch (FileNotFoundException | NoSuchFileException missing) {
+                        // Step 2: gen not found per-file — try registered archive strategies.
+                        // Handles the case: index was previously on TAR, strategy disabled.
+                        boolean recovered = false;
+                        if (strategyProvider != null && repositoryBasePath != null) {
+                            for (TranslogRemoteStoreStrategy other : strategyProvider.allTranslogStrategies()) {
+                                logger.debug("Gen {} not found per-file, trying strategy [{}]", i, other.getClass().getSimpleName());
+                                other.downloadRange(
+                                    i, i, longGenToPrimaryTerm, location,
+                                    translogTransferManager.getTransferService(),
+                                    translogTransferManager.getShardId(),
+                                    repositoryBasePath
+                                );
+                                if (Files.exists(location.resolve(tlogFile))) {
+                                    recovered = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!recovered) {
+                            throw missing; // truly not found anywhere
+                        }
+                    }
                 }
             }
             logger.info(

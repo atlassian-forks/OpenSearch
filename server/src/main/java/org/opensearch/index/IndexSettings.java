@@ -767,6 +767,32 @@ public final class IndexSettings {
         Property.IndexScope
     );
 
+    /**
+     * Per-index setting that selects which remote store strategy plugin to use for segment uploads.
+     * An empty value (the default) means use the built-in per-file behavior even if a strategy
+     * plugin is installed. Setting this to a plugin's strategy name (e.g. {@code "tar"}) activates
+     * the plugin for this index. Snapshotted at shard-open time; takes effect on next shard restart.
+     */
+    public static final Setting<String> INDEX_REMOTE_STORE_SEGMENT_STRATEGY_SETTING = Setting.simpleString(
+        "index.remote_store.segment.strategy",
+        "",
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
+    /**
+     * Per-index setting that selects which remote store strategy plugin to use for translog uploads.
+     * An empty value (the default) means use the built-in per-file behavior even if a strategy
+     * plugin is installed. Setting this to a plugin's strategy name (e.g. {@code "tar"}) activates
+     * the plugin for this index. Snapshotted at shard-open time; takes effect on next shard restart.
+     */
+    public static final Setting<String> INDEX_REMOTE_STORE_TRANSLOG_STRATEGY_SETTING = Setting.simpleString(
+        "index.remote_store.translog.strategy",
+        "",
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
     public static final Setting<Long> INDEX_CONTEXT_CREATED_VERSION = Setting.longSetting(
         "index.context.created_version",
         0,

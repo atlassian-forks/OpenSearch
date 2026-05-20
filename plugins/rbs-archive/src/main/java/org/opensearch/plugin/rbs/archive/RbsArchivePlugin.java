@@ -62,6 +62,22 @@ public class RbsArchivePlugin extends Plugin implements RemoteStorePlugin {
     /** Shared node-level TAR translog strategy — created once, shared across all shards. */
     private TarTranslogRemoteStoreStrategy tarTranslogStrategy;
 
+    /**
+     * The strategy name used to identify this plugin in per-index settings.
+     * Operators enable the archive strategy on an index via:
+     * <pre>
+     *   PUT my-index/_settings
+     *   { "index.remote_store.translog.strategy": "tar",
+     *     "index.remote_store.segment.strategy":  "tar" }
+     * </pre>
+     * Installing this plugin does NOT automatically switch existing indices to archive
+     * mode — an explicit per-index opt-in is required.
+     */
+    @Override
+    public String getStrategyName() {
+        return "tar";
+    }
+
     @Override
     public SegmentRemoteStoreStrategy getSegmentStrategy() {
         return new TarSegmentRemoteStoreStrategy();

@@ -25,12 +25,14 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.Version;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.io.VersionedCodecStreamWrapper;
 import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.remote.SegmentRemoteStoreStrategy;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
 import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.store.lockmanager.FileLockInfo;
@@ -102,6 +104,18 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * It is important to initialize this map on creation of RemoteSegmentStoreDirectory and update it on each upload and delete.
      */
     private Map<String, UploadedSegmentMetadata> segmentsUploadedToRemoteStore;
+
+    /**
+     * Optional plugin-provided segment strategy used to open archive-backed segment files.
+     * When set, {@link #openInput} delegates to this strategy for files whose metadata records
+     * a TAR byte offset ({@code tarOffset >= 0}), enabling direct range-GET reads against the
+     * TAR blob.  Null (the default) means all files are opened via the standard per-file path.
+     * <p>
+     * Set by {@link #setSegmentStrategy} after construction, once the strategy has been resolved
+     * from the per-index {@code index.remote_store.segment.strategy} setting.
+     */
+    @Nullable
+    private SegmentRemoteStoreStrategy segmentStrategy;
 
     private static final VersionedCodecStreamWrapper<RemoteSegmentMetadata> metadataStreamWrapper = new VersionedCodecStreamWrapper<>(
         new RemoteSegmentMetadataHandler(),
@@ -564,13 +578,20 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      */
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
-        String remoteFilename = getExistingRemoteFilename(name);
-        long fileLength = fileLength(name);
-        if (remoteFilename != null) {
-            return remoteDataDirectory.openInput(remoteFilename, fileLength, context);
-        } else {
+        UploadedSegmentMetadata metadata = segmentsUploadedToRemoteStore.get(name);
+        if (metadata == null) {
             throw new NoSuchFileException(name);
         }
+        // If the file was uploaded as part of an archive (TAR) blob, delegate to the segment
+        // strategy so it can issue a direct range-GET without re-reading the TAR index.
+        // The strategy is identified by the tarOffset sentinel: >= 0 means archive blob.
+        if (metadata.getTarOffset() >= 0 && segmentStrategy != null) {
+            return segmentStrategy.openInput(name, metadata);
+        }
+        // Default: fetch the named blob directly (per-file behavior).
+        String remoteFilename = metadata.getUploadedFilename();
+        long fileLength = metadata.getLength();
+        return remoteDataDirectory.openInput(remoteFilename, fileLength, context);
     }
 
     /**
@@ -709,6 +730,17 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @param from            the local directory containing {@code src}
      * @throws IOException if the file checksum cannot be computed
      */
+    /**
+     * Sets the plugin-provided segment strategy used by {@link #openInput} to open archive-backed files.
+     * Called once after construction when the per-index strategy setting has been resolved.
+     * May be called with {@code null} to clear a previously set strategy (e.g. during shard close).
+     *
+     * @param strategy the archive segment strategy, or {@code null} for the built-in per-file path
+     */
+    public void setSegmentStrategy(@Nullable SegmentRemoteStoreStrategy strategy) {
+        this.segmentStrategy = strategy;
+    }
+
     public void postUploadForArchive(String src, String archiveBlobName, long tarOffset, long tarDataLength, Directory from)
         throws IOException {
         String checksum = getChecksumOfLocalFile(from, src);

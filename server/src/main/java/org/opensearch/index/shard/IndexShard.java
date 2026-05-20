@@ -4081,7 +4081,10 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     private SegmentRemoteStoreStrategy resolveSegmentStrategy(RemoteStoreStrategyProvider provider) {
-        SegmentRemoteStoreStrategy strategy = provider.getSegmentStrategy();
+        // Per-index opt-in: read the strategy name from the index setting.
+        // Empty string (default) means use core per-file behavior even if a plugin is installed.
+        String strategyName = indexSettings().getValue(IndexSettings.INDEX_REMOTE_STORE_SEGMENT_STRATEGY_SETTING);
+        SegmentRemoteStoreStrategy strategy = provider.segmentStrategyFor(strategyName);
         if (strategy != null) {
             return strategy;
         }
@@ -4096,7 +4099,10 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
      * when no plugin is registered (core falls back to the default per-file translog behaviour).
      */
     private TranslogRemoteStoreStrategy resolveTranslogStrategy(RemoteStoreStrategyProvider provider) {
-        return provider.getTranslogStrategy(); // null means "use core default"
+        // Per-index opt-in: read the strategy name from the index setting.
+        // Empty string (default) means use core per-file behavior even if a plugin is installed.
+        String strategyName = indexSettings().getValue(IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_STRATEGY_SETTING);
+        return provider.translogStrategyFor(strategyName); // null means "use core default"
     }
 
     private boolean isRemoteStoreEnabled() {

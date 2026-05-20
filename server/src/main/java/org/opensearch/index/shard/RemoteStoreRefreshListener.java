@@ -29,6 +29,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.remote.RemoteSegmentTransferTracker;
+import org.opensearch.index.remote.DefaultSegmentRemoteStoreStrategy;
 import org.opensearch.index.remote.SegmentRemoteStoreStrategy;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.CompositeDirectory;
@@ -126,6 +127,9 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         this.checkpointPublisher = checkpointPublisher;
         this.remoteStoreSettings = remoteStoreSettings;
         this.segmentStrategy = segmentStrategy;
+        // Wire the strategy into RSSD so openInput() can dispatch archive reads directly
+        // via range-GET without needing to hold a reference to the strategy itself.
+        this.remoteDirectory.setSegmentStrategy(segmentStrategy instanceof DefaultSegmentRemoteStoreStrategy ? null : segmentStrategy);
     }
 
     @Override

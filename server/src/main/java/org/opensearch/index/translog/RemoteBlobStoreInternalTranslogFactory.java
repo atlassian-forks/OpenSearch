@@ -10,6 +10,7 @@ package org.opensearch.index.translog;
 
 import org.opensearch.index.remote.RemoteStoreStrategyProvider;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.translog.transfer.TranslogRemoteStoreStrategy;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.repositories.RepositoriesService;
@@ -73,7 +74,11 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
 
         assert repository instanceof BlobStoreRepository : "repository should be instance of BlobStoreRepository";
         BlobStoreRepository blobStoreRepository = ((BlobStoreRepository) repository);
-        TranslogRemoteStoreStrategy translogStrategy = remoteStoreStrategyProvider.getTranslogStrategy();
+        // Per-index strategy: look up by name from the index setting. Empty name = built-in per-file.
+        String strategyName = config.getIndexSettings().getValue(
+            IndexSettings.INDEX_REMOTE_STORE_TRANSLOG_STRATEGY_SETTING
+        );
+        TranslogRemoteStoreStrategy translogStrategy = remoteStoreStrategyProvider.translogStrategyFor(strategyName);
         if (RemoteStoreSettings.isPinnedTimestampsEnabled()) {
             return new RemoteFsTimestampAwareTranslog(
                 config,
