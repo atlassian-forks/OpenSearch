@@ -121,7 +121,20 @@ final class TranslogArchiveGcScanner {
      *
      * @param now current time (used to determine which day dirs to scan)
      */
-    public void scan(Instant now) {
+    /**
+     * Scans translog TAR archives and deletes minute-dirs whose data is safe to remove.
+     *
+     * <p>For each minute-dir that has been scanned (i.e. a {@code gc_idx} entry exists),
+     * this method calls {@link #isSafeToDelete(String, Set)} with the provided live index
+     * UUIDs. If safe, it deletes all TAR blobs in that minute-dir and the corresponding
+     * {@code gc_idx} entry.
+     *
+     * @param now             current timestamp (used to determine which day-dirs to scan)
+     * @param liveIndexUUIDs  set of index UUIDs currently alive in cluster state; entries
+     *                        absent from this set are treated as deleted and won't block GC.
+     *                        Pass {@code null} to skip liveness check (conservative mode).
+     */
+    public void scan(Instant now, Set<String> liveIndexUUIDs) {
         BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(archiveBasePath);
         BlobPath gcIdxRoot = gcIdxRootPath(archiveBasePath);
 
@@ -133,11 +146,19 @@ final class TranslogArchiveGcScanner {
 
         for (String dayDir : new String[] { yesterday, today }) {
             try {
-                scanDay(txlogRoot, gcIdxRoot, dayDir);
+                scanDay(txlogRoot, gcIdxRoot, dayDir, liveIndexUUIDs);
             } catch (Exception e) {
                 logger.warn("GC scanner: failed to scan txlog day dir {}: {}", dayDir, e.getMessage());
             }
         }
+    }
+
+    /**
+     * Convenience overload that skips liveness check (conservative — deleted indices won't
+     * unblock GC). Retained for backward compatibility with existing unit tests.
+     */
+    public void scan(Instant now) {
+        scan(now, null);
     }
 
     /**
@@ -376,7 +397,7 @@ final class TranslogArchiveGcScanner {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    private void scanDay(BlobPath txlogRoot, BlobPath gcIdxRoot, String dayDir) {
+    private void scanDay(BlobPath txlogRoot, BlobPath gcIdxRoot, String dayDir, Set<String> liveIndexUUIDs) {
         BlobPath dayTxlogPath = txlogRoot.add(dayDir);
         BlobPath dayGcIdxPath = gcIdxRoot.add(dayDir);
 
@@ -432,6 +453,36 @@ final class TranslogArchiveGcScanner {
             } catch (IOException e) {
                 logger.warn("GC scanner: failed to batch-delete orphaned gc_idx blobs in {}: {}", dayDir, e.getMessage());
             }
+        }
+
+        // Phase 1 deletion: delete minute-dirs whose data is fully checkpointed.
+        // We iterate the already-in-memory minute-keys for this day and delete any that are safe.
+        // This is the only deletion path — there is no separate timestamp-based phase.
+        for (String minuteDir : sortedMinuteDirs) {
+            String minuteKey = dayDir + "/" + minuteDir;
+            if (!isSafeToDelete(minuteKey, liveIndexUUIDs)) {
+                continue;
+            }
+            // Delete all TAR blobs in this minute-dir
+            BlobPath minutePath = dayTxlogPath.add(minuteDir);
+            try {
+                List<BlobMetadata> tars = PlainActionFuture.<List<BlobMetadata>, IOException>get(
+                    f -> transferService.listAllInSortedOrder(minutePath, "", MAX_TARS_PER_MINUTE, f)
+                );
+                if (tars != null && !tars.isEmpty()) {
+                    List<String> tarNames = new ArrayList<>();
+                    for (BlobMetadata tar : tars) {
+                        tarNames.add(tar.name());
+                    }
+                    transferService.deleteBlobs(minutePath, tarNames);
+                    logger.debug("GC scanner: deleted {} TAR blobs in {}/{}", tarNames.size(), dayDir, minuteDir);
+                }
+            } catch (Exception e) {
+                logger.warn("GC scanner: failed to delete TARs in {}/{}: {}", dayDir, minuteDir, e.getMessage());
+                continue; // Don't evict if deletion failed — retry on next scan
+            }
+            // Evict from memory and delete gc_idx entry
+            evictAndDeleteIdx(dayDir, minuteDir);
         }
     }
 

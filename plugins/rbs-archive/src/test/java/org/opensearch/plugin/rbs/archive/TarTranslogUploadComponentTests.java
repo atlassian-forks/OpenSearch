@@ -336,17 +336,6 @@ public class TarTranslogUploadComponentTests extends OpenSearchTestCase {
     }
 
     /**
-     * lastKnownBasePath is captured from upload() for use by GC.
-     */
-    public void testUploadCapturesLastKnownBasePath() throws Exception {
-        assertNull("basePath should be null before any upload", strategy.getLastKnownBasePath());
-        TransferSnapshot snapshot = buildSnapshot(1L, 1L, 0L);
-        strategy.upload(snapshot, NOOP_LISTENER, transferService, SHARD_ID, basePath);
-        assertNotNull("lastKnownBasePath should be set after upload", strategy.getLastKnownBasePath());
-        assertEquals("captured basePath should match upload basePath", basePath, strategy.getLastKnownBasePath());
-    }
-
-    /**
      * GC entries (GcShardEntry) are embedded in the TAR's _index. Read back with
      * readGcPrefix to verify seqNo metadata is correctly stored.
      */

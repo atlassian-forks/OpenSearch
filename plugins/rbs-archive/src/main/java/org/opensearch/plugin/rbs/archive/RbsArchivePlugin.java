@@ -25,7 +25,6 @@ import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.watcher.ResourceWatcherService;
 
-import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
 import java.util.function.Supplier;
@@ -54,7 +53,6 @@ public class RbsArchivePlugin extends Plugin implements RemoteStorePlugin {
     static final TimeValue DEFAULT_ARCHIVE_MAX_WAIT = TimeValue.timeValueMillis(200);
     static final int DEFAULT_ARCHIVE_THRESHOLD = 10;
     static final TimeValue DEFAULT_GC_INTERVAL = TimeValue.timeValueMinutes(10);
-    static final Duration DEFAULT_RETENTION_AGE = Duration.ofHours(2);
 
     /**
      * Shared node-level TAR translog strategy — created at plugin construction time so that
@@ -141,8 +139,7 @@ public class RbsArchivePlugin extends Plugin implements RemoteStorePlugin {
             tarTranslogStrategy,
             DEFAULT_ARCHIVE_MAX_WAIT,
             DEFAULT_ARCHIVE_THRESHOLD,
-            DEFAULT_GC_INTERVAL,
-            DEFAULT_RETENTION_AGE
+            DEFAULT_GC_INTERVAL
         );
 
         return List.of(collector);

@@ -25,12 +25,10 @@ import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * TAR-based translog remote store strategy using node-level batch upload.
@@ -55,12 +53,6 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
     private volatile TranslogBatchCoordinator coordinator;
     /** Node-level LRU cache for parsed TAR {@code _index} entries, shared across all recovery calls. */
     private final TranslogArchiveIndexCache indexCache;
-    /**
-     * Tracks the repository base path from the most recent upload() call.
-     * Used by {@link #runArchiveGc} when no per-call basePath is available.
-     * Null until the first upload occurs.
-     */
-    private volatile BlobPath lastKnownBasePath;
 
     public TarTranslogRemoteStoreStrategy(TranslogBatchCoordinator coordinator) {
         this(coordinator, new TranslogArchiveIndexCache());
@@ -97,11 +89,6 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
      * (or fails), then notifies the listener.
      */
 
-    /** Returns the last repository base path captured from an upload, or {@code null} if no upload has completed yet. */
-    public BlobPath getLastKnownBasePath() {
-        return lastKnownBasePath;
-    }
-
     @Override
     public boolean upload(
         TransferSnapshot snapshot,
@@ -131,9 +118,6 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
             listener.onUploadComplete(snapshot);
             return true;
         }
-
-        // Capture basePath so GC (which may run on cluster-manager before any download occurs) can use it.
-        lastKnownBasePath = repositoryBasePath;
 
         var meta = snapshot.getTranslogTransferMetadata();
         TranslogShardBatch batch = new TranslogShardBatch(
@@ -278,9 +262,6 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
         ShardId shardId,
         BlobPath repositoryBasePath
     ) throws IOException {
-        // Capture basePath for GC (GC runs on the cluster-manager which may not be uploading).
-        lastKnownBasePath = repositoryBasePath;
-
         return TranslogArchiveRecovery.recoverFromHierarchicalPath(
             transferService,
             repositoryBasePath,
@@ -380,117 +361,4 @@ class TarTranslogRemoteStoreStrategy implements TranslogRemoteStoreStrategy {
         return total;
     }
 
-    public void runArchiveGc(BlobPath basePath, Duration retentionAge) throws IOException {
-        // Prefer the explicitly passed basePath; fall back to the one captured from the last upload.
-        BlobPath effectiveBase = (basePath != null) ? basePath : lastKnownBasePath;
-        if (effectiveBase == null) {
-            logger.debug("TAR translog archive GC: no basePath known yet (no upload has completed), skipping");
-            return;
-        }
-        if (retentionAge == null || retentionAge.isNegative() || retentionAge.isZero()) {
-            logger.warn("TAR translog archive GC: invalid retentionAge={}, skipping", retentionAge);
-            return;
-        }
-        runTranslogGc(coordinator.getLastKnownTransferService(), effectiveBase, retentionAge, logger);
-    }
-
-    /**
-     * Scans the txlog archive hierarchy and deletes TAR blobs (and empty parent dirs) older than
-     * {@code retentionAge}. Package-private for unit testing.
-     *
-     * <p>Walk order: {@code txlog/ → yyyyMMdd/ → HHmm/ → *.tar}
-     * <p>A blob is expired when {@code now - blobTimestamp > retentionAge}.
-     * <p>After deleting all expired blobs in a minute-dir, the minute-dir itself is removed if empty.
-     * After processing all minute-dirs in a day-dir, the day-dir is removed if empty.
-     *
-     * @param transferService blob store I/O
-     * @param basePath        repository base path (txlog root is {@code basePath/txlog/})
-     * @param retentionAge    blobs older than this are eligible for deletion
-     * @param log             caller's logger
-     */
-    static void runTranslogGc(
-        TransferService transferService,
-        BlobPath basePath,
-        Duration retentionAge,
-        org.apache.logging.log4j.Logger log
-    ) throws IOException {
-        if (transferService == null) {
-            log.debug("TAR translog archive GC: no TransferService available yet, skipping");
-            return;
-        }
-        Instant cutoff = Instant.now().minus(retentionAge);
-        BlobPath txlogRoot = TranslogArchivePathHelper.txlogRootPath(basePath);
-
-        Set<String> dayDirs;
-        try {
-            dayDirs = transferService.listFolders(txlogRoot);
-        } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
-            log.debug("TAR translog archive GC: txlog root not present, nothing to clean up");
-            return;
-        }
-
-        for (String dayDir : dayDirs) {
-            BlobPath dayPath = txlogRoot.add(dayDir);
-            Set<String> minuteDirs;
-            try {
-                minuteDirs = transferService.listFolders(dayPath);
-            } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
-                continue;
-            }
-
-            for (String minuteDir : minuteDirs) {
-                BlobPath minutePath = dayPath.add(minuteDir);
-                Set<String> blobs;
-                try {
-                    blobs = transferService.listAll(minutePath);
-                } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
-                    continue;
-                }
-
-                // Delete expired TAR blobs
-                List<String> toDelete = new ArrayList<>();
-                for (String blob : blobs) {
-                    if (!blob.endsWith(".tar")) continue;
-                    TranslogArchivePathHelper.parseTarBlobTimestamp(dayDir, minuteDir, blob)
-                        .filter(ts -> ts.isBefore(cutoff))
-                        .ifPresent(ts -> {
-                            toDelete.add(blob);
-                            log.debug(
-                                "TAR translog archive GC: deleting expired blob {}/{}/{} (ts={}, cutoff={})",
-                                dayDir,
-                                minuteDir,
-                                blob,
-                                ts,
-                                cutoff
-                            );
-                        });
-                }
-                if (!toDelete.isEmpty()) {
-                    transferService.deleteBlobs(minutePath, toDelete);
-                }
-
-                // Remove empty minute-dir (best-effort)
-                try {
-                    Set<String> remaining = transferService.listAll(minutePath);
-                    if (remaining.isEmpty()) {
-                        // Some stores support directory deletion via an empty delete; try deleting the sentinel
-                        transferService.deleteBlobs(dayPath, List.of(minuteDir));
-                    }
-                } catch (Exception ignored) {
-                    // Directory cleanup is best-effort; ignore errors
-                }
-            }
-
-            // Remove empty day-dir (best-effort)
-            try {
-                Set<String> remainingMinutes = transferService.listFolders(dayPath);
-                if (remainingMinutes.isEmpty()) {
-                    transferService.deleteBlobs(txlogRoot, List.of(dayDir));
-                }
-            } catch (Exception ignored) {
-                // Best-effort
-            }
-        }
-        log.debug("TAR translog archive GC: scan complete (cutoff={})", cutoff);
-    }
 }

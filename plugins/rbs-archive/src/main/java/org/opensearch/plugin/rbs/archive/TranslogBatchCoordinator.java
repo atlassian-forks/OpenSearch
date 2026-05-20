@@ -156,10 +156,19 @@ class TranslogBatchCoordinator {
     /**
      * Returns the {@link TransferService} captured from the most recent batch dispatch,
      * or {@code null} if no batch has been dispatched yet.
-     * Used by {@link TarTranslogRemoteStoreStrategy#runArchiveGc} to list/delete blobs.
+     * Used by {@link TranslogBatchCollector} to initialize the GC scanner.
      */
     public TransferService getLastKnownTransferService() {
         return batchTransferService;
+    }
+
+    /**
+     * Returns the repository base path captured from the most recent batch dispatch,
+     * or {@code null} if no batch has been dispatched yet.
+     * Used by {@link TranslogBatchCollector} to initialize the GC scanner.
+     */
+    public BlobPath getLastKnownBasePath() {
+        return batchBasePath;
     }
 
     public void submitAndWait(TranslogShardBatch shardBatch, TransferService transferService, BlobPath repositoryBasePath)

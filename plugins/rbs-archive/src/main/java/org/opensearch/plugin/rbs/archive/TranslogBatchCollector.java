@@ -19,7 +19,7 @@ import org.opensearch.index.translog.transfer.TransferService;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
-import java.time.Duration;
+import java.util.Set;
 
 /**
  * Node-singleton lifecycle component for translog archive upload and GC.
@@ -45,7 +45,6 @@ final class TranslogBatchCollector extends AbstractLifecycleComponent implements
     private final ThreadPool threadPool;
     private final TarTranslogRemoteStoreStrategy strategy;
     private final TimeValue gcInterval;
-    private final Duration retentionAge;
     /** Checkpoint-aware GC scanner — lazily initialized when TransferService and basePath become available. */
     private volatile TranslogArchiveGcScanner gcScanner;
     private final String nodeId;
@@ -64,8 +63,7 @@ final class TranslogBatchCollector extends AbstractLifecycleComponent implements
         TarTranslogRemoteStoreStrategy strategy,
         TimeValue archiveMaxWait,
         int archiveThreshold,
-        TimeValue gcInterval,
-        Duration retentionAge
+        TimeValue gcInterval
     ) {
         this.nodeId = nodeId;
         this.clusterService = clusterService;
@@ -74,7 +72,6 @@ final class TranslogBatchCollector extends AbstractLifecycleComponent implements
         this.archiveMaxWait = archiveMaxWait;
         this.archiveThreshold = archiveThreshold;
         this.gcInterval = gcInterval;
-        this.retentionAge = retentionAge;
     }
 
     @Override
@@ -132,7 +129,7 @@ final class TranslogBatchCollector extends AbstractLifecycleComponent implements
     private synchronized void initGcScannerIfNeeded() {
         if (gcScanner != null) return;
         TransferService ts = coordinator != null ? coordinator.getLastKnownTransferService() : null;
-        BlobPath basePath = strategy.getLastKnownBasePath();
+        BlobPath basePath = coordinator != null ? coordinator.getLastKnownBasePath() : null;
         if (ts == null || basePath == null) {
             logger.debug("TranslogBatchCollector GC: no TransferService/basePath available yet, skipping scanner init");
             return;
@@ -154,11 +151,20 @@ final class TranslogBatchCollector extends AbstractLifecycleComponent implements
                 // No uploads yet — nothing to GC
                 return;
             }
-            // Phase 1: scan for new minute-dirs and build .idx files
-            scanner.scan(java.time.Instant.now());
+            // Collect live index UUIDs from current cluster state so the scanner can treat
+            // deleted indices as unconditionally safe (won't block GC when checkpoint is gone).
+            Set<String> liveIndexUUIDs = clusterService.state()
+                .metadata()
+                .indices()
+                .keySet()
+                .stream()
+                .map(name -> clusterService.state().metadata().index(name).getIndexUUID())
+                .collect(java.util.stream.Collectors.toSet());
 
-            // Phase 2: delete expired minute-dirs (both checkpoint-aware and timestamp fallback)
-            strategy.runArchiveGc(strategy.getLastKnownBasePath(), retentionAge);
+            // Scan for new minute-dirs, build gc_idx files, and delete safe minute-dirs.
+            // This is the only GC phase — checkpoint-aware deletion handles all cases,
+            // including deleted indices (via liveIndexUUIDs) and rolling checkpoints.
+            scanner.scan(java.time.Instant.now(), liveIndexUUIDs);
         } catch (Exception e) {
             logger.warn("Translog archive GC failed", e);
         }
