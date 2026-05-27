@@ -32,11 +32,14 @@
 
 package org.opensearch.common.blobstore;
 
+import org.opensearch.common.annotation.ExperimentalApi;
+
 /**
  * The result of deleting multiple blobs from a {@link BlobStore}.
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public final class DeleteResult {
 
     public static final DeleteResult ZERO = new DeleteResult(0, 0);

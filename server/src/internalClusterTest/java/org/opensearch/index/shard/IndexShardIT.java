@@ -735,7 +735,9 @@ public class IndexShardIT extends OpenSearchSingleNodeTestCase {
             MergedSegmentPublisher.EMPTY,
             ReferencedSegmentsPublisher.EMPTY,
             Collections.emptyMap(),
-            null // TODO
+            null, // TODO
+            Collections.emptyMap(),
+            Collections.emptyMap()
         );
     }
 

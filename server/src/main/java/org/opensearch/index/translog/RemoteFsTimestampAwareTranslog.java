@@ -17,6 +17,7 @@ import org.opensearch.common.logging.Loggers;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
+import org.opensearch.index.translog.transfer.RemoteStoreTranslogStrategy;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
 import org.opensearch.index.translog.transfer.TranslogTransferMetadata;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -79,6 +80,40 @@ public class RemoteFsTimestampAwareTranslog extends RemoteFsTranslog {
         TranslogOperationHelper translogOperationHelper,
         boolean isServerSideEncryptionEnabled
     ) throws IOException {
+        this(
+            config,
+            translogUUID,
+            deletionPolicy,
+            globalCheckpointSupplier,
+            primaryTermSupplier,
+            persistedSequenceNumberConsumer,
+            blobStoreRepository,
+            threadPool,
+            startedPrimarySupplier,
+            remoteTranslogTransferTracker,
+            remoteStoreSettings,
+            translogOperationHelper,
+            isServerSideEncryptionEnabled,
+            java.util.Collections.emptyMap()
+        );
+    }
+
+    public RemoteFsTimestampAwareTranslog(
+        TranslogConfig config,
+        String translogUUID,
+        TranslogDeletionPolicy deletionPolicy,
+        LongSupplier globalCheckpointSupplier,
+        LongSupplier primaryTermSupplier,
+        LongConsumer persistedSequenceNumberConsumer,
+        BlobStoreRepository blobStoreRepository,
+        ThreadPool threadPool,
+        BooleanSupplier startedPrimarySupplier,
+        RemoteTranslogTransferTracker remoteTranslogTransferTracker,
+        RemoteStoreSettings remoteStoreSettings,
+        TranslogOperationHelper translogOperationHelper,
+        boolean isServerSideEncryptionEnabled,
+        Map<String, RemoteStoreTranslogStrategy> translogStrategies
+    ) throws IOException {
         super(
             config,
             translogUUID,
@@ -93,7 +128,8 @@ public class RemoteFsTimestampAwareTranslog extends RemoteFsTranslog {
             remoteStoreSettings,
             translogOperationHelper,
             null,
-            isServerSideEncryptionEnabled
+            isServerSideEncryptionEnabled,
+            translogStrategies
         );
         logger = Loggers.getLogger(getClass(), shardId);
         this.metadataFilePinnedTimestampMap = new HashMap<>();

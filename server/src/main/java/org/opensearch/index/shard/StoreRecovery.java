@@ -67,6 +67,7 @@ import org.opensearch.index.snapshots.blobstore.RemoteStoreShardShallowCopySnaps
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.Store;
+import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.translog.Checkpoint;
 import org.opensearch.index.translog.Translog;
@@ -86,6 +87,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -429,12 +431,9 @@ final class StoreRecovery {
                     false,
                     indexShard.indexSettings
                 );
-                RemoteSegmentMetadata remoteSegmentMetadata = sourceRemoteDirectory.initializeToSpecificCommit(
-                    primaryTerm,
-                    commitGeneration,
-                    recoverySource.snapshot().getSnapshotId().getUUID()
-                );
-                indexShard.syncSegmentsFromGivenRemoteSegmentStore(true, sourceRemoteDirectory, remoteSegmentMetadata, false);
+                sourceRemoteDirectory.setActiveStrategy(resolveSegmentStrategy(indexShard));
+                RemoteStoreSegmentStrategy.MetadataReader reader = sourceRemoteDirectory.getMetadataReader();
+                indexShard.syncSegmentsFromGivenRemoteSegmentStore(true, sourceRemoteDirectory, reader, primaryTerm, commitGeneration);
                 final Store store = indexShard.store();
                 if (indexShard.indexSettings.isRemoteStoreEnabled() == false) {
                     bootstrap(indexShard, store);
@@ -514,6 +513,7 @@ final class StoreRecovery {
                         false,
                         indexShard.indexSettings
                     );
+                    sourceRemoteDirectory.setActiveStrategy(resolveSegmentStrategy(indexShard));
                     RemoteSegmentMetadata remoteSegmentMetadata = sourceRemoteDirectory.initializeToSpecificTimestamp(
                         recoverySource.pinnedTimestamp()
                     );
@@ -560,6 +560,20 @@ final class StoreRecovery {
         } catch (Exception e) {
             listener.onFailure(e);
         }
+    }
+
+    private static RemoteStoreSegmentStrategy resolveSegmentStrategy(final IndexShard indexShard) {
+        final Map<String, RemoteStoreSegmentStrategy> segmentStrategies = indexShard.getRemoteStoreSegmentStrategies();
+        if (segmentStrategies != null && indexShard.indexSettings() != null) {
+            final String strategyName = indexShard.indexSettings().getRemoteStoreSegmentStrategy();
+            if ("default".equals(strategyName) == false) {
+                final RemoteStoreSegmentStrategy matched = segmentStrategies.get(strategyName);
+                if (matched != null) {
+                    return matched;
+                }
+            }
+        }
+        return new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
     }
 
     private boolean canRecover(IndexShard indexShard) {

@@ -173,33 +173,42 @@ public class RemoteStorePublishMergedSegmentAction extends AbstractPublishCheckp
             }
         }
 
-        getRemoteStoreUploaderService(indexShard).uploadSegments(segmentsToUpload, segmentsSizeMap, new ActionListener<>() {
-            @Override
-            public void onResponse(Void unused) {
-                logger.trace(() -> new ParameterizedMessage("Successfully uploaded segments {} to remote store", segmentsToUpload));
-                latch.countDown();
-            }
+        getRemoteStoreUploaderService(indexShard).uploadSegments(
+            segmentsToUpload,
+            segmentsSizeMap,
+            segmentsToUpload,
+            checkpoint,
+            new ActionListener<>() {
+                @Override
+                public void onResponse(Void unused) {
+                    logger.trace(() -> new ParameterizedMessage("Successfully uploaded segments {} to remote store", segmentsToUpload));
+                    latch.countDown();
+                }
 
-            @Override
-            public void onFailure(Exception e) {
-                logger.warn(() -> new ParameterizedMessage("Failed to upload segments {} to remote store. {}", segmentsToUpload, e));
-                latch.countDown();
-            }
-        }, (x) -> new UploadListener() {
-            @Override
-            public void beforeUpload(String file) {}
+                @Override
+                public void onFailure(Exception e) {
+                    logger.warn(() -> new ParameterizedMessage("Failed to upload segments {} to remote store. {}", segmentsToUpload, e));
+                    latch.countDown();
+                }
+            },
+            (x) -> new UploadListener() {
+                @Override
+                public void beforeUpload(String file) {}
 
-            @Override
-            public void onSuccess(String file) {
-                localToRemoteStoreFilenames.put(file, indexShard.getRemoteDirectory().getExistingRemoteFilename(file));
-                indexShard.mergedSegmentTransferTracker().addTotalBytesSent(checkpoint.getMetadataMap().get(file).length());
-            }
+                @Override
+                public void onSuccess(String file) {
+                    localToRemoteStoreFilenames.put(file, indexShard.getRemoteDirectory().getExistingRemoteFilename(file));
+                    indexShard.mergedSegmentTransferTracker().addTotalBytesSent(checkpoint.getMetadataMap().get(file).length());
+                }
 
-            @Override
-            public void onFailure(String file) {
-                logger.warn("Unable to upload segments during merge. Continuing.");
-            }
-        }, true, cryptoMetadata);
+                @Override
+                public void onFailure(String file) {
+                    logger.warn("Unable to upload segments during merge. Continuing.");
+                }
+            },
+            true,
+            cryptoMetadata
+        );
         try {
             long timeout = indexShard.getRecoverySettings().getMergedSegmentReplicationTimeout().seconds();
             if (latch.await(timeout, TimeUnit.SECONDS) == false) {

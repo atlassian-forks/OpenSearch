@@ -319,7 +319,13 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                     }, latch);
 
                     // Start the segments files upload with crypto
-                    uploadNewSegments(localSegmentsPostRefresh, localSegmentsSizeMap, segmentUploadsCompletedListener, cryptoMetadata);
+                    uploadNewSegments(
+                        localSegmentsPostRefresh,
+                        localSegmentsSizeMap,
+                        checkpoint,
+                        segmentUploadsCompletedListener,
+                        cryptoMetadata
+                    );
                     if (latch.await(
                         remoteStoreSettings.getClusterRemoteSegmentTransferTimeout().millis(),
                         TimeUnit.MILLISECONDS
@@ -373,6 +379,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
     private void uploadNewSegments(
         Collection<String> localSegmentsPostRefresh,
         Map<String, Long> localSegmentsSizeMap,
+        ReplicationCheckpoint checkpoint,
         ActionListener<Void> segmentUploadsCompletedListener,
         CryptoMetadata cryptoMetadata
     ) {
@@ -384,6 +391,8 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         remoteStoreUploader.uploadSegments(
             filteredFiles,
             localSegmentsSizeMap,
+            localSegmentsPostRefresh,
+            checkpoint,
             segmentUploadsCompletedListener,
             uploadListenerFunction,
             isLowPriorityUpload(),

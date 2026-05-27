@@ -25,7 +25,9 @@ import org.opensearch.index.remote.RemoteStorePathStrategy;
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
+import org.opensearch.index.translog.transfer.DefaultRemoteStoreTranslogStrategy;
 import org.opensearch.index.translog.transfer.FileTransferTracker;
+import org.opensearch.index.translog.transfer.RemoteStoreTranslogStrategy;
 import org.opensearch.index.translog.transfer.TransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogCheckpointTransferSnapshot;
 import org.opensearch.index.translog.transfer.TranslogTransferManager;
@@ -41,6 +43,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
@@ -99,6 +102,8 @@ public class RemoteFsTranslog extends Translog {
     private final boolean isTranslogMetadataEnabled;
     private final boolean isServerSideEncryptionEnabled;
 
+    private final RemoteStoreTranslogStrategy remoteStoreTranslogStrategy;
+
     public RemoteFsTranslog(
         TranslogConfig config,
         String translogUUID,
@@ -115,6 +120,42 @@ public class RemoteFsTranslog extends Translog {
         ChannelFactory channelFactory,
         boolean isServerSideEncryptionEnabled
     ) throws IOException {
+        this(
+            config,
+            translogUUID,
+            deletionPolicy,
+            globalCheckpointSupplier,
+            primaryTermSupplier,
+            persistedSequenceNumberConsumer,
+            blobStoreRepository,
+            threadPool,
+            startedPrimarySupplier,
+            remoteTranslogTransferTracker,
+            remoteStoreSettings,
+            translogOperationHelper,
+            channelFactory,
+            isServerSideEncryptionEnabled,
+            Collections.emptyMap()
+        );
+    }
+
+    public RemoteFsTranslog(
+        TranslogConfig config,
+        String translogUUID,
+        TranslogDeletionPolicy deletionPolicy,
+        LongSupplier globalCheckpointSupplier,
+        LongSupplier primaryTermSupplier,
+        LongConsumer persistedSequenceNumberConsumer,
+        BlobStoreRepository blobStoreRepository,
+        ThreadPool threadPool,
+        BooleanSupplier startedPrimarySupplier,
+        RemoteTranslogTransferTracker remoteTranslogTransferTracker,
+        RemoteStoreSettings remoteStoreSettings,
+        TranslogOperationHelper translogOperationHelper,
+        ChannelFactory channelFactory,
+        boolean isServerSideEncryptionEnabled,
+        Map<String, RemoteStoreTranslogStrategy> translogStrategies
+    ) throws IOException {
         super(
             config,
             translogUUID,
@@ -126,6 +167,20 @@ public class RemoteFsTranslog extends Translog {
             channelFactory
         );
         logger = Loggers.getLogger(getClass(), shardId);
+        final Path translogPath = config.getTranslogPath();
+        if (Files.isDirectory(translogPath)) {
+            try (java.nio.file.DirectoryStream<Path> ds = Files.newDirectoryStream(translogPath, "rbs-translog-bundle-*.tar")) {
+                for (final Path p : ds) {
+                    try {
+                        Files.deleteIfExists(p);
+                    } catch (final IOException e) {
+                        // ignore
+                    }
+                }
+            } catch (final IOException e) {
+                // ignore
+            }
+        }
         this.startedPrimarySupplier = startedPrimarySupplier;
         this.remoteTranslogTransferTracker = remoteTranslogTransferTracker;
         fileTransferTracker = new FileTransferTracker(shardId, remoteTranslogTransferTracker);
@@ -142,9 +197,19 @@ public class RemoteFsTranslog extends Translog {
             isTranslogMetadataEnabled,
             isServerSideEncryptionEnabled
         );
+        String strategyName = indexSettings().getRemoteStoreTranslogStrategy();
+        if ("default".equals(strategyName)) {
+            this.remoteStoreTranslogStrategy = new DefaultRemoteStoreTranslogStrategy(translogTransferManager);
+        } else {
+            RemoteStoreTranslogStrategy strategy = translogStrategies.get(strategyName);
+            if (strategy == null) {
+                throw new IllegalArgumentException("Unknown translog strategy: " + strategyName);
+            }
+            this.remoteStoreTranslogStrategy = strategy;
+        }
         try {
             if (config.downloadRemoteTranslogOnInit()) {
-                download(translogTransferManager, location, logger, config.shouldSeedRemote(), 0);
+                download(remoteStoreTranslogStrategy, translogTransferManager, location, logger, config.shouldSeedRemote(), 0);
             }
             Checkpoint checkpoint = readCheckpoint(location);
             logger.info("Downloaded data from remote translog till maxSeqNo = {}", checkpoint.maxSeqNo);
@@ -202,6 +267,36 @@ public class RemoteFsTranslog extends Translog {
         long timestamp,
         boolean isServerSideEncryptionEnabled
     ) throws IOException {
+        download(
+            repository,
+            shardId,
+            threadPool,
+            location,
+            pathStrategy,
+            remoteStoreSettings,
+            logger,
+            seedRemote,
+            isTranslogMetadataEnabled,
+            timestamp,
+            isServerSideEncryptionEnabled,
+            null
+        );
+    }
+
+    public static void download(
+        Repository repository,
+        ShardId shardId,
+        ThreadPool threadPool,
+        Path location,
+        RemoteStorePathStrategy pathStrategy,
+        RemoteStoreSettings remoteStoreSettings,
+        Logger logger,
+        boolean seedRemote,
+        boolean isTranslogMetadataEnabled,
+        long timestamp,
+        boolean isServerSideEncryptionEnabled,
+        RemoteStoreTranslogStrategy translogStrategy
+    ) throws IOException {
         assert repository instanceof BlobStoreRepository : String.format(
             Locale.ROOT,
             "%s repository should be instance of BlobStoreRepository",
@@ -223,13 +318,35 @@ public class RemoteFsTranslog extends Translog {
             isTranslogMetadataEnabled,
             isServerSideEncryptionEnabled
         );
-        RemoteFsTranslog.download(translogTransferManager, location, logger, seedRemote, timestamp);
+        RemoteStoreTranslogStrategy strategy = translogStrategy;
+        if (strategy == null) {
+            strategy = new DefaultRemoteStoreTranslogStrategy(translogTransferManager);
+        }
+        RemoteFsTranslog.download(strategy, translogTransferManager, location, logger, seedRemote, timestamp);
         logger.trace(remoteTranslogTransferTracker.toString());
     }
 
     // Visible for testing
     static void download(TranslogTransferManager translogTransferManager, Path location, Logger logger, boolean seedRemote, long timestamp)
         throws IOException {
+        download(
+            new DefaultRemoteStoreTranslogStrategy(translogTransferManager),
+            translogTransferManager,
+            location,
+            logger,
+            seedRemote,
+            timestamp
+        );
+    }
+
+    static void download(
+        RemoteStoreTranslogStrategy strategy,
+        TranslogTransferManager translogTransferManager,
+        Path location,
+        Logger logger,
+        boolean seedRemote,
+        long timestamp
+    ) throws IOException {
         /*
         In Primary to Primary relocation , there can be concurrent upload and download of translog.
         While translog files are getting downloaded by new primary, it might hence be deleted by the primary
@@ -242,7 +359,7 @@ public class RemoteFsTranslog extends Translog {
             boolean success = false;
             long startTimeMs = System.currentTimeMillis();
             try {
-                downloadOnce(translogTransferManager, location, logger, seedRemote, timestamp);
+                downloadOnce(strategy, translogTransferManager, location, logger, seedRemote, timestamp);
                 success = true;
                 return;
             } catch (FileNotFoundException | NoSuchFileException e) {
@@ -257,6 +374,7 @@ public class RemoteFsTranslog extends Translog {
     }
 
     private static void downloadOnce(
+        RemoteStoreTranslogStrategy strategy,
         TranslogTransferManager translogTransferManager,
         Path location,
         Logger logger,
@@ -279,15 +397,48 @@ public class RemoteFsTranslog extends Translog {
             }
 
             Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
-            for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
-                String generation = Long.toString(i);
-                translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
+            final long minGen = translogMetadata.getMinTranslogGeneration();
+            final long maxGen = translogMetadata.getGeneration();
+            final ShardId shardId = translogTransferManager.getShardId();
+
+            // Try primary strategy first, then fallback chain (supports rolling upgrade across strategy changes)
+            IOException primaryException = null;
+            try {
+                strategy.downloadRange(shardId, minGen, maxGen, generationToPrimaryTermMapper, location);
+            } catch (IOException e) {
+                primaryException = e;
+                logger.warn("Primary translog strategy failed downloadRange [{},{}], trying fallback chain", minGen, maxGen, e);
             }
-            logger.info(
-                "Downloaded translog and checkpoint files from={} to={}",
-                translogMetadata.getMinTranslogGeneration(),
-                translogMetadata.getGeneration()
-            );
+
+            if (primaryException != null) {
+                boolean recovered = false;
+                for (final RemoteStoreTranslogStrategy fallback : strategy.fallbackStrategies()) {
+                    try {
+                        fallback.downloadRange(shardId, minGen, maxGen, generationToPrimaryTermMapper, location);
+                        recovered = true;
+                        logger.info(
+                            "Translog recovery succeeded via fallback strategy {} for range [{},{}]",
+                            fallback.getClass().getSimpleName(),
+                            minGen,
+                            maxGen
+                        );
+                        break;
+                    } catch (IOException fe) {
+                        logger.warn(
+                            "Fallback strategy {} also failed for range [{},{}]",
+                            fallback.getClass().getSimpleName(),
+                            minGen,
+                            maxGen,
+                            fe
+                        );
+                    }
+                }
+                if (recovered == false) {
+                    throw primaryException;
+                }
+            }
+
+            logger.info("Downloaded translog and checkpoint files from={} to={}", minGen, maxGen);
 
             statsTracker.recordDownloadStats(prevDownloadBytesSucceeded, prevDownloadTimeInMillis);
 
@@ -463,11 +614,15 @@ public class RemoteFsTranslog extends Translog {
                 config.getNodeId()
             ).build()
         ) {
-            Checkpoint checkpoint = current.getLastSyncedCheckpoint();
+            final Checkpoint checkpoint = current.getLastSyncedCheckpoint();
+            // Thread globalCheckpoint into the transfer metadata so bundle-based strategies
+            // can use it as a replication-safe GC threshold (see NodeBundleRegistry.ShardReport).
+            transferSnapshotProvider.getTranslogTransferMetadata().setGlobalCheckpoint(checkpoint.globalCheckpoint);
 
             // resolve Index-level cryptoMetadata
-            CryptoMetadata cryptoMetadata = resolveCryptoMetadata();
-            return translogTransferManager.transferSnapshot(
+            final CryptoMetadata cryptoMetadata = resolveCryptoMetadata();
+            return remoteStoreTranslogStrategy.transferSnapshot(
+                shardId,
                 transferSnapshotProvider,
                 new RemoteFsTranslogTransferListener(generation, primaryTerm, maxSeqNo, checkpoint.globalCheckpoint),
                 cryptoMetadata
@@ -616,6 +771,15 @@ public class RemoteFsTranslog extends Translog {
             }
             generationsToDelete.add(generation);
         }
+        // If the strategy owns GC (e.g. TAR node bundles), skip core's per-generation DELETEs.
+        // Without this, core would flood remote store with 404-producing DELETE requests for
+        // per-generation paths that don't exist when data lives in multi-shard bundle blobs.
+        if (remoteStoreTranslogStrategy != null
+            && remoteStoreTranslogStrategy.resolveStaleTranslogBlobs() == RemoteStoreTranslogStrategy.GcDecision.SKIP) {
+            remoteGenerationDeletionPermits.release(REMOTE_DELETION_PERMITS);
+            return;
+        }
+
         if (generationsToDelete.isEmpty() == false) {
             try {
                 deleteRemoteGeneration(generationsToDelete);
@@ -651,6 +815,12 @@ public class RemoteFsTranslog extends Translog {
      * This will also delete all stale translog metadata files from remote except the latest basis the metadata file comparator.
      */
     private void deleteStaleRemotePrimaryTerms() {
+        // If the strategy owns GC (e.g. TAR node bundles), skip core's primary-term directory deletions.
+        // Old primary term paths don't exist as real directories when data lives in multi-shard bundles.
+        if (remoteStoreTranslogStrategy != null
+            && remoteStoreTranslogStrategy.resolveStaleTranslogBlobs() == RemoteStoreTranslogStrategy.GcDecision.SKIP) {
+            return;
+        }
         // The deletion of older translog files in remote store is on best-effort basis, there is a possibility that there
         // are older files that are no longer needed and should be cleaned up. In here, we delete all files that are part
         // of older primary term.

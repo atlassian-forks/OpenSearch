@@ -11,6 +11,7 @@ package org.opensearch.index.shard;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.util.UploadListener;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 
 import java.util.Collection;
 import java.util.Map;
@@ -24,6 +25,8 @@ public interface RemoteStoreUploader {
     void uploadSegments(
         Collection<String> localSegments,
         Map<String, Long> localSegmentsSizeMap,
+        Collection<String> activeFiles,
+        ReplicationCheckpoint checkpoint,
         ActionListener<Void> listener,
         Function<Map<String, Long>, UploadListener> uploadListenerFunction,
         boolean isLowPriorityUpload,

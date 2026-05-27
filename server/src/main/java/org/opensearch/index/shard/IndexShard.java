@@ -194,6 +194,8 @@ import org.opensearch.index.store.Store;
 import org.opensearch.index.store.Store.MetadataSnapshot;
 import org.opensearch.index.store.StoreFileMetadata;
 import org.opensearch.index.store.StoreStats;
+import org.opensearch.index.store.remote.RemoteSegmentFile;
+import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
 import org.opensearch.index.translog.RemoteFsTranslog;
@@ -203,6 +205,7 @@ import org.opensearch.index.translog.TranslogConfig;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogRecoveryRunner;
 import org.opensearch.index.translog.TranslogStats;
+import org.opensearch.index.translog.transfer.RemoteStoreTranslogStrategy;
 import org.opensearch.index.warmer.ShardIndexWarmerService;
 import org.opensearch.index.warmer.WarmerStats;
 import org.opensearch.indices.IndexingMemoryController;
@@ -422,6 +425,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
     private final Map<String, FormatChecksumStrategy> checksumStrategies;
 
+    private final Map<String, RemoteStoreSegmentStrategy> segmentStrategies;
+    private final Map<String, RemoteStoreTranslogStrategy> translogStrategies;
+
     @InternalApi
     public IndexShard(
         final ShardRouting shardRouting,
@@ -463,7 +469,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         @Nullable final MergedSegmentPublisher mergedSegmentPublisher,
         @Nullable final ReferencedSegmentsPublisher referencedSegmentsPublisher,
         final Map<String, FormatChecksumStrategy> checksumStrategies,
-        @Nullable final DataFormatRegistry dataFormatRegistry
+        @Nullable final DataFormatRegistry dataFormatRegistry,
+        final Map<String, RemoteStoreSegmentStrategy> segmentStrategies,
+        final Map<String, RemoteStoreTranslogStrategy> translogStrategies
     ) throws IOException {
         super(shardRouting.shardId(), indexSettings);
         assert shardRouting.initializing();
@@ -619,6 +627,16 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         }
         this.dataFormatRegistry = dataFormatRegistry;
         this.checksumStrategies = checksumStrategies;
+        this.segmentStrategies = segmentStrategies;
+        this.translogStrategies = translogStrategies;
+    }
+
+    public Map<String, RemoteStoreSegmentStrategy> getRemoteStoreSegmentStrategies() {
+        return segmentStrategies;
+    }
+
+    public Map<String, RemoteStoreTranslogStrategy> getRemoteStoreTranslogStrategies() {
+        return translogStrategies;
     }
 
     /**
@@ -5791,6 +5809,16 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         long timestamp,
         boolean isServerSideEncryptionEnabled
     ) throws IOException {
+        String strategyName = indexSettings().getRemoteStoreTranslogStrategy();
+        RemoteStoreTranslogStrategy strategy;
+        if ("default".equals(strategyName)) {
+            strategy = null;
+        } else {
+            strategy = translogStrategies.get(strategyName);
+            if (strategy == null) {
+                throw new IllegalArgumentException("Unknown translog strategy: " + strategyName);
+            }
+        }
         RemoteFsTranslog.download(
             repository,
             shardId,
@@ -5802,7 +5830,8 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             shouldSeedRemoteStore(),
             isTranslogMetadataEnabled,
             timestamp,
-            isServerSideEncryptionEnabled
+            isServerSideEncryptionEnabled,
+            strategy
         );
     }
 
@@ -5886,6 +5915,79 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             );
             store.decRef();
             remoteStore.decRef();
+        }
+    }
+
+    public void syncSegmentsFromGivenRemoteSegmentStore(
+        boolean overrideLocal,
+        RemoteSegmentStoreDirectory sourceRemoteDirectory,
+        RemoteStoreSegmentStrategy.MetadataReader reader,
+        long primaryTerm,
+        long generation
+    ) throws IOException {
+        logger.trace("Downloading segments from given remote segment store");
+        RemoteSegmentStoreDirectory remoteDirectory = null;
+        if (remoteStore != null) {
+            remoteDirectory = getRemoteDirectory();
+            remoteDirectory.init();
+            remoteStore.incRef();
+        }
+        RemoteSegmentMetadata metadata = reader.readMetadata(primaryTerm, generation);
+        if (metadata == null) {
+            throw new NoSuchFileException("Metadata not found for primaryTerm: " + primaryTerm + " generation: " + generation);
+        }
+        Collection<RemoteSegmentFile> downloadableFiles = metadata.getMetadata().values();
+        Map<String, UploadedSegmentMetadata> uploadedSegments = downloadableFiles.stream()
+            .collect(Collectors.toMap(RemoteSegmentFile::getName, file -> (UploadedSegmentMetadata) file));
+        store.incRef();
+        try {
+            final Directory storeDirectory;
+            if (recoveryState.getStage() == RecoveryState.Stage.INDEX) {
+                storeDirectory = new StoreRecovery.StatsDirectoryWrapper(store.directory(), recoveryState.getIndex());
+                for (String file : uploadedSegments.keySet()) {
+                    long checksum = Long.parseLong(uploadedSegments.get(file).getChecksum());
+                    if (overrideLocal || localDirectoryContains(storeDirectory, file, checksum) == false) {
+                        recoveryState.getIndex().addFileDetail(file, uploadedSegments.get(file).getLength(), false);
+                    } else {
+                        recoveryState.getIndex().addFileDetail(file, uploadedSegments.get(file).getLength(), true);
+                    }
+                }
+            } else {
+                storeDirectory = store.directory();
+            }
+
+            String segmentsNFile = copySegmentFiles(
+                storeDirectory,
+                sourceRemoteDirectory,
+                remoteDirectory,
+                uploadedSegments,
+                overrideLocal,
+                () -> {}
+            );
+            if (segmentsNFile != null) {
+                try (
+                    ChecksumIndexInput indexInput = new BufferedChecksumIndexInput(
+                        storeDirectory.openInput(segmentsNFile, IOContext.READONCE)
+                    )
+                ) {
+                    long commitGeneration = SegmentInfos.generationFromSegmentsFileName(segmentsNFile);
+                    SegmentInfos infosSnapshot = SegmentInfos.readCommit(store.directory(), indexInput, commitGeneration);
+                    long processedLocalCheckpoint = Long.parseLong(infosSnapshot.getUserData().get(LOCAL_CHECKPOINT_KEY));
+                    if (remoteStore != null) {
+                        store.commitSegmentInfos(infosSnapshot, processedLocalCheckpoint, processedLocalCheckpoint);
+                    } else {
+                        store.directory().sync(infosSnapshot.files(true));
+                        store.directory().syncMetaData();
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new IndexShardRecoveryException(shardId, "Exception while copying segment files from remote segment store", e);
+        } finally {
+            store.decRef();
+            if (remoteStore != null) {
+                remoteStore.decRef();
+            }
         }
     }
 

@@ -9,6 +9,7 @@
 package org.opensearch.index.translog;
 
 import org.opensearch.index.remote.RemoteTranslogTransferTracker;
+import org.opensearch.index.translog.transfer.RemoteStoreTranslogStrategy;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.repositories.Repository;
@@ -17,6 +18,7 @@ import org.opensearch.repositories.blobstore.BlobStoreRepository;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
@@ -39,6 +41,8 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
 
     private final boolean isServerSideEncryptionEnabled;
 
+    private final Map<String, RemoteStoreTranslogStrategy> translogStrategies;
+
     public RemoteBlobStoreInternalTranslogFactory(
         Supplier<RepositoriesService> repositoriesServiceSupplier,
         ThreadPool threadPool,
@@ -46,6 +50,26 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
         RemoteTranslogTransferTracker remoteTranslogTransferTracker,
         RemoteStoreSettings remoteStoreSettings,
         boolean isServerSideEncryptionEnabled
+    ) {
+        this(
+            repositoriesServiceSupplier,
+            threadPool,
+            repositoryName,
+            remoteTranslogTransferTracker,
+            remoteStoreSettings,
+            isServerSideEncryptionEnabled,
+            java.util.Collections.emptyMap()
+        );
+    }
+
+    public RemoteBlobStoreInternalTranslogFactory(
+        Supplier<RepositoriesService> repositoriesServiceSupplier,
+        ThreadPool threadPool,
+        String repositoryName,
+        RemoteTranslogTransferTracker remoteTranslogTransferTracker,
+        RemoteStoreSettings remoteStoreSettings,
+        boolean isServerSideEncryptionEnabled,
+        Map<String, RemoteStoreTranslogStrategy> translogStrategies
     ) {
         Repository repository;
         try {
@@ -58,6 +82,7 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
         this.remoteTranslogTransferTracker = remoteTranslogTransferTracker;
         this.remoteStoreSettings = remoteStoreSettings;
         this.isServerSideEncryptionEnabled = isServerSideEncryptionEnabled;
+        this.translogStrategies = translogStrategies;
     }
 
     @Override
@@ -112,7 +137,8 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
                 remoteTranslogTransferTracker,
                 remoteStoreSettings,
                 translogOperationHelper,
-                isServerSideEncryptionEnabled
+                isServerSideEncryptionEnabled,
+                translogStrategies
             );
         } else {
             return new RemoteFsTranslog(
@@ -129,7 +155,8 @@ public class RemoteBlobStoreInternalTranslogFactory implements TranslogFactory {
                 remoteStoreSettings,
                 translogOperationHelper,
                 null,
-                isServerSideEncryptionEnabled
+                isServerSideEncryptionEnabled,
+                translogStrategies
             );
         }
     }

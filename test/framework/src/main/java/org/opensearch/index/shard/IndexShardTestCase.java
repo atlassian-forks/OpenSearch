@@ -808,7 +808,9 @@ public abstract class IndexShardTestCase extends OpenSearchTestCase {
                 mergedSegmentPublisher,
                 ReferencedSegmentsPublisher.EMPTY,
                 Collections.emptyMap(),
-                null // TODO
+                null, // TODO
+                Collections.emptyMap(),
+                Collections.emptyMap()
             );
             indexShard.addShardFailureCallback(DEFAULT_SHARD_FAILURE_HANDLER);
             if (remoteStoreStatsTrackerFactory != null) {

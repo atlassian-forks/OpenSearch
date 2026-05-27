@@ -109,7 +109,7 @@ public class RemoteStoreReplicationSource implements SegmentReplicationSource {
                     Collectors.toMap(
                         e -> e.getKey(),
                         e -> new StoreFileMetadata(
-                            e.getValue().getOriginalFilename(),
+                            e.getValue().getName(),
                             e.getValue().getLength(),
                             Store.digestToString(Long.valueOf(e.getValue().getChecksum())),
                             version,

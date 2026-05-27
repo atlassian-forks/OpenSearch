@@ -20,6 +20,7 @@ import org.apache.lucene.store.Lock;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.action.LatchedActionListener;
 import org.opensearch.cluster.metadata.CryptoMetadata;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.AsyncMultiStreamBlobContainer;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
@@ -62,6 +63,7 @@ import static org.opensearch.common.blobstore.transfer.RemoteTransferContainer.c
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public class RemoteDirectory extends Directory {
 
     protected final BlobContainer blobContainer;
@@ -386,6 +388,10 @@ public class RemoteDirectory extends Directory {
 
     public Optional<FormatBlobRouter> getFormatBlobRouter() {
         return Optional.empty();
+    }
+
+    public java.util.function.UnaryOperator<InputStream> getDownloadRateLimiter(String filename) {
+        return downloadRateLimiterProvider.get(filename);
     }
 
     public boolean copyFrom(

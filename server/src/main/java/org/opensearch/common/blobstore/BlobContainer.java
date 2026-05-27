@@ -52,6 +52,7 @@ import java.util.Map;
  *
  * @opensearch.internal
  */
+@ExperimentalApi
 public interface BlobContainer {
 
     /**
@@ -314,6 +315,7 @@ public interface BlobContainer {
     /**
      * The type representing sort order of blob names
      */
+    @ExperimentalApi
     enum BlobNameSortOrder {
 
         LEXICOGRAPHIC(Comparator.comparing(BlobMetadata::name));

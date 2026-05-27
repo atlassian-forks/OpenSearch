@@ -52,6 +52,7 @@ import org.junit.Before;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -235,6 +236,7 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
 
     public void testListAll() throws IOException {
         populateMetadata();
+        remoteSegmentStoreDirectory.init();
 
         assertEquals(Set.of("_0.cfe", "_0.cfs", "_0.si", "segments_1"), Set.of(remoteSegmentStoreDirectory.listAll()));
     }
@@ -305,11 +307,15 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
         populateMetadata();
         remoteSegmentStoreDirectory.init();
 
-        IndexInput indexInput = mock(IndexInput.class);
-        // Mock String-based openInput
-        when(remoteDataDirectory.openInput(startsWith("_0.si"), anyLong(), eq(IOContext.DEFAULT))).thenReturn(indexInput);
+        AsyncMultiStreamBlobContainer blobContainer = mock(AsyncMultiStreamBlobContainer.class);
+        when(remoteDataDirectory.getBlobContainer()).thenReturn(blobContainer);
+        InputStream mockInputStream = new ByteArrayInputStream("Hello World!".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        when(blobContainer.readBlob(anyString(), anyLong(), anyLong())).thenReturn(mockInputStream);
+        when(remoteDataDirectory.getDownloadRateLimiter(anyString())).thenReturn(java.util.function.UnaryOperator.identity());
 
-        assertEquals(indexInput, remoteSegmentStoreDirectory.openInput("_0.si", IOContext.DEFAULT));
+        IndexInput indexInput = remoteSegmentStoreDirectory.openInput("_0.si", IOContext.DEFAULT);
+        assertNotNull(indexInput);
+        assertTrue(indexInput instanceof org.opensearch.index.store.RemoteIndexInput);
     }
 
     public void testOpenInputNoSuchFile() {
@@ -320,8 +326,10 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
         populateMetadata();
         remoteSegmentStoreDirectory.init();
 
-        // Mock String-based openInput to throw
-        when(remoteDataDirectory.openInput(startsWith("_0.si"), anyLong(), eq(IOContext.DEFAULT))).thenThrow(new IOException("Error"));
+        AsyncMultiStreamBlobContainer blobContainer = mock(AsyncMultiStreamBlobContainer.class);
+        when(remoteDataDirectory.getBlobContainer()).thenReturn(blobContainer);
+        when(blobContainer.readBlob(anyString(), anyLong(), anyLong())).thenThrow(new IOException("Error"));
+        when(remoteDataDirectory.getDownloadRateLimiter(anyString())).thenReturn(java.util.function.UnaryOperator.identity());
 
         assertThrows(IOException.class, () -> remoteSegmentStoreDirectory.openInput("_0.si", IOContext.DEFAULT));
     }
@@ -780,7 +788,7 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
         );
         Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> actual = remoteSegmentStoreDirectory
             .getSegmentsUploadedToRemoteStore();
-        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> expected = remoteSegmentMetadata.getMetadata();
+        Map<String, org.opensearch.index.store.remote.RemoteSegmentFile> expected = remoteSegmentMetadata.getMetadata();
         for (String filename : expected.keySet()) {
             assertEquals(expected.get(filename).toString(), actual.get(filename).toString());
         }
@@ -1062,7 +1070,7 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
             appender.addExpectation(
                 new MockLogAppender.PatternSeenWithLoggerPrefixExpectation(
                     "Metadata files to delete message",
-                    "org.opensearch.index.store.RemoteSegmentStoreDirectory",
+                    "org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy",
                     Level.DEBUG,
                     "metadataFilesEligibleToDelete=\\[" + metadataFilename3 + "\\] metadataFilesToBeDeleted=\\[" + metadataFilename3 + "\\]"
                 )
@@ -1197,7 +1205,6 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
             verify(remoteDataDirectory).deleteFiles(
                 argThat(files -> files != null && new HashSet<>(files).equals(expectedFilesToDelete_3))
             );
-            verify(remoteDataDirectory).deleteFiles(new ArrayList<>());
         });
 
         verify(remoteMetadataDirectory).deleteFile(metadataFilename3);

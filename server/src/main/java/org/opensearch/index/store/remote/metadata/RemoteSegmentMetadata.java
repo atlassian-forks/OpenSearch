@@ -16,6 +16,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.StoreFileMetadata;
+import org.opensearch.index.store.remote.RemoteSegmentFile;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 
 import java.io.IOException;
@@ -47,14 +48,14 @@ public class RemoteSegmentMetadata {
     /**
      * Data structure holding metadata content
      */
-    private final Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> metadata;
+    private final Map<String, RemoteSegmentFile> metadata;
 
     private final byte[] segmentInfosBytes;
 
     private final ReplicationCheckpoint replicationCheckpoint;
 
     public RemoteSegmentMetadata(
-        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> metadata,
+        Map<String, RemoteSegmentFile> metadata,
         byte[] segmentInfosBytes,
         ReplicationCheckpoint replicationCheckpoint
     ) {
@@ -67,7 +68,7 @@ public class RemoteSegmentMetadata {
      * Exposes underlying metadata content data structure.
      * @return {@code metadata}
      */
-    public Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> getMetadata() {
+    public Map<String, RemoteSegmentFile> getMetadata() {
         return this.metadata;
     }
 
@@ -100,7 +101,7 @@ public class RemoteSegmentMetadata {
      * @param segmentMetadata metadata content in the form of {@code Map<String, String>}
      * @return {@link RemoteSegmentMetadata}
      */
-    public static Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> fromMapOfStrings(Map<String, String> segmentMetadata) {
+    public static Map<String, RemoteSegmentFile> fromMapOfStrings(Map<String, String> segmentMetadata) {
         return segmentMetadata.entrySet()
             .stream()
             .collect(
@@ -132,8 +133,7 @@ public class RemoteSegmentMetadata {
      */
     public static RemoteSegmentMetadata read(IndexInput indexInput, int version) throws IOException {
         Map<String, String> metadata = indexInput.readMapOfStrings();
-        final Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> uploadedSegmentMetadataMap = RemoteSegmentMetadata
-            .fromMapOfStrings(metadata);
+        final Map<String, RemoteSegmentFile> uploadedSegmentMetadataMap = RemoteSegmentMetadata.fromMapOfStrings(metadata);
         ReplicationCheckpoint replicationCheckpoint = readCheckpointFromIndexInput(indexInput, uploadedSegmentMetadataMap, version);
         int byteArraySize = (int) indexInput.readLong();
         byte[] segmentInfosBytes = new byte[byteArraySize];
@@ -158,7 +158,7 @@ public class RemoteSegmentMetadata {
 
     private static ReplicationCheckpoint readCheckpointFromIndexInput(
         IndexInput in,
-        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> uploadedSegmentMetadataMap,
+        Map<String, RemoteSegmentFile> uploadedSegmentMetadataMap,
         int version
     ) throws IOException {
         return new ReplicationCheckpoint(
@@ -173,9 +173,7 @@ public class RemoteSegmentMetadata {
         );
     }
 
-    private static Map<String, StoreFileMetadata> toStoreFileMetadata(
-        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> metadata
-    ) {
+    private static Map<String, StoreFileMetadata> toStoreFileMetadata(Map<String, RemoteSegmentFile> metadata) {
         return metadata.entrySet()
             .stream()
             // TODO: Version here should be read from UploadedSegmentMetadata.

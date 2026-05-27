@@ -142,7 +142,16 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
             exception -> fail("Should not fail for empty segments")
         );
 
-        uploaderService.uploadSegments(emptySegments, segmentSizeMap, listener, mockUploadListenerFunction, false, null);
+        uploaderService.uploadSegments(
+            emptySegments,
+            segmentSizeMap,
+            emptySegments,
+            null,
+            listener,
+            mockUploadListenerFunction,
+            false,
+            null
+        );
 
         assertTrue(latch.await(1, TimeUnit.SECONDS));
     }
@@ -202,7 +211,7 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
             exception -> fail("Upload should succeed: " + exception.getMessage())
         );
 
-        testUploaderService.uploadSegments(segments, segmentSizeMap, listener, mockUploadListenerFunction, false, null);
+        testUploaderService.uploadSegments(segments, segmentSizeMap, segments, null, listener, mockUploadListenerFunction, false, null);
 
         assertTrue(latch.await(5, TimeUnit.SECONDS));
         // Verify the upload listener was called correctly
@@ -265,7 +274,7 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
             exception -> fail("Upload should succeed: " + exception.getMessage())
         );
 
-        testUploaderService.uploadSegments(segments, segmentSizeMap, listener, mockUploadListenerFunction, true, null);
+        testUploaderService.uploadSegments(segments, segmentSizeMap, segments, null, listener, mockUploadListenerFunction, true, null);
 
         assertTrue(latch.await(5, TimeUnit.SECONDS));
         // Verify the upload listener was called correctly
@@ -331,7 +340,7 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
             exception -> fail("Upload should succeed: " + exception.getMessage())
         );
 
-        testUploaderService.uploadSegments(segments, segmentSizeMap, listener, mockUploadListenerFunction, false, null);
+        testUploaderService.uploadSegments(segments, segmentSizeMap, segments, null, listener, mockUploadListenerFunction, false, null);
 
         assertTrue(latch.await(5, TimeUnit.SECONDS));
         verify(mockCompositeDirectory).afterSyncToRemote("segment1");
@@ -398,7 +407,7 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
             latch.countDown();
         });
 
-        testUploaderService.uploadSegments(segments, segmentSizeMap, listener, mockUploadListenerFunction, false, null);
+        testUploaderService.uploadSegments(segments, segmentSizeMap, segments, null, listener, mockUploadListenerFunction, false, null);
 
         assertTrue(latch.await(5, TimeUnit.SECONDS));
         verify(freshMockShard).failShard(eq("Index corrupted (resource=test)"), eq(corruptException));
@@ -465,7 +474,7 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
             latch.countDown();
         });
 
-        testUploaderService.uploadSegments(segments, segmentSizeMap, listener, mockUploadListenerFunction, false, null);
+        testUploaderService.uploadSegments(segments, segmentSizeMap, segments, null, listener, mockUploadListenerFunction, false, null);
 
         assertTrue(latch.await(5, TimeUnit.SECONDS));
         verify(freshMockShard, never()).failShard(any(), any());
@@ -532,6 +541,8 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
         testUploaderService.uploadSegments(
             Collections.singletonList("seg1"),
             Map.of("seg1", 100L),
+            Collections.singletonList("seg1"),
+            null,
             ActionListener.wrap(r -> latch.countDown(), e -> fail("Should not fail")),
             mockUploadListenerFunction,
             false,
@@ -582,6 +593,8 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
         testUploaderService.uploadSegments(
             Collections.singletonList("seg1"),
             Map.of("seg1", 100L),
+            Collections.singletonList("seg1"),
+            null,
             ActionListener.wrap(r -> latch.countDown(), e -> fail("Should not fail")),
             mockUploadListenerFunction,
             false,
@@ -633,6 +646,8 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
         testUploaderService.uploadSegments(
             Collections.singletonList("seg1"),
             Map.of("seg1", 100L),
+            Collections.singletonList("seg1"),
+            null,
             ActionListener.wrap(r -> latch.countDown(), e -> fail("Should not fail")),
             mockUploadListenerFunction,
             false,
