@@ -15,8 +15,6 @@ import org.opensearch.index.translog.transfer.listener.TranslogTransferListener;
 
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.Collections;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -59,6 +57,16 @@ public interface RemoteStoreTranslogStrategy {
     }
 
     /**
+     * Transfers a translog snapshot to the remote translog store.
+     *
+     * @param shardId the shard ID
+     * @param transferSnapshot the translog snapshot to transfer
+     * @param listener listener to handle transfer completion and failure events
+     * @param cryptoMetadata encryption metadata for secure uploads
+     * @return true if the transfer was successful, false otherwise
+     * @throws IOException in case of I/O error during transfer
+     */
+    /**
      * Returns strategies to try in order if {@link #downloadRange} cannot find all requested
      * generations. This enables safe rolling upgrades when a shard's strategy changes
      * (e.g. from {@code "default"} per-file to {@code "tar"} bundles) — old blobs written by
@@ -72,20 +80,10 @@ public interface RemoteStoreTranslogStrategy {
      *
      * @return ordered list of fallback strategies; may be empty
      */
-    default List<RemoteStoreTranslogStrategy> fallbackStrategies() {
-        return Collections.emptyList();
+    default java.util.List<RemoteStoreTranslogStrategy> fallbackStrategies() {
+        return java.util.Collections.emptyList();
     }
 
-    /**
-     * Transfers a translog snapshot to the remote translog store.
-     *
-     * @param shardId the shard ID
-     * @param transferSnapshot the translog snapshot to transfer
-     * @param listener listener to handle transfer completion and failure events
-     * @param cryptoMetadata encryption metadata for secure uploads
-     * @return true if the transfer was successful, false otherwise
-     * @throws IOException in case of I/O error during transfer
-     */
     boolean transferSnapshot(
         ShardId shardId,
         TransferSnapshot transferSnapshot,
