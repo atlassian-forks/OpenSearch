@@ -13,6 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.Version;
 import org.opensearch.common.SetOnce;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.index.remote.RemoteStoreUtils;
 
@@ -28,6 +29,7 @@ import java.util.Optional;
  *
  * @opensearch.internal
  */
+@PublicApi(since = "3.7.0")
 public class TranslogTransferMetadata {
 
     public static final Logger logger = LogManager.getLogger(TranslogTransferMetadata.class);
@@ -56,6 +58,14 @@ public class TranslogTransferMetadata {
 
     private final String nodeId;
 
+    /**
+     * The global checkpoint at the time of this snapshot — all replicas have acknowledged
+     * generations up to this value. Used by bundle-based GC strategies to determine which
+     * generations are safe to delete cluster-wide (not just locally flushed).
+     * Defaults to {@link Long#MAX_VALUE} (conservative: never delete early) when unavailable.
+     */
+    private long globalCheckpoint = Long.MAX_VALUE;
+
     public TranslogTransferMetadata(long primaryTerm, long generation, long minTranslogGeneration, int count, String nodeId) {
         this.primaryTerm = primaryTerm;
         this.generation = generation;
@@ -70,6 +80,14 @@ public class TranslogTransferMetadata {
      */
     public TranslogTransferMetadata(long primaryTerm, long generation, long minTranslogGeneration, int count) {
         this(primaryTerm, generation, minTranslogGeneration, count, "");
+    }
+
+    public void setGlobalCheckpoint(final long globalCheckpoint) {
+        this.globalCheckpoint = globalCheckpoint;
+    }
+
+    public long getGlobalCheckpoint() {
+        return globalCheckpoint;
     }
 
     public long getPrimaryTerm() {

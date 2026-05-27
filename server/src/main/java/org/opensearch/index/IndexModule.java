@@ -90,10 +90,12 @@ import org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory;
 import org.opensearch.index.store.DefaultCompositeDirectoryFactory;
 import org.opensearch.index.store.FsDirectoryFactory;
 import org.opensearch.index.store.Store;
+import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
 import org.opensearch.index.store.remote.directory.RemoteSnapshotDirectoryFactory;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.NodeCacheService;
 import org.opensearch.index.translog.TranslogFactory;
+import org.opensearch.index.translog.transfer.RemoteStoreTranslogStrategy;
 import org.opensearch.indices.ClusterMergeSchedulerConfig;
 import org.opensearch.indices.IndicesBitsetFilterCache;
 import org.opensearch.indices.IndicesQueryCache;
@@ -842,7 +844,9 @@ public final class IndexModule {
             segmentReplicationStatsProvider,
             clusterDefaultMaxMergeAtOnceSupplier,
             clusterMergeSchedulerConfig,
-            (DataFormatRegistry) null
+            (DataFormatRegistry) null,
+            Collections.emptyMap(),
+            Collections.emptyMap()
         );
     }
 
@@ -914,7 +918,9 @@ public final class IndexModule {
             segmentReplicationStatsProvider,
             clusterDefaultMaxMergeAtOnceSupplier,
             clusterMergeSchedulerConfig,
-            (DataFormatRegistry) null
+            (DataFormatRegistry) null,
+            Collections.emptyMap(),
+            Collections.emptyMap()
         );
     }
 
@@ -988,7 +994,9 @@ public final class IndexModule {
             segmentReplicationStatsProvider,
             clusterDefaultMaxMergeAtOnceSupplier,
             clusterMergeSchedulerConfig,
-            (DataFormatRegistry) null
+            (DataFormatRegistry) null,
+            Collections.emptyMap(),
+            Collections.emptyMap()
         );
     }
 
@@ -1021,7 +1029,9 @@ public final class IndexModule {
         Function<ShardId, ReplicationStats> segmentReplicationStatsProvider,
         Supplier<Integer> clusterDefaultMaxMergeAtOnceSupplier,
         ClusterMergeSchedulerConfig clusterMergeSchedulerConfig,
-        DataFormatRegistry dataFormatRegistry
+        DataFormatRegistry dataFormatRegistry,
+        Map<String, RemoteStoreSegmentStrategy> segmentStrategies,
+        Map<String, RemoteStoreTranslogStrategy> translogStrategies
     ) throws IOException {
         final IndexEventListener eventListener = freeze();
         Function<IndexService, CheckedFunction<DirectoryReader, DirectoryReader, IOException>> readerWrapperFactory = indexReaderWrapper
@@ -1101,7 +1111,9 @@ public final class IndexModule {
                 clusterMergeSchedulerConfig,
                 dataFormatRegistry,
                 dataFormatAwareStoreDirectoryFactory,
-                nodeCacheService
+                nodeCacheService,
+                segmentStrategies,
+                translogStrategies
             );
             success = true;
             return indexService;

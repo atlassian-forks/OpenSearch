@@ -151,11 +151,14 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.index.shard.IndexingOperationListener;
 import org.opensearch.index.shard.IndexingStats;
+import org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy;
+import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
 import org.opensearch.index.store.remote.filecache.NodeCacheService;
 import org.opensearch.index.translog.InternalTranslogFactory;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogStats;
+import org.opensearch.index.translog.transfer.RemoteStoreTranslogStrategy;
 import org.opensearch.indices.cluster.IndicesClusterStateService;
 import org.opensearch.indices.fielddata.cache.IndicesFieldDataCache;
 import org.opensearch.indices.mapper.MapperRegistry;
@@ -174,6 +177,7 @@ import org.opensearch.node.Node;
 import org.opensearch.node.remotestore.RemoteStoreNodeAttribute;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.PluginsService;
+import org.opensearch.plugins.RemoteStorePlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.aggregations.support.ValuesSourceRegistry;
@@ -484,6 +488,8 @@ public class IndicesService extends AbstractLifecycleComponent
     private final ClusterMergeSchedulerConfig clusterMergeSchedulerConfig;
     private final DataFormatRegistry dataFormatRegistry;
     private final Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories;
+    private final Map<String, RemoteStoreSegmentStrategy> segmentStrategies;
+    private final Map<String, RemoteStoreTranslogStrategy> translogStrategies;
 
     @Override
     protected void doStart() {
@@ -635,12 +641,33 @@ public class IndicesService extends AbstractLifecycleComponent
         this.allowExpensiveQueries = ALLOW_EXPENSIVE_QUERIES.get(clusterService.getSettings());
         clusterService.getClusterSettings().addSettingsUpdateConsumer(ALLOW_EXPENSIVE_QUERIES, this::setAllowExpensiveQueries);
         this.remoteDirectoryFactory = remoteDirectoryFactory;
+
+        final Map<String, RemoteStoreSegmentStrategy> segmentStrategiesMap = new HashMap<>();
+        pluginsService.filterPlugins(RemoteStorePlugin.class)
+            .stream()
+            .map(RemoteStorePlugin::getRemoteStoreSegmentStrategies)
+            .flatMap(m -> m.entrySet().stream())
+            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue))
+            .forEach(segmentStrategiesMap::put);
+        segmentStrategiesMap.put("default", new DefaultRemoteStoreSegmentStrategy());
+        this.segmentStrategies = Map.copyOf(segmentStrategiesMap);
+
+        final Map<String, RemoteStoreTranslogStrategy> translogStrategiesMap = new HashMap<>();
+        pluginsService.filterPlugins(RemoteStorePlugin.class)
+            .stream()
+            .map(RemoteStorePlugin::getRemoteStoreTranslogStrategies)
+            .flatMap(m -> m.entrySet().stream())
+            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue))
+            .forEach(translogStrategiesMap::put);
+        this.translogStrategies = Map.copyOf(translogStrategiesMap);
+
         this.translogFactorySupplier = getTranslogFactorySupplier(
             repositoriesServiceSupplier,
             threadPool,
             remoteStoreStatsTrackerFactory,
             settings,
-            remoteStoreSettings
+            remoteStoreSettings,
+            translogStrategies
         );
         this.searchRequestStats = searchRequestStats;
         this.clusterDefaultRefreshInterval = CLUSTER_DEFAULT_INDEX_REFRESH_INTERVAL_SETTING.get(clusterService.getSettings());
@@ -805,7 +832,8 @@ public class IndicesService extends AbstractLifecycleComponent
         ThreadPool threadPool,
         RemoteStoreStatsTrackerFactory remoteStoreStatsTrackerFactory,
         Settings settings,
-        RemoteStoreSettings remoteStoreSettings
+        RemoteStoreSettings remoteStoreSettings,
+        Map<String, RemoteStoreTranslogStrategy> translogStrategies
     ) {
         return (indexSettings, shardRouting) -> {
             if (indexSettings.isRemoteTranslogStoreEnabled() && shardRouting.primary()) {
@@ -815,7 +843,8 @@ public class IndicesService extends AbstractLifecycleComponent
                     indexSettings.getRemoteStoreTranslogRepository(),
                     remoteStoreStatsTrackerFactory.getRemoteTranslogTransferTracker(shardRouting.shardId()),
                     remoteStoreSettings,
-                    RemoteStoreUtils.isServerSideEncryptionEnabledIndex(indexSettings.getIndexMetadata())
+                    RemoteStoreUtils.isServerSideEncryptionEnabledIndex(indexSettings.getIndexMetadata()),
+                    translogStrategies
                 );
             } else if (RemoteStoreNodeAttribute.isTranslogRepoConfigured(settings) && shardRouting.primary()) {
                 return new RemoteBlobStoreInternalTranslogFactory(
@@ -824,7 +853,8 @@ public class IndicesService extends AbstractLifecycleComponent
                     RemoteStoreNodeAttribute.getRemoteStoreTranslogRepo(indexSettings.getNodeSettings()),
                     remoteStoreStatsTrackerFactory.getRemoteTranslogTransferTracker(shardRouting.shardId()),
                     remoteStoreSettings,
-                    RemoteStoreUtils.isServerSideEncryptionEnabledIndex(indexSettings.getIndexMetadata())
+                    RemoteStoreUtils.isServerSideEncryptionEnabledIndex(indexSettings.getIndexMetadata()),
+                    translogStrategies
                 );
             }
             return new InternalTranslogFactory();
@@ -835,6 +865,14 @@ public class IndicesService extends AbstractLifecycleComponent
 
     public ClusterService clusterService() {
         return clusterService;
+    }
+
+    public Map<String, RemoteStoreSegmentStrategy> getRemoteStoreSegmentStrategies() {
+        return segmentStrategies;
+    }
+
+    public Map<String, RemoteStoreTranslogStrategy> getRemoteStoreTranslogStrategies() {
+        return translogStrategies;
     }
 
     @Override
@@ -1221,7 +1259,9 @@ public class IndicesService extends AbstractLifecycleComponent
             segmentReplicationStatsProvider,
             this::getClusterDefaultMaxMergeAtOnce,
             clusterMergeSchedulerConfig,
-            dataFormatRegistry
+            dataFormatRegistry,
+            this.segmentStrategies,
+            this.translogStrategies
         );
     }
 

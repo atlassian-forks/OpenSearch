@@ -106,9 +106,11 @@ import org.opensearch.index.store.FormatChecksumStrategy;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.Store;
+import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
 import org.opensearch.index.store.remote.filecache.NodeCacheService;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogFactory;
+import org.opensearch.index.translog.transfer.RemoteStoreTranslogStrategy;
 import org.opensearch.indices.ClusterMergeSchedulerConfig;
 import org.opensearch.indices.IndicesBitsetFilterCache;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -225,6 +227,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private volatile boolean shardLevelRefreshEnabled;
     private final IndexStorePlugin.StoreFactory storeFactory;
     private final DataFormatRegistry dataFormatRegistry;
+    private final Map<String, RemoteStoreSegmentStrategy> segmentStrategies;
+    private final Map<String, RemoteStoreTranslogStrategy> translogStrategies;
 
     @InternalApi
     public IndexService(
@@ -274,9 +278,13 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         ClusterMergeSchedulerConfig clusterMergeSchedulerConfig,
         DataFormatRegistry dataFormatRegistry,
         DataFormatAwareStoreDirectoryFactory dataFormatAwareStoreDirectoryFactory,
-        NodeCacheService nodeCacheService
+        NodeCacheService nodeCacheService,
+        Map<String, RemoteStoreSegmentStrategy> segmentStrategies,
+        Map<String, RemoteStoreTranslogStrategy> translogStrategies
     ) {
         super(indexSettings);
+        this.segmentStrategies = segmentStrategies;
+        this.translogStrategies = translogStrategies;
         this.storeFactory = storeFactory;
         this.allowExpensiveQueries = allowExpensiveQueries;
         this.indexSettings = indexSettings;
@@ -488,7 +496,9 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             clusterMergeSchedulerConfig,
             null,
             null,
-            null
+            null,
+            Collections.emptyMap(),
+            Collections.emptyMap()
         );
     }
 
@@ -892,7 +902,9 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                 this.indexSettings.isSegRepEnabledOrRemoteNode() ? mergedSegmentPublisher : null,
                 this.indexSettings.isSegRepEnabledOrRemoteNode() ? referencedSegmentsPublisher : null,
                 checksumStrategies,
-                dataFormatRegistry
+                dataFormatRegistry,
+                segmentStrategies,
+                translogStrategies
             );
             eventListener.indexShardStateChanged(indexShard, null, indexShard.state(), "shard created");
             eventListener.afterIndexShardCreated(indexShard);

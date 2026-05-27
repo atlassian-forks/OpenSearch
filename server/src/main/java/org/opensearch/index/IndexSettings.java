@@ -881,6 +881,20 @@ public final class IndexSettings {
         Property.IndexScope
     );
 
+    public static final Setting<String> INDEX_REMOTE_STORE_SEGMENT_STRATEGY_SETTING = Setting.simpleString(
+        "index.remote_store.segment.strategy",
+        "default",
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
+    public static final Setting<String> INDEX_REMOTE_STORE_TRANSLOG_STRATEGY_SETTING = Setting.simpleString(
+        "index.remote_store.translog.strategy",
+        "default",
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
     public static final Setting<Long> INDEX_CONTEXT_CREATED_VERSION = Setting.longSetting(
         "index.context.created_version",
         0,
@@ -948,6 +962,8 @@ public final class IndexSettings {
     private volatile String remoteStoreSegmentPathPrefix;
     private int remoteTranslogKeepExtraGen;
     private boolean autoForcemergeEnabled;
+    private volatile String remoteStoreSegmentStrategy;
+    private volatile String remoteStoreTranslogStrategy;
 
     // volatile fields are updated via #updateIndexMetadata(IndexMetadata) under lock
     private volatile Settings settings;
@@ -1175,6 +1191,8 @@ public final class IndexSettings {
         remoteTranslogUploadBufferInterval = INDEX_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.get(settings);
         remoteStoreRepository = settings.get(IndexMetadata.SETTING_REMOTE_SEGMENT_STORE_REPOSITORY);
         this.remoteTranslogKeepExtraGen = INDEX_REMOTE_TRANSLOG_KEEP_EXTRA_GEN_SETTING.get(settings);
+        this.remoteStoreSegmentStrategy = INDEX_REMOTE_STORE_SEGMENT_STRATEGY_SETTING.get(settings);
+        this.remoteStoreTranslogStrategy = INDEX_REMOTE_STORE_TRANSLOG_STRATEGY_SETTING.get(settings);
         String rawPrefix = IndexMetadata.INDEX_REMOTE_STORE_SEGMENT_PATH_PREFIX.get(settings);
         // Only set the prefix if it's explicitly set and not empty
         this.remoteStoreSegmentPathPrefix = (rawPrefix != null && !rawPrefix.trim().isEmpty()) ? rawPrefix : null;
@@ -1389,6 +1407,8 @@ public final class IndexSettings {
             this::setRemoteTranslogUploadBufferInterval
         );
         scopedSettings.addSettingsUpdateConsumer(INDEX_REMOTE_TRANSLOG_KEEP_EXTRA_GEN_SETTING, this::setRemoteTranslogKeepExtraGen);
+        scopedSettings.addSettingsUpdateConsumer(INDEX_REMOTE_STORE_SEGMENT_STRATEGY_SETTING, this::setRemoteStoreSegmentStrategy);
+        scopedSettings.addSettingsUpdateConsumer(INDEX_REMOTE_STORE_TRANSLOG_STRATEGY_SETTING, this::setRemoteStoreTranslogStrategy);
         this.autoForcemergeEnabled = scopedSettings.get(INDEX_AUTO_FORCE_MERGES_ENABLED);
         scopedSettings.addSettingsUpdateConsumer(INDEX_AUTO_FORCE_MERGES_ENABLED, this::setAutoForcemergeEnabled);
         scopedSettings.addSettingsUpdateConsumer(INDEX_DOC_ID_FUZZY_SET_ENABLED_SETTING, this::setEnableFuzzySetForDocId);
@@ -2356,6 +2376,22 @@ public final class IndexSettings {
 
     public RemoteStorePathStrategy getRemoteStorePathStrategy() {
         return remoteStorePathStrategy;
+    }
+
+    public String getRemoteStoreSegmentStrategy() {
+        return remoteStoreSegmentStrategy;
+    }
+
+    public String getRemoteStoreTranslogStrategy() {
+        return remoteStoreTranslogStrategy;
+    }
+
+    public void setRemoteStoreSegmentStrategy(String remoteStoreSegmentStrategy) {
+        this.remoteStoreSegmentStrategy = remoteStoreSegmentStrategy;
+    }
+
+    public void setRemoteStoreTranslogStrategy(String remoteStoreTranslogStrategy) {
+        this.remoteStoreTranslogStrategy = remoteStoreTranslogStrategy;
     }
 
     public boolean isTranslogMetadataEnabled() {

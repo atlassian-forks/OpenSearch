@@ -9,6 +9,7 @@
 package org.opensearch.index.translog.transfer;
 
 import org.opensearch.common.Nullable;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.common.lucene.store.InputStreamIndexInput;
 import org.opensearch.common.util.io.IOUtils;
@@ -29,6 +30,7 @@ import java.util.Objects;
  *
  * @opensearch.internal
  */
+@PublicApi(since = "3.7.0")
 public class FileSnapshot implements Closeable {
 
     private final String name;
@@ -104,6 +106,7 @@ public class FileSnapshot implements Closeable {
      *
      * @opensearch.internal
      */
+    @PublicApi(since = "3.7.0")
     public static class TransferFileSnapshot extends FileSnapshot {
 
         private final long primaryTerm;
@@ -171,6 +174,7 @@ public class FileSnapshot implements Closeable {
      *
      * @opensearch.internal
      */
+    @PublicApi(since = "3.7.0")
     public static class TranslogFileSnapshot extends TransferFileSnapshot {
 
         private final long generation;
@@ -207,6 +211,7 @@ public class FileSnapshot implements Closeable {
      *
      * @opensearch.internal
      */
+    @PublicApi(since = "3.7.0")
     public static final class CheckpointFileSnapshot extends TransferFileSnapshot {
 
         private final long generation;

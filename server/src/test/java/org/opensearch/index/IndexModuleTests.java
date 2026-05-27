@@ -285,7 +285,9 @@ public class IndexModuleTests extends OpenSearchTestCase {
             null,
             () -> TieredMergePolicyProvider.DEFAULT_MAX_MERGE_AT_ONCE,
             mockClusterMergeSchedulerConfig,
-            (DataFormatRegistry) null
+            (DataFormatRegistry) null,
+            Collections.emptyMap(),
+            Collections.emptyMap()
         );
     }
 
