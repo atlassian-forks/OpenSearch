@@ -48,6 +48,15 @@ import static org.opensearch.index.remote.RemoteStoreEnums.DataType.METADATA;
  */
 @PublicApi(since = "2.3.0")
 public class RemoteSegmentStoreDirectoryFactory implements IndexStorePlugin.DirectoryFactory {
+
+    /**
+     * Reserved key under which a plugin may register an alternative {@link IndexStorePlugin.DirectoryFactory}
+     * (via the existing {@link IndexStorePlugin#getDirectoryFactories()}) to replace the built-in remote segment
+     * store directory factory node-wide. Not yet index-settings-selectable, and reuses the local-store
+     * directory-factory map rather than a dedicated remote-store registry.
+     */
+    public static final String PLUGGABLE_REMOTE_DIRECTORY_FACTORY_KEY = "_remote_segment_store_override";
+
     private final Supplier<RepositoriesService> repositoriesService;
     private final String segmentsPathFixedPrefix;
 
@@ -223,17 +232,29 @@ public class RemoteSegmentStoreDirectoryFactory implements IndexStorePlugin.Dire
                 indexFixedPrefix
             );
 
-            return new RemoteSegmentStoreDirectory(
-                dataDirectory,
-                metadataDirectory,
-                mdLockManager,
-                threadPool,
-                shardId,
-                pendingDownloadMergedSegments
-            );
+            return createDirectory(dataDirectory, metadataDirectory, mdLockManager, threadPool, shardId, pendingDownloadMergedSegments);
         } catch (RepositoryMissingException e) {
             throw new IllegalArgumentException("Repository should be created before creating index with remote_store enabled setting", e);
         }
+    }
+
+    /**
+     * Constructs the {@link RemoteSegmentStoreDirectory} from its already-resolved parts. {@code dataDirectory}
+     * is already the correct concrete type for this index (plain {@code RemoteDirectory}, or
+     * {@code DataFormatAwareRemoteDirectory} when pluggable data formats are enabled); subclasses that want to
+     * change only how segments physically land in blob storage don't need to duplicate that resolution, which
+     * has grown more involved over time and is easy to fall out of sync with by re-deriving it independently.
+     * Override this single method instead to return a {@link RemoteSegmentStoreDirectory} subclass.
+     */
+    protected RemoteSegmentStoreDirectory createDirectory(
+        RemoteDirectory dataDirectory,
+        RemoteDirectory metadataDirectory,
+        RemoteStoreLockManager mdLockManager,
+        ThreadPool threadPool,
+        ShardId shardId,
+        Map<String, String> pendingDownloadMergedSegments
+    ) throws IOException {
+        return new RemoteSegmentStoreDirectory(dataDirectory, metadataDirectory, mdLockManager, threadPool, shardId, pendingDownloadMergedSegments);
     }
 
     public Supplier<RepositoriesService> getRepositoriesService() {

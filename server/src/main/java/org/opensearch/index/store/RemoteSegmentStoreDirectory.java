@@ -72,6 +72,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -86,7 +87,7 @@ import java.util.stream.Collectors;
  * @opensearch.api
  */
 @PublicApi(since = "2.3.0")
-public final class RemoteSegmentStoreDirectory extends FilterDirectory implements RemoteStoreCommitLevelLockManager {
+public class RemoteSegmentStoreDirectory extends FilterDirectory implements RemoteStoreCommitLevelLockManager {
 
     /**
      * Each segment file is uploaded with unique suffix.
@@ -97,7 +98,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     /**
      * remoteDataDirectory is used to store segment files at path: cluster_UUID/index_UUID/shardId/segments/data
      */
-    private final RemoteDirectory remoteDataDirectory;
+    protected final RemoteDirectory remoteDataDirectory;
     /**
      * remoteMetadataDirectory is used to store metadata files at path: cluster_UUID/index_UUID/shardId/segments/metadata
      */
@@ -670,6 +671,38 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     }
 
     /**
+     * Uploads the complete set of new segment files produced by one refresh. {@code perFileListenerFactory} is
+     * called once per file, in {@code files} order, to obtain that file's own completion listener — callers use
+     * this to run per-file bookkeeping (upload stats, cache eviction signals) independently of however many
+     * remote objects the files end up in.
+     * <p>
+     * The default implementation uploads each file independently via {@link #copyFrom(Directory, String, IOContext,
+     * ActionListener, boolean, CryptoMetadata)}, exactly as before this method existed. Subclasses may override to
+     * bundle multiple files into fewer remote objects (e.g. one blob per refresh instead of one per file) — as long
+     * as every file's listener is still invoked once the file's data is durably stored, callers cannot tell the
+     * difference.
+     *
+     * @param from                   The directory containing the files to be uploaded
+     * @param files                  Files to be uploaded, in upload order
+     * @param context                IOContext to be used to open IndexInput of each file during remote upload
+     * @param perFileListenerFactory Builds the completion listener for a given filename
+     * @param lowPriorityUpload     Whether this is a low priority upload
+     * @param cryptoMetadata         CryptoMetadata for index-level encryption
+     */
+    public void copyFrom(
+        Directory from,
+        Collection<String> files,
+        IOContext context,
+        Function<String, ActionListener<Void>> perFileListenerFactory,
+        boolean lowPriorityUpload,
+        CryptoMetadata cryptoMetadata
+    ) {
+        for (String src : files) {
+            copyFrom(from, src, context, perFileListenerFactory.apply(src), lowPriorityUpload, cryptoMetadata);
+        }
+    }
+
+    /**
      * This acquires a lock on a given commit by creating a lock file in lock directory using {@code FileLockInfo}
      *
      * @param primaryTerm Primary Term of index at the time of commit.
@@ -744,7 +777,14 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         return metadataFiles.get(0);
     }
 
-    private void postUpload(Directory from, String src, String remoteFilename, String checksum) throws IOException {
+    /**
+     * Registers {@code src} as uploaded under {@code remoteFilename}, so that {@link #openInput}, {@link #fileLength},
+     * {@link #deleteFile}, and {@link #containsFile} resolve it correctly and {@link #uploadMetadata} persists it.
+     * {@code remoteFilename} is opaque to core — subclasses that bundle multiple files into one remote blob may
+     * pass any string here (e.g. encoding a blob name plus a byte range) as long as their own {@link #openInput}
+     * override knows how to interpret it.
+     */
+    protected void postUpload(Directory from, String src, String remoteFilename, String checksum) throws IOException {
         UploadedSegmentMetadata segmentMetadata = new UploadedSegmentMetadata(src, remoteFilename, checksum, from.fileLength(src));
         addUploadedSegment(src, segmentMetadata);
     }
@@ -1268,7 +1308,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             AtomicBoolean deletionSuccessful = new AtomicBoolean(true);
             try {
                 // Batch delete all stale segment files
-                remoteDataDirectory.deleteFiles(filesToDelete);
+                deleteRemoteFiles(filesToDelete, activeSegmentRemoteFilenames);
                 deletedSegmentFiles.addAll(filesToDelete);
 
                 // Update cache after successful batch deletion
@@ -1293,6 +1333,21 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             }
         }
         logger.debug("deletedSegmentFiles={}", deletedSegmentFiles);
+    }
+
+    /**
+     * Deletes {@code staleUploadedFilenames} — {@code uploadedFilename} values no longer referenced by any
+     * retained metadata file, recomputed fresh on every {@link #deleteStaleSegments} run. {@code
+     * activeUploadedFilenames} is the complementary still-live set from that same run.
+     * <p>
+     * Default implementation deletes each name as a blob, exactly as before this method existed. Subclasses
+     * whose {@code uploadedFilename} values are opaque pointers into a shared blob (e.g. several files bundled
+     * into one remote object) can override this to delete the underlying blob only once every pointer into it
+     * is confirmed stale — checked against {@code activeUploadedFilenames}, which requires no state beyond
+     * what this method already receives.
+     */
+    protected void deleteRemoteFiles(List<String> staleUploadedFilenames, Set<String> activeUploadedFilenames) throws IOException {
+        remoteDataDirectory.deleteFiles(staleUploadedFilenames);
     }
 
     public void deleteStaleSegmentsAsync(int lastNMetadataFilesToKeep) {

@@ -1062,11 +1062,19 @@ public class Node implements Closeable {
 
             final DataFormatRegistry dataFormatRegistry = new DataFormatRegistry(pluginsService);
 
-            final IndexStorePlugin.DirectoryFactory remoteDirectoryFactory = new RemoteSegmentStoreDirectoryFactory(
-                repositoriesServiceReference::get,
-                threadPool,
-                remoteStoreSettings.getSegmentsPathFixedPrefix(),
-                dataFormatRegistry
+            // Extension point: a plugin may register a DirectoryFactory under
+            // RemoteSegmentStoreDirectoryFactory.PLUGGABLE_REMOTE_DIRECTORY_FACTORY_KEY (via the existing
+            // IndexStorePlugin#getDirectoryFactories()) to replace the built-in remote segment store directory
+            // factory node-wide, e.g. to return a RemoteSegmentStoreDirectory subclass that bundles segment
+            // uploads. Falls back to the built-in factory when no plugin registers one.
+            final IndexStorePlugin.DirectoryFactory remoteDirectoryFactory = directoryFactories.getOrDefault(
+                RemoteSegmentStoreDirectoryFactory.PLUGGABLE_REMOTE_DIRECTORY_FACTORY_KEY,
+                new RemoteSegmentStoreDirectoryFactory(
+                    repositoriesServiceReference::get,
+                    threadPool,
+                    remoteStoreSettings.getSegmentsPathFixedPrefix(),
+                    dataFormatRegistry
+                )
             );
 
             final TaskResourceTrackingService taskResourceTrackingService = new TaskResourceTrackingService(
