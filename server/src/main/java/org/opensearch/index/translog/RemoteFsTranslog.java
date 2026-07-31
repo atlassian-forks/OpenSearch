@@ -131,7 +131,7 @@ public class RemoteFsTranslog extends Translog {
         fileTransferTracker = new FileTransferTracker(shardId, remoteTranslogTransferTracker);
         isTranslogMetadataEnabled = indexSettings().isTranslogMetadataEnabled();
         this.isServerSideEncryptionEnabled = isServerSideEncryptionEnabled;
-        this.translogTransferManager = buildTranslogTransferManager(
+        this.translogTransferManager = createTranslogTransferManager(
             blobStoreRepository,
             threadPool,
             shardId,
@@ -323,6 +323,36 @@ public class RemoteFsTranslog extends Translog {
             && checkpoint.minSeqNo == SequenceNumbers.NO_OPS_PERFORMED
             && checkpoint.maxSeqNo == SequenceNumbers.NO_OPS_PERFORMED
             && checkpoint.numOps == 0;
+    }
+
+    /**
+     * Constructs the {@link TranslogTransferManager} used for the lifetime of this instance. Default
+     * implementation delegates to {@link #buildTranslogTransferManager}. Subclasses may override to return a
+     * {@link TranslogTransferManager} subclass instead — e.g. one that batches multiple generations' uploads
+     * into fewer remote objects.
+     */
+    protected TranslogTransferManager createTranslogTransferManager(
+        BlobStoreRepository blobStoreRepository,
+        ThreadPool threadPool,
+        ShardId shardId,
+        FileTransferTracker fileTransferTracker,
+        RemoteTranslogTransferTracker tracker,
+        RemoteStorePathStrategy pathStrategy,
+        RemoteStoreSettings remoteStoreSettings,
+        boolean isTranslogMetadataEnabled,
+        boolean isServerSideEncryptionEnabled
+    ) throws IOException {
+        return buildTranslogTransferManager(
+            blobStoreRepository,
+            threadPool,
+            shardId,
+            fileTransferTracker,
+            tracker,
+            pathStrategy,
+            remoteStoreSettings,
+            isTranslogMetadataEnabled,
+            isServerSideEncryptionEnabled
+        );
     }
 
     public static TranslogTransferManager buildTranslogTransferManager(

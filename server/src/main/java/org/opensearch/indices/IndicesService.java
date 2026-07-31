@@ -174,6 +174,7 @@ import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.ingest.IngestService;
 import org.opensearch.node.Node;
 import org.opensearch.node.remotestore.RemoteStoreNodeAttribute;
+import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.PluginsService;
 import org.opensearch.plugins.SearchStatsContributor;
@@ -648,7 +649,8 @@ public class IndicesService extends AbstractLifecycleComponent
             threadPool,
             remoteStoreStatsTrackerFactory,
             settings,
-            remoteStoreSettings
+            remoteStoreSettings,
+            pluginsService
         );
         this.searchRequestStats = searchRequestStats;
         this.clusterDefaultRefreshInterval = CLUSTER_DEFAULT_INDEX_REFRESH_INTERVAL_SETTING.get(clusterService.getSettings());
@@ -815,9 +817,19 @@ public class IndicesService extends AbstractLifecycleComponent
         ThreadPool threadPool,
         RemoteStoreStatsTrackerFactory remoteStoreStatsTrackerFactory,
         Settings settings,
-        RemoteStoreSettings remoteStoreSettings
+        RemoteStoreSettings remoteStoreSettings,
+        PluginsService pluginsService
     ) {
         return (indexSettings, shardRouting) -> {
+            // Extension point: an EnginePlugin may return a custom TranslogFactory (e.g. one that
+            // returns a RemoteFsTranslog subclass batching translog uploads) to replace the built-in remote
+            // translog factory for indices it opts into. Falls back to the built-in logic below otherwise.
+            for (EnginePlugin enginePlugin : pluginsService.filterPlugins(EnginePlugin.class)) {
+                Optional<TranslogFactory> customTranslogFactory = enginePlugin.getCustomTranslogFactory(indexSettings);
+                if (customTranslogFactory.isPresent()) {
+                    return customTranslogFactory.get();
+                }
+            }
             if (indexSettings.isRemoteTranslogStoreEnabled() && shardRouting.primary()) {
                 return new RemoteBlobStoreInternalTranslogFactory(
                     repositoriesServiceSupplier,

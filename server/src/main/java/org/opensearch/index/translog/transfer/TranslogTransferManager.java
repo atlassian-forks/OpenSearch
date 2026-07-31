@@ -62,8 +62,8 @@ import static org.opensearch.index.translog.transfer.TranslogTransferMetadata.ME
 public class TranslogTransferManager {
 
     private final ShardId shardId;
-    private final TransferService transferService;
-    private final BlobPath remoteDataTransferPath;
+    protected final TransferService transferService;
+    protected final BlobPath remoteDataTransferPath;
     private final BlobPath remoteMetadataTransferPath;
     private final FileTransferTracker fileTransferTracker;
     private final RemoteTranslogTransferTracker remoteTranslogTransferTracker;

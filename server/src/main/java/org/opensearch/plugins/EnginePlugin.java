@@ -43,6 +43,7 @@ import org.opensearch.index.engine.exec.commit.CommitterFactory;
 import org.opensearch.index.seqno.RetentionLeases;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogDeletionPolicyFactory;
+import org.opensearch.index.translog.TranslogFactory;
 
 import java.util.Optional;
 import java.util.function.Supplier;
@@ -130,6 +131,22 @@ public interface EnginePlugin {
      */
     @ExperimentalApi
     default Optional<CommitterFactory> getCommitterFactory(IndexSettings indexSettings) {
+        return Optional.empty();
+    }
+
+    /**
+     * When an index is created this method is invoked for each engine plugin, once per shard, to determine
+     * whether to replace the built-in {@link TranslogFactory} (which decides between local-only and
+     * remote-store-backed translog) for the given index. Plugins that are not overriding it should return
+     * {@link Optional#empty()}. A plugin might return e.g. a factory that constructs a
+     * {@code RemoteFsTranslog} subclass which batches multiple translog uploads into fewer remote objects.
+     * <p>
+     * Only one of the installed Engine plugins can override this for a given shard, otherwise the first
+     * non-empty result wins (no conflict detection yet, unlike {@link #getEngineFactory}).
+     *
+     * @return an optional translog factory
+     */
+    default Optional<TranslogFactory> getCustomTranslogFactory(IndexSettings indexSettings) {
         return Optional.empty();
     }
 }
