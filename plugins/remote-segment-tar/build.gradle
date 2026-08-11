@@ -1,0 +1,26 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+apply plugin: 'opensearch.internal-cluster-test'
+apply plugin: 'jacoco'
+
+opensearchplugin {
+    description = 'Remote segment TAR blob layout'
+    classname = 'org.opensearch.plugin.remotesegmenttar.RemoteSegmentTarPlugin'
+}
+
+jacocoTestCoverageVerification {
+    violationRules {
+        rule {
+            element = 'BUNDLE'
+            limit {
+                counter = 'LINE'
+                value = 'COVEREDRATIO'
+                minimum = 0.95
+            }
+        }
+    }
+}
+
+check.dependsOn jacocoTestCoverageVerification
