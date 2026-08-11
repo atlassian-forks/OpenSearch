@@ -101,7 +101,8 @@ public class TransportRemoteStoreMetadataAction extends TransportAction<RemoteSt
             RemoteSegmentStoreDirectoryFactory remoteDirectoryFactory = new RemoteSegmentStoreDirectoryFactory(
                 () -> repositoriesService,
                 threadPool,
-                remoteStoreSettings.getSegmentsPathFixedPrefix()
+                remoteStoreSettings.getSegmentsPathFixedPrefix(),
+                remoteStoreSettings.getRemoteSegmentBlobLayoutRegistry()
             );
 
             for (String indexName : concreteIndices) {
@@ -200,7 +201,9 @@ public class TransportRemoteStoreMetadataAction extends TransportAction<RemoteSt
             shardId,
             indexSettings.getRemoteStorePathStrategy(),
             null,
-            RemoteStoreUtils.isServerSideEncryptionEnabledIndex(indexSettings.getIndexMetadata())
+            RemoteStoreUtils.isServerSideEncryptionEnabledIndex(indexSettings.getIndexMetadata()),
+            indexSettings.isWarmIndex(),
+            IndexSettings.INDEX_REMOTE_STORE_SEGMENT_BLOB_LAYOUT_SETTING.get(indexSettings.getSettings())
         );
 
         Map<String, RemoteSegmentMetadata> segmentMetadataMapWithFilenames = remoteDirectory.readLatestNMetadataFiles(5);

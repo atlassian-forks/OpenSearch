@@ -170,6 +170,8 @@ import org.opensearch.index.remote.RemoteIndexPathUploader;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
 import org.opensearch.index.store.DefaultCompositeDirectoryFactory;
 import org.opensearch.index.store.IndexStoreListener;
+import org.opensearch.index.store.RemoteSegmentBlobLayoutFactory;
+import org.opensearch.index.store.RemoteSegmentBlobLayoutRegistry;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheCleaner;
@@ -232,6 +234,7 @@ import org.opensearch.plugins.PersistentTaskPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.PluginInfo;
 import org.opensearch.plugins.PluginsService;
+import org.opensearch.plugins.RemoteSegmentBlobLayoutPlugin;
 import org.opensearch.plugins.RepositoryPlugin;
 import org.opensearch.plugins.ScriptPlugin;
 import org.opensearch.plugins.SearchPipelinePlugin;
@@ -952,10 +955,18 @@ public class Node implements Closeable {
 
             final CompositeIndexSettings compositeIndexSettings = new CompositeIndexSettings(settings, settingsModule.getClusterSettings());
 
+            final List<RemoteSegmentBlobLayoutFactory> remoteSegmentBlobLayouts = pluginsService.filterPlugins(
+                RemoteSegmentBlobLayoutPlugin.class
+            ).stream().flatMap(plugin -> plugin.getRemoteSegmentBlobLayouts().values().stream()).collect(toList());
+            final RemoteSegmentBlobLayoutRegistry remoteSegmentBlobLayoutRegistry = new RemoteSegmentBlobLayoutRegistry(
+                remoteSegmentBlobLayouts
+            );
+            remoteStoreSettings.setRemoteSegmentBlobLayoutRegistry(remoteSegmentBlobLayoutRegistry);
             final IndexStorePlugin.DirectoryFactory remoteDirectoryFactory = new RemoteSegmentStoreDirectoryFactory(
                 repositoriesServiceReference::get,
                 threadPool,
-                remoteStoreSettings.getSegmentsPathFixedPrefix()
+                remoteStoreSettings.getSegmentsPathFixedPrefix(),
+                remoteSegmentBlobLayoutRegistry
             );
 
             final TaskResourceTrackingService taskResourceTrackingService = new TaskResourceTrackingService(

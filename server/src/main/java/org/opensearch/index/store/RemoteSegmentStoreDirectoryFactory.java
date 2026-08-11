@@ -49,14 +49,26 @@ public class RemoteSegmentStoreDirectoryFactory implements IndexStorePlugin.Dire
 
     private final ThreadPool threadPool;
 
+    private final RemoteSegmentBlobLayoutRegistry blobLayoutRegistry;
+
     public RemoteSegmentStoreDirectoryFactory(
         Supplier<RepositoriesService> repositoriesService,
         ThreadPool threadPool,
         String segmentsPathFixedPrefix
     ) {
+        this(repositoriesService, threadPool, segmentsPathFixedPrefix, new RemoteSegmentBlobLayoutRegistry(Map.of()));
+    }
+
+    public RemoteSegmentStoreDirectoryFactory(
+        Supplier<RepositoriesService> repositoriesService,
+        ThreadPool threadPool,
+        String segmentsPathFixedPrefix,
+        RemoteSegmentBlobLayoutRegistry blobLayoutRegistry
+    ) {
         this.repositoriesService = repositoriesService;
         this.segmentsPathFixedPrefix = segmentsPathFixedPrefix;
         this.threadPool = threadPool;
+        this.blobLayoutRegistry = blobLayoutRegistry;
     }
 
     @Override
@@ -75,7 +87,8 @@ public class RemoteSegmentStoreDirectoryFactory implements IndexStorePlugin.Dire
             indexSettings.getRemoteStorePathStrategy(),
             null,
             RemoteStoreUtils.isServerSideEncryptionEnabledIndex(indexSettings.getIndexMetadata()),
-            indexSettings.isWarmIndex()
+            indexSettings.isWarmIndex(),
+            IndexSettings.INDEX_REMOTE_STORE_SEGMENT_BLOB_LAYOUT_SETTING.get(indexSettings.getSettings())
         );
     }
 
@@ -113,6 +126,28 @@ public class RemoteSegmentStoreDirectoryFactory implements IndexStorePlugin.Dire
         String indexFixedPrefix,
         boolean isServerSideEncryptionEnabled,
         boolean isWarmIndex
+    ) throws IOException {
+        return newDirectory(
+            repositoryName,
+            indexUUID,
+            shardId,
+            pathStrategy,
+            indexFixedPrefix,
+            isServerSideEncryptionEnabled,
+            isWarmIndex,
+            RemoteSegmentBlobLayoutRegistry.DEFAULT_LAYOUT_NAME
+        );
+    }
+
+    public Directory newDirectory(
+        String repositoryName,
+        String indexUUID,
+        ShardId shardId,
+        RemoteStorePathStrategy pathStrategy,
+        String indexFixedPrefix,
+        boolean isServerSideEncryptionEnabled,
+        boolean isWarmIndex,
+        String blobLayoutName
     ) throws IOException {
         assert Objects.nonNull(pathStrategy);
         // We should be not calling close for repository.
@@ -179,7 +214,8 @@ public class RemoteSegmentStoreDirectoryFactory implements IndexStorePlugin.Dire
                 mdLockManager,
                 threadPool,
                 shardId,
-                pendingDownloadMergedSegments
+                pendingDownloadMergedSegments,
+                blobLayoutRegistry.getFactory(blobLayoutName).create(new RemoteSegmentBlobStore(dataDirectory), shardId)
             );
         } catch (RepositoryMissingException e) {
             throw new IllegalArgumentException("Repository should be created before creating index with remote_store enabled setting", e);

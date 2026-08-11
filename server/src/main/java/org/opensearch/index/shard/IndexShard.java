@@ -3222,7 +3222,8 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     repositoriesService,
                     listener,
                     remoteStoreSettings.getSegmentsPathFixedPrefix(),
-                    threadPool
+                    threadPool,
+                    remoteStoreSettings.getRemoteSegmentBlobLayoutRegistry()
                 );
             } else {
                 storeRecovery.recoverFromSnapshotAndRemoteStore(
@@ -3231,7 +3232,8 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     repositoriesService,
                     listener,
                     remoteStoreSettings.getSegmentsPathFixedPrefix(),
-                    threadPool
+                    threadPool,
+                    remoteStoreSettings.getRemoteSegmentBlobLayoutRegistry()
                 );
             }
         } catch (Exception e) {

@@ -130,7 +130,8 @@ public final class TransportCleanupRepositoryAction extends TransportClusterMana
         this.remoteSegmentStoreDirectoryFactory = new RemoteSegmentStoreDirectoryFactory(
             () -> repositoriesService,
             threadPool,
-            remoteStoreSettings.getSegmentsPathFixedPrefix()
+            remoteStoreSettings.getSegmentsPathFixedPrefix(),
+            remoteStoreSettings.getRemoteSegmentBlobLayoutRegistry()
         );
         this.remoteStoreLockManagerFactory = new RemoteStoreLockManagerFactory(
             () -> repositoriesService,

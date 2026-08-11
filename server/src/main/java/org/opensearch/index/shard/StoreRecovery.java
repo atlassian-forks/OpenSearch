@@ -56,6 +56,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.mapper.MapperService;
@@ -64,6 +65,7 @@ import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.snapshots.IndexShardRestoreFailedException;
 import org.opensearch.index.snapshots.blobstore.RemoteStoreShardShallowCopySnapshot;
+import org.opensearch.index.store.RemoteSegmentBlobLayoutRegistry;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.Store;
@@ -385,7 +387,8 @@ final class StoreRecovery {
         RepositoriesService repositoriesService,
         ActionListener<Boolean> listener,
         String segmentsPathFixedPrefix,
-        ThreadPool threadPool
+        ThreadPool threadPool,
+        RemoteSegmentBlobLayoutRegistry remoteSegmentBlobLayoutRegistry
     ) {
         try {
             if (canRecover(indexShard)) {
@@ -416,7 +419,8 @@ final class StoreRecovery {
                 RemoteSegmentStoreDirectoryFactory directoryFactory = new RemoteSegmentStoreDirectoryFactory(
                     () -> repositoriesService,
                     threadPool,
-                    segmentsPathFixedPrefix
+                    segmentsPathFixedPrefix,
+                    remoteSegmentBlobLayoutRegistry
                 );
                 RemoteSegmentStoreDirectory sourceRemoteDirectory = (RemoteSegmentStoreDirectory) directoryFactory.newDirectory(
                     remoteStoreRepository,
@@ -424,7 +428,9 @@ final class StoreRecovery {
                     shardId,
                     shallowCopyShardMetadata.getRemoteStorePathStrategy(),
                     null,
-                    RemoteStoreUtils.isServerSideEncryptionEnabledIndex(indexShard.indexSettings.getIndexMetadata())
+                    RemoteStoreUtils.isServerSideEncryptionEnabledIndex(indexShard.indexSettings.getIndexMetadata()),
+                    indexShard.indexSettings.isWarmIndex(),
+                    IndexSettings.INDEX_REMOTE_STORE_SEGMENT_BLOB_LAYOUT_SETTING.get(indexShard.indexSettings.getSettings())
                 );
                 RemoteSegmentMetadata remoteSegmentMetadata = sourceRemoteDirectory.initializeToSpecificCommit(
                     primaryTerm,
@@ -468,7 +474,8 @@ final class StoreRecovery {
         RepositoriesService repositoriesService,
         ActionListener<Boolean> listener,
         String segmentsPathFixedPrefix,
-        ThreadPool threadPool
+        ThreadPool threadPool,
+        RemoteSegmentBlobLayoutRegistry remoteSegmentBlobLayoutRegistry
     ) {
         try {
             if (canRecover(indexShard)) {
@@ -491,7 +498,8 @@ final class StoreRecovery {
                     RemoteSegmentStoreDirectoryFactory directoryFactory = new RemoteSegmentStoreDirectoryFactory(
                         () -> repositoriesService,
                         threadPool,
-                        segmentsPathFixedPrefix
+                        segmentsPathFixedPrefix,
+                        remoteSegmentBlobLayoutRegistry
                     );
                     String remoteSegmentStoreRepository = ((SnapshotRecoverySource) indexShard.recoveryState().getRecoverySource())
                         .sourceRemoteStoreRepository();
@@ -507,7 +515,9 @@ final class StoreRecovery {
                         shardId,
                         remoteStorePathStrategy,
                         null,
-                        RemoteStoreUtils.isServerSideEncryptionEnabledIndex(prevIndexMetadata)
+                        RemoteStoreUtils.isServerSideEncryptionEnabledIndex(prevIndexMetadata),
+                        false,
+                        IndexSettings.INDEX_REMOTE_STORE_SEGMENT_BLOB_LAYOUT_SETTING.get(prevIndexMetadata.getSettings())
                     );
                     RemoteSegmentMetadata remoteSegmentMetadata = sourceRemoteDirectory.initializeToSpecificTimestamp(
                         recoverySource.pinnedTimestamp()

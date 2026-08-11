@@ -17,6 +17,9 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.remote.RemoteStoreEnums;
+import org.opensearch.index.store.RemoteSegmentBlobLayoutRegistry;
+
+import java.util.Map;
 
 /**
  * Settings for remote store
@@ -208,6 +211,7 @@ public class RemoteStoreSettings {
     private static volatile TimeValue pinnedTimestampsLookbackInterval;
     private final String translogPathFixedPrefix;
     private final String segmentsPathFixedPrefix;
+    private volatile RemoteSegmentBlobLayoutRegistry remoteSegmentBlobLayoutRegistry = new RemoteSegmentBlobLayoutRegistry(Map.of());
 
     public RemoteStoreSettings(Settings settings, ClusterSettings clusterSettings) {
         clusterRemoteTranslogBufferInterval = CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.get(settings);
@@ -354,5 +358,15 @@ public class RemoteStoreSettings {
 
     public String getSegmentsPathFixedPrefix() {
         return segmentsPathFixedPrefix;
+    }
+
+    @ExperimentalApi
+    public RemoteSegmentBlobLayoutRegistry getRemoteSegmentBlobLayoutRegistry() {
+        return remoteSegmentBlobLayoutRegistry;
+    }
+
+    @ExperimentalApi
+    public void setRemoteSegmentBlobLayoutRegistry(RemoteSegmentBlobLayoutRegistry remoteSegmentBlobLayoutRegistry) {
+        this.remoteSegmentBlobLayoutRegistry = remoteSegmentBlobLayoutRegistry;
     }
 }

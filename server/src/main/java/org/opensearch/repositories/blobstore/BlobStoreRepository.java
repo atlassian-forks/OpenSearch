@@ -1698,7 +1698,8 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             RemoteSegmentStoreDirectoryFactory remoteDirectoryFactory = new RemoteSegmentStoreDirectoryFactory(
                 remoteStoreLockManagerFactory.getRepositoriesService(),
                 threadPool,
-                remoteStoreSettings.getSegmentsPathFixedPrefix()
+                remoteStoreSettings.getSegmentsPathFixedPrefix(),
+                remoteStoreSettings.getRemoteSegmentBlobLayoutRegistry()
             );
             remoteDirectoryCleanupAsync(
                 remoteDirectoryFactory,

@@ -248,7 +248,8 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         this.remoteSegmentStoreDirectoryFactory = new RemoteSegmentStoreDirectoryFactory(
             () -> repositoriesService,
             threadPool,
-            remoteStoreSettings.getSegmentsPathFixedPrefix()
+            remoteStoreSettings.getSegmentsPathFixedPrefix(),
+            remoteStoreSettings.getRemoteSegmentBlobLayoutRegistry()
         );
         this.transportService = transportService;
         this.remoteStorePinnedTimestampService = remoteStorePinnedTimestampService;
