@@ -23,6 +23,7 @@ import org.opensearch.index.store.CompositeDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -65,6 +66,7 @@ public class RemoteStoreUploaderService implements RemoteStoreUploader {
         GroupedActionListener<Void> batchUploadListener = new GroupedActionListener<>(mappedListener, localSegments.size());
         Directory directory = ((FilterDirectory) (((FilterDirectory) storeDirectory).getDelegate())).getDelegate();
 
+        Map<String, ActionListener<Void>> listeners = new HashMap<>();
         for (String localSegment : localSegments) {
             // Initializing listener here to ensure that the stats increment operations are thread-safe
             UploadListener statsListener = uploadListenerFunction.apply(localSegmentsSizeMap);
@@ -84,14 +86,8 @@ public class RemoteStoreUploaderService implements RemoteStoreUploader {
                 batchUploadListener.onFailure(ex);
             });
             statsListener.beforeUpload(localSegment);
-            remoteDirectory.copyFrom(
-                storeDirectory,
-                localSegment,
-                IOContext.DEFAULT,
-                aggregatedListener,
-                isLowPriorityUpload,
-                cryptoMetadata
-            );
+            listeners.put(localSegment, aggregatedListener);
         }
+        remoteDirectory.copyFrom(storeDirectory, localSegments, IOContext.DEFAULT, listeners::get, isLowPriorityUpload, cryptoMetadata);
     }
 }

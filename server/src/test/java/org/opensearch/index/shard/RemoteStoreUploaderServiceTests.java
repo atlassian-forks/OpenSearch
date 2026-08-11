@@ -8,9 +8,13 @@
 
 package org.opensearch.index.shard;
 
+import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FilterDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexOutput;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.util.UploadListener;
 import org.opensearch.core.action.ActionListener;
@@ -165,7 +169,7 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
         when(freshMockShard.state()).thenReturn(IndexShardState.STARTED);
 
         // Create a mock directory structure that matches what the code expects
-        Directory innerMockDelegate = mock(Directory.class);
+        Directory innerMockDelegate = checksummedDirectory(segments);
         FilterDirectory innerFilterDirectory = new TestFilterDirectory(new TestFilterDirectory(innerMockDelegate));
 
         FilterDirectory outerFilterDirectory = new TestFilterDirectory(new TestFilterDirectory(innerFilterDirectory));
@@ -228,7 +232,7 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
         when(freshMockShard.state()).thenReturn(IndexShardState.STARTED);
 
         // Create a mock directory structure that matches what the code expects
-        Directory innerMockDelegate = mock(Directory.class);
+        Directory innerMockDelegate = checksummedDirectory(segments);
         FilterDirectory innerFilterDirectory = new TestFilterDirectory(new TestFilterDirectory(innerMockDelegate));
 
         FilterDirectory outerFilterDirectory = new TestFilterDirectory(new TestFilterDirectory(innerFilterDirectory));
@@ -295,6 +299,11 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
         when(mockShardRouting.primary()).thenReturn(true);
 
         CompositeDirectory mockCompositeDirectory = mock(CompositeDirectory.class);
+        Directory sourceDirectory = checksummedDirectory(segments);
+        when(mockCompositeDirectory.fileLength("segment1")).thenAnswer(invocation -> sourceDirectory.fileLength("segment1"));
+        when(mockCompositeDirectory.openInput(eq("segment1"), any())).thenAnswer(
+            invocation -> sourceDirectory.openInput("segment1", invocation.getArgument(1))
+        );
         FilterDirectory innerFilterDirectory = new TestFilterDirectory(mockCompositeDirectory);
         FilterDirectory outerFilterDirectory = new TestFilterDirectory(innerFilterDirectory);
 
@@ -485,5 +494,16 @@ public class RemoteStoreUploaderServiceTests extends OpenSearchTestCase {
         public TestFilterDirectory(Directory in) {
             super(in);
         }
+    }
+
+    private Directory checksummedDirectory(Collection<String> files) throws IOException {
+        Directory directory = new ByteBuffersDirectory();
+        for (String file : files) {
+            try (IndexOutput output = directory.createOutput(file, IOContext.DEFAULT)) {
+                output.writeString(file);
+                CodecUtil.writeFooter(output);
+            }
+        }
+        return directory;
     }
 }
