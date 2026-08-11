@@ -52,6 +52,7 @@ import org.opensearch.index.compositeindex.datacube.startree.StarTreeIndexSettin
 import org.opensearch.index.remote.RemoteStoreEnums.PathType;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
 import org.opensearch.index.remote.RemoteStoreUtils;
+import org.opensearch.index.store.RemoteSegmentBlobLayoutRegistry;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.ingest.IngestService;
@@ -878,6 +879,16 @@ public final class IndexSettings {
         0,
         Property.Dynamic,
         Property.IndexScope
+    );
+
+    /**
+     * Selects the immutable physical layout used for remote segment files.
+     */
+    public static final Setting<String> INDEX_REMOTE_STORE_SEGMENT_BLOB_LAYOUT_SETTING = Setting.simpleString(
+        "index.remote_store.segment.blob_layout",
+        RemoteSegmentBlobLayoutRegistry.DEFAULT_LAYOUT_NAME,
+        Property.IndexScope,
+        Property.Final
     );
 
     public static final Setting<Long> INDEX_CONTEXT_CREATED_VERSION = Setting.longSetting(
