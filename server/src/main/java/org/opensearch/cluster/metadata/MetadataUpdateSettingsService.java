@@ -67,6 +67,7 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -573,14 +574,10 @@ public class MetadataUpdateSettingsService {
             return;
         }
 
-        // Check if remote store is enabled
-        boolean isRemoteStoreEnabled = clusterService.state()
-            .nodes()
-            .getNodes()
-            .values()
-            .stream()
-            .allMatch(DiscoveryNode::isRemoteStoreNode);
-        if (!isRemoteStoreEnabled) {
+        // Primary shard balancing requires remote-backed segments, including in segments-only clusters.
+        Collection<DiscoveryNode> nodes = clusterService.state().nodes().getNodes().values();
+        boolean isRemoteSegmentStoreEnabled = nodes.isEmpty() == false && nodes.stream().allMatch(DiscoveryNode::isRemoteSegmentStoreNode);
+        if (isRemoteSegmentStoreEnabled == false) {
             throw new IllegalArgumentException(
                 "Setting ["
                     + INDEX_TOTAL_PRIMARY_SHARDS_PER_NODE_SETTING.getKey()

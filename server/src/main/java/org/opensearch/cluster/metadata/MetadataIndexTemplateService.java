@@ -1671,7 +1671,7 @@ public class MetadataIndexTemplateService {
             validateTranslogDurabilitySettingsInTemplate(settings, clusterService.getClusterSettings());
 
             // validate index total primary shards per node setting
-            validateIndexTotalPrimaryShardsPerNodeSetting(settings);
+            validateIndexTotalPrimaryShardsPerNodeSetting(settings, clusterService.state());
         }
 
         if (indexPatterns.stream().anyMatch(Regex::isMatchAllPattern)) {
