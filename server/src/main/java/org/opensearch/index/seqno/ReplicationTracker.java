@@ -286,7 +286,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         final long currentTimeMillis = currentTimeMillisSupplier.getAsLong();
         final long retentionLeaseMillis = indexSettings.getRetentionLeaseMillis();
         final Set<String> leaseIdsForCurrentPeers;
-        if (indexSettings.isRemoteStoreEnabled()) {
+        if (indexSettings.isRemoteTranslogStoreEnabled()) {
             leaseIdsForCurrentPeers = Collections.singleton(getPeerRecoveryRetentionLeaseId(routingTable.primaryShard().currentNodeId()));
         } else {
             leaseIdsForCurrentPeers = routingTable.assignedShards()
@@ -975,6 +975,10 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
             && createdMissingRetentionLeases) {
             // all tracked shard copies have a corresponding peer-recovery retention lease
             for (final ShardRouting shardRouting : routingTable.assignedShards()) {
+                // Search replicas are assigned but never tracked by the primary, so they have no checkpoint state.
+                if (shardRouting.isSearchOnly()) {
+                    continue;
+                }
                 final CheckpointState cps = checkpoints.get(shardRouting.allocationId().getId());
                 if (cps.tracked && cps.replicated) {
                     assert retentionLeases.contains(getPeerRecoveryRetentionLeaseId(shardRouting))
@@ -1256,14 +1260,28 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         return this.latestReplicationCheckpoint;
     }
 
-    // skip any shard that is a relocating primary or search only replica (not tracked by primary)
+    // A recovery target can be marked in-sync before its routing transitions from INITIALIZING to STARTED. Track replication lag
+    // only after the copy becomes active so that recovery finalization time is not reported as replication lag.
     private boolean shouldSkipReplicationTimer(String allocationId) {
         Optional<ShardRouting> shardRouting = routingTable.assignedShards()
             .stream()
             .filter(routing -> Objects.nonNull(routing.allocationId()))
             .filter(routing -> routing.allocationId().getId().equals(allocationId))
             .findAny();
-        return shardRouting.isPresent() && (shardRouting.get().primary() || shardRouting.get().isSearchOnly());
+        return shardRouting.isPresent()
+            && (shardRouting.get().active() == false || shardRouting.get().primary() || shardRouting.get().isSearchOnly());
+    }
+
+    /**
+     * Whether the replica holding {@code allocationId} is kept current by segment replication, and so needs a lag
+     * timer. The last clause asks the replica's own node rather than the index, because under {@code MIXED}
+     * compatibility one index can have a replica on each kind of node; it is blind to {@code segments_only}, whose
+     * nodes have no translog repository, hence the first.
+     */
+    private boolean isReplicatedBySegments(final String allocationId) {
+        return (indexSettings.isRemoteStoreEnabled() && indexSettings.isTranslogDurableInRemoteStore() == false)
+            || indexSettings.isSegRepLocalEnabled()
+            || isShardOnRemoteEnabledNode.apply(routingTable.getByAllocationId(allocationId).currentNodeId());
     }
 
     private void createReplicationLagTimers() {
@@ -1277,8 +1295,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                     && replicationGroup.getUnavailableInSyncShards().contains(allocationId) == false
                     && shouldSkipReplicationTimer(allocationId) == false
                     && latestReplicationCheckpoint.isAheadOf(cps.visibleReplicationCheckpoint)
-                    && (indexSettings.isSegRepLocalEnabled() == true
-                        || isShardOnRemoteEnabledNode.apply(routingTable.getByAllocationId(allocationId).currentNodeId()))) {
+                    && isReplicatedBySegments(allocationId)) {
                     cps.checkpointTimers.computeIfAbsent(latestReplicationCheckpoint, ignored -> new SegmentReplicationLagTimer());
                     logger.trace(
                         () -> new ParameterizedMessage(
@@ -1436,6 +1453,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         } else if (hasAllPeerRecoveryRetentionLeases == false
             && routingTable.assignedShards()
                 .stream()
+                .filter(shardRouting -> shardRouting.isSearchOnly() == false)
                 .allMatch(
                     shardRouting -> retentionLeases.contains(getPeerRecoveryRetentionLeaseId(shardRouting))
                         || checkpoints.get(shardRouting.allocationId().getId()).tracked == false
@@ -1564,7 +1582,9 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
     }
 
     private boolean assignedToRemoteStoreNode(IndexShardRoutingTable routingTable, String allocationId) {
-        return indexSettings().isRemoteStoreEnabled()
+        // Deliberately keyed off the remote translog rather than the remote segment store: a shard whose translog is
+        // only stored locally still needs to take part in replication for its operations to be durable.
+        return indexSettings().isRemoteTranslogStoreEnabled()
             || (routingTable.getByAllocationId(allocationId) != null
                 && isShardOnRemoteEnabledNode.apply(routingTable.getByAllocationId(allocationId).currentNodeId()));
     }
@@ -1882,7 +1902,10 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                 .stream()
                 .anyMatch(shardRouting -> isShardOnRemoteEnabledNode.apply(shardRouting.currentNodeId()) == false);
         if (hasAllPeerRecoveryRetentionLeases == false || createMissingRetentionLeasesDuringMigration) {
-            final List<ShardRouting> shardRoutings = routingTable.assignedShards();
+            final List<ShardRouting> shardRoutings = routingTable.assignedShards()
+                .stream()
+                .filter(shardRouting -> shardRouting.isSearchOnly() == false)
+                .collect(Collectors.toList());
             final GroupedActionListener<ReplicationResponse> groupedActionListener = new GroupedActionListener<>(ActionListener.wrap(vs -> {
                 setHasAllPeerRecoveryRetentionLeases();
                 setCreatedMissingRetentionLeases();

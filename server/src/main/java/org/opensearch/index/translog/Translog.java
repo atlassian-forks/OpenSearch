@@ -587,7 +587,7 @@ public abstract class Translog extends AbstractIndexShardComponent implements In
                 tragedy,
                 persistedSequenceNumberConsumer,
                 bigArrays,
-                indexSettings.isAssignedOnRemoteNode(),
+                indexSettings.isTranslogDurableInRemoteStore(),
                 translogOperationHelper
             );
         } catch (final IOException e) {

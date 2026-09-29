@@ -177,7 +177,11 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
         // An optimization can be done as this will get invoked
         // for every set of node join task which we can optimize to not compute if cluster state already has
         // repository information.
-        Optional<DiscoveryNode> remoteDN = currentNodes.getNodes().values().stream().filter(DiscoveryNode::isRemoteStoreNode).findFirst();
+        Optional<DiscoveryNode> remoteDN = currentNodes.getNodes()
+            .values()
+            .stream()
+            .filter(DiscoveryNode::isRemoteSegmentStoreNode)
+            .findFirst();
         Optional<DiscoveryNode> remotePublicationDN = currentNodes.getNodes()
             .values()
             .stream()
@@ -231,7 +235,7 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
                     ensureNodeCommissioned(node, currentState.metadata());
                     nodesBuilder.add(node);
 
-                    if ((remoteDN.isEmpty() && node.isRemoteStoreNode())
+                    if ((remoteDN.isEmpty() && node.isRemoteSegmentStoreNode())
                         || (remotePublicationDN.isEmpty() && node.isRemoteStatePublicationEnabled())) {
                         // This is hit only on cases where we encounter first remote node
                         logger.info("Updating system repository now for remote store");
@@ -503,8 +507,9 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
     public static void ensureRemoteRepositoryCompatibility(DiscoveryNode joiningNode, DiscoveryNodes currentNodes, Metadata metadata) {
         List<DiscoveryNode> existingNodes = new ArrayList<>(currentNodes.getNodes().values());
 
-        boolean isClusterRemoteStoreEnabled = existingNodes.stream().anyMatch(DiscoveryNode::isRemoteStoreNode);
-        if (isClusterRemoteStoreEnabled || joiningNode.isRemoteStoreNode()) {
+        // Not isRemoteStoreNode(): it also requires a cluster state repository, which segments_only has none of.
+        boolean isClusterRemoteSegmentStoreEnabled = existingNodes.stream().anyMatch(DiscoveryNode::isRemoteSegmentStoreNode);
+        if (isClusterRemoteSegmentStoreEnabled || joiningNode.isRemoteSegmentStoreNode()) {
             ensureRemoteStoreNodesCompatibility(joiningNode, currentNodes, metadata);
         } else {
             ensureRemoteClusterStateNodesCompatibility(joiningNode, currentNodes);
@@ -567,10 +572,10 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
 
         if (STRICT.equals(remoteStoreCompatibilityMode)) {
             DiscoveryNode existingNode = remoteRoutingTableNode.orElseGet(() -> existingNodes.get(0));
-            if (joiningNode.isRemoteStoreNode()) {
+            if (joiningNode.isRemoteSegmentStoreNode()) {
                 ensureRemoteStoreNodesCompatibility(joiningNode, existingNode, reposToSkip);
             } else {
-                if (existingNode.isRemoteStoreNode()) {
+                if (existingNode.isRemoteSegmentStoreNode()) {
                     throw new IllegalStateException(
                         "a non remote store node [" + joiningNode + "] is trying to join a remote store cluster"
                     );
@@ -589,10 +594,10 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
                     logger.warn(reason);
                     throw new IllegalStateException(reason);
                 }
-                if (joiningNode.isRemoteStoreNode()) {
+                if (joiningNode.isRemoteSegmentStoreNode()) {
                     Optional<DiscoveryNode> remoteDN = remoteRoutingTableNode.isPresent()
                         ? remoteRoutingTableNode
-                        : existingNodes.stream().filter(DiscoveryNode::isRemoteStoreNode).findFirst();
+                        : existingNodes.stream().filter(DiscoveryNode::isRemoteSegmentStoreNode).findFirst();
                     remoteDN.ifPresent(discoveryNode -> ensureRemoteStoreNodesCompatibility(joiningNode, discoveryNode, reposToSkip));
                 }
             }
@@ -604,8 +609,8 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
         DiscoveryNode existingNode,
         List<String> reposToSkip
     ) {
-        if (joiningNode.isRemoteStoreNode()) {
-            if (existingNode.isRemoteStoreNode()) {
+        if (joiningNode.isRemoteSegmentStoreNode()) {
+            if (existingNode.isRemoteSegmentStoreNode()) {
                 RemoteStoreNodeAttribute joiningRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(joiningNode);
                 RemoteStoreNodeAttribute existingRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(existingNode);
                 if (existingRemoteStoreNodeAttribute.equalsWithRepoSkip(joiningRemoteStoreNodeAttribute, reposToSkip) == false) {

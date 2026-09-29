@@ -119,6 +119,7 @@ import java.io.UnsupportedEncodingException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -229,9 +230,8 @@ public class MetadataCreateIndexService {
         createIndexTaskKey = clusterService.registerClusterManagerTask(CREATE_INDEX, true);
         Supplier<Version> minNodeVersionSupplier = () -> clusterService.state().nodes().getMinNodeVersion();
         remoteStoreCustomMetadataResolver = RemoteStoreNodeAttribute.isSegmentRepoConfigured(settings)
-            && RemoteStoreNodeAttribute.isTranslogRepoConfigured(settings)
-                ? new RemoteStoreCustomMetadataResolver(remoteStoreSettings, minNodeVersionSupplier, repositoriesServiceSupplier, settings)
-                : null;
+            ? new RemoteStoreCustomMetadataResolver(remoteStoreSettings, minNodeVersionSupplier, repositoriesServiceSupplier, settings)
+            : null;
     }
 
     public IndexScopedSettings getIndexScopedSettings() {
@@ -684,7 +684,7 @@ public class MetadataCreateIndexService {
             .getNodes()
             .values()
             .stream()
-            .filter(DiscoveryNode::isRemoteStoreNode)
+            .filter(DiscoveryNode::isRemoteSegmentStoreNode)
             .findFirst();
 
         String sseEnabledIndex = existingCustomData == null
@@ -1366,7 +1366,7 @@ public class MetadataCreateIndexService {
                 .getNodes()
                 .values()
                 .stream()
-                .filter(DiscoveryNode::isRemoteStoreNode)
+                .filter(DiscoveryNode::isRemoteSegmentStoreNode)
                 .findFirst();
 
             if (remoteNode.isPresent()) {
@@ -2059,6 +2059,16 @@ public class MetadataCreateIndexService {
      */
     // TODO : Update this check for SegRep to DocRep migration on need basis
     public static void validateIndexTotalPrimaryShardsPerNodeSetting(Settings indexSettings) {
+        validateIndexTotalPrimaryShardsPerNodeSetting(indexSettings, IndexMetadata.INDEX_REMOTE_STORE_ENABLED_SETTING.get(indexSettings));
+    }
+
+    public static void validateIndexTotalPrimaryShardsPerNodeSetting(Settings indexSettings, ClusterState clusterState) {
+        Collection<DiscoveryNode> nodes = clusterState.nodes().getNodes().values();
+        boolean isRemoteSegmentStoreEnabled = nodes.isEmpty() == false && nodes.stream().allMatch(DiscoveryNode::isRemoteSegmentStoreNode);
+        validateIndexTotalPrimaryShardsPerNodeSetting(indexSettings, isRemoteSegmentStoreEnabled);
+    }
+
+    private static void validateIndexTotalPrimaryShardsPerNodeSetting(Settings indexSettings, boolean isRemoteSegmentStoreEnabled) {
         // Get the setting value
         int indexPrimaryShardsPerNode = INDEX_TOTAL_PRIMARY_SHARDS_PER_NODE_SETTING.get(indexSettings);
         int indexRemoteCapablePrimaryShardsPerNode = INDEX_TOTAL_REMOTE_CAPABLE_PRIMARY_SHARDS_PER_NODE_SETTING.get(indexSettings);
@@ -2068,9 +2078,7 @@ public class MetadataCreateIndexService {
             return;
         }
 
-        // Check if remote store is enabled
-        boolean isRemoteStoreEnabled = IndexMetadata.INDEX_REMOTE_STORE_ENABLED_SETTING.get(indexSettings);
-        if (!isRemoteStoreEnabled) {
+        if (isRemoteSegmentStoreEnabled == false) {
             throw new IllegalArgumentException(
                 "Setting ["
                     + INDEX_TOTAL_PRIMARY_SHARDS_PER_NODE_SETTING.getKey()
